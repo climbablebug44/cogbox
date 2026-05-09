@@ -138,7 +138,7 @@ with subtest("Phase B: --network none blocks all outbound"):
     out = machine.succeed(as_user("cogbox list"))
     assert "(running)" in out, out
     hostname = machine.succeed(as_user("cogbox ssh hostname")).strip()
-    assert hostname == "cogbox", f"unexpected inner hostname {hostname!r}"
+    assert hostname == "cogbox-default", f"unexpected inner hostname {hostname!r}"
     machine.fail(probe(None, "10.99.0.1"))
     machine.fail(probe(None, "10.99.0.2"))
     stop_instance("cc-default")

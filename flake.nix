@@ -143,7 +143,13 @@
 			modules = [
 				microvm.nixosModules.microvm
 				({ pkgs, ... }: {
-					networking.hostName = name;
+					# `@cogbox-instance@` is a sentinel rewritten by
+					# cogbox-launch.sh to the active instance name, so
+					# systemd applies `cogbox-<instance>` as the hostname
+					# during early boot. Anchored on `systemd.hostname=`
+					# rather than the raw token to avoid collisions if
+					# the placeholder ever appears verbatim elsewhere.
+					boot.kernelParams = [ "systemd.hostname=cogbox-@cogbox-instance@" ];
 					users.users.root.password = "";
 					services.getty.autologinUser = "root";
 					microvm = {

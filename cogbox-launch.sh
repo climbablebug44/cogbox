@@ -651,6 +651,7 @@ SED_ARGS=(
 	-e "s/( )-m [0-9]+/\1-m $MEM/"
 	-e "s/(memory-backend-memfd,id=mem,size=)[0-9]+(M)/\1${MEM}\2/"
 	-e "s|${RUNTIME_TEMPLATE}/|${RUNTIME}/|g"
+	-e "s|@cogbox-instance@|${EFFECTIVE_NAME}|g"
 )
 if [ "$NETWORK_MODE" = "none" ]; then
 	# SLIRP with restrict=on -- blocks all outbound, keeps port forwards

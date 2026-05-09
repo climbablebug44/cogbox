@@ -87,6 +87,10 @@ Harness authentication and base config are shared across all instances:
 Each instance gets its own overlay on top of the shared config, so
 per-instance harness settings persist independently.
 
+The guest's kernel hostname is set to `cogbox-<instance>` at boot
+(e.g. `cogbox-default`, `cogbox-work`), so shell prompts and SSH
+banners distinguish concurrent instances.
+
 ## CLI
 
 cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
