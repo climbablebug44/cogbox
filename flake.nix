@@ -3,7 +3,6 @@
 
 	inputs = {
 		nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
-		nixpkgs-master.url = "github:nixos/nixpkgs?ref=master";
 		illustris-lib = {
 			url = "github:illustris/flake";
 			flake = false;
@@ -22,6 +21,11 @@
 			inputs.nixpkgs.follows = "nixpkgs";
 			inputs.illustris-lib.follows = "illustris-lib";
 		};
+		# Intentionally not setting inputs.nixpkgs.follows: llm-agents.nix
+		# publishes its builds to cache.numtide.com against its own pinned
+		# nixpkgs, and overriding it would force local rebuilds of every
+		# harness against our nixpkgs revision instead of cache hits.
+		llm-agents.url = "github:numtide/llm-agents.nix";
 		userExtensions.url = "path:./userExtensions";
 	};
 
@@ -62,10 +66,7 @@
 		mkHarnesses = system: pkgs: lib.filterAttrs (_: h: h.enable) {
 			claude-code = {
 				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
-				package = (import inputs.nixpkgs-master {
-					inherit system;
-					config.allowUnfree = true;
-				}).claude-code;
+				package = inputs.llm-agents.packages.${system}.claude-code;
 				launcher = {
 					name = "c";
 					flags = [ "--dangerously-skip-permissions" ];
@@ -85,8 +86,8 @@
 			};
 
 			opencode = {
-				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
-				package = pkgs.opencode;
+				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				package = inputs.llm-agents.packages.${system}.opencode;
 				launcher = {
 					name = "oc";
 					# `--dangerously-skip-permissions` exists only on the

@@ -548,8 +548,9 @@ filter, so the formats stay in sync.
 
 Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
 `nixfs`.
-Harness binaries (with launchers): `claude-code` (`c`, on `x86_64-linux`
-and `aarch64-linux`), `opencode` (`oc`, all supported architectures).
+Harness binaries (with launchers): `claude-code` (`c`) and `opencode`
+(`oc`), both on `x86_64-linux` and `aarch64-linux` only (sourced from
+`numtide/llm-agents.nix`).
 Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 (where the `nix-mcp` flake publishes a build).
 
@@ -599,10 +600,11 @@ How "full auto" is wired per harness:
 
 - Linux host with KVM. Build targets: `x86_64-linux`, `aarch64-linux`,
   `riscv64-linux`.
-- Per-harness platform availability varies. `claude-code` is pre-built
-  on `x86_64-linux` and `aarch64-linux` only; on `riscv64-linux` only
-  `opencode` ships out of the box, and `claude-code` would have to be
-  installed manually inside the VM.
+- Per-harness platform availability varies. Both `claude-code` and
+  `opencode` come from `numtide/llm-agents.nix`, which builds them for
+  `x86_64-linux` and `aarch64-linux` only. On `riscv64-linux` neither
+  harness ships out of the box and would have to be installed manually
+  inside the VM.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not
