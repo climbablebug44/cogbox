@@ -178,6 +178,12 @@
 					boot.kernelParams = [ "systemd.hostname=cogbox-@cogbox-instance@" ];
 					users.users.root.password = "";
 					services.getty.autologinUser = "root";
+					# Land interactive login shells in the persisted data
+					# dir so the autologin session starts where the user's
+					# state lives, rather than in root's home.
+					programs.bash.loginShellInit = ''
+						cd /var/lib/${name}
+					'';
 					microvm = {
 						hypervisor = "qemu";
 						inherit vcpu mem;

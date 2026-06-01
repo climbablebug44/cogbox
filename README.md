@@ -95,6 +95,10 @@ The guest's kernel hostname is set to `cogbox-<instance>` at boot
 (e.g. `cogbox-default`, `cogbox-work`), so shell prompts and SSH
 banners distinguish concurrent instances.
 
+Interactive login shells start in `/var/lib/cogbox` (the persisted,
+host-shared data dir) rather than root's home, so the autologin session
+opens where the instance's state lives.
+
 ## CLI
 
 cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
