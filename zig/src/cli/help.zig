@@ -10,7 +10,7 @@ pub const TOP_LEVEL =
 	\\cogbox - run coding-agent harnesses (claude-code, opencode, codex) in an isolated QEMU microvm
 	\\
 	\\Usage:
-	\\  cogbox [VERB] [OPTIONS]
+	\\  cogbox [VERB] [OPTIONS]            (cbx is a short alias for cogbox)
 	\\
 	\\Verbs:
 	\\  start     Launch the VM in the background, then SSH into it (default).

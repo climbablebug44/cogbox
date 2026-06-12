@@ -572,6 +572,11 @@
 					--prefix PATH : "${lib.makeBinPath (with pkgs; [
 						coreutils gnused gnugrep jq diffutils nix bashInteractive openssh
 					] ++ [ self.packages.${system}.passt-cc ])}"
+
+				# `cbx` is a short alias for `cogbox`. The wrapper execs an
+				# absolute path to .cogbox-wrapped (not $0) and the Zig CLI
+				# ignores argv[0], so the symlink behaves identically.
+				ln -s cogbox $out/bin/cbx
 			'';
 		in rec {
 			cogbox-tools = pkgs.stdenv.mkDerivation {

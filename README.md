@@ -52,6 +52,10 @@ session. When you exit the session the VM keeps running (stop it with
 watch it boot on the serial console instead (`Ctrl-]` detaches without
 stopping the VM).
 
+The package installs the CLI as both `cogbox` and `cbx` (a short alias
+symlink); once it's on your `PATH`, the two names are interchangeable
+(`cbx stop`, `cbx list`, ...).
+
 Each enabled harness ships a launcher inside the VM: `c` for
 `claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
 are installed unconditionally (subject to per-architecture availability),
