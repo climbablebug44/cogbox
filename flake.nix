@@ -611,6 +611,10 @@
 			# (which would fail with no network).
 			cogbox-test-hello = mkCogbox
 				self.nixosConfigurations.cogbox-x86_64-test-hello.config.microvm.declaredRunner;
+			# Phase Q analog: wrapper baked against the composition-shaped
+			# runner (see cogbox-x86_64-test-plugin).
+			cogbox-test-plugin = mkCogbox
+				self.nixosConfigurations.cogbox-x86_64-test-plugin.config.microvm.declaredRunner;
 		});
 
 		checks = forAllSystems (system: let
@@ -664,6 +668,34 @@
 					userExt = { pkgs, ... }: {
 						environment.systemPackages = [ pkgs.hello ];
 						system.extraDependencies = [ pkgs.hello ];
+					};
+				};
+			};
+			# Same idea for Phase Q (`cogbox plugin`): the generated
+			# composition flake wraps the plugin modules and the (no-op
+			# scaffold) user module in an `imports` list. That nesting
+			# changes module flattening order, which changes
+			# environment.systemPackages ORDER, which changes the
+			# system-path drv -- so the flat test-hello fixture above does
+			# NOT cache-hit for the plugin path. Pre-build the runner with
+			# the exact same nested shape the composition produces: two
+			# plugins from one flake (default = hello, extra = etc marker)
+			# plus the scaffold's no-op module, in add order, user last.
+			cogbox-x86_64-test-plugin = mkMicrovm "x86_64-linux" "cogbox" {
+				vcpu = 16;
+				mem = 32768;
+				extraModules = cogboxModules "x86_64-linux" {
+					userExt = {
+						imports = [
+							({ pkgs, ... }: {
+								environment.systemPackages = [ pkgs.hello ];
+								system.extraDependencies = [ pkgs.hello ];
+							})
+							({ ... }: {
+								environment.etc."cogbox-test-extra".text = "extra\n";
+							})
+							({ pkgs, lib, ... }: { })
+						];
 					};
 				};
 			};

@@ -68,6 +68,12 @@ in {
 			++ [
 				self.nixosConfigurations.cogbox-x86_64-test-hello.config.microvm.declaredRunner
 				self.packages.x86_64-linux.cogbox-test-hello
+				# Phase Q: the plugin composition flake produces an
+				# imports-nested module whose systemPackages ORDER differs
+				# from the flat test-hello shape, hence a distinct runner
+				# drv that needs its own pre-built pin.
+				self.nixosConfigurations.cogbox-x86_64-test-plugin.config.microvm.declaredRunner
+				self.packages.x86_64-linux.cogbox-test-plugin
 			];
 
 		users.users.testuser = {

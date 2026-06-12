@@ -44,6 +44,15 @@ pub fn instanceFlakeDir(allocator: std.mem.Allocator, paths: *const Paths, name:
 	return try std.fs.path.join(allocator, &.{ paths.config_dir, "instances", eff, "flake" });
 }
 
+/// The generated plugin-composition flake's directory. A sibling of `flake/`
+/// (not a file next to config.json) for the same reason `flake/` is its own
+/// subdir: it becomes a `path:` flake input, and unrelated edits in the
+/// instance config dir must not bust its source hash.
+pub fn instancePluginsFlakeDir(allocator: std.mem.Allocator, paths: *const Paths, name: ?[]const u8) ![]const u8 {
+	const eff = name orelse "default";
+	return try std.fs.path.join(allocator, &.{ paths.config_dir, "instances", eff, "plugins-flake" });
+}
+
 pub fn instanceDataDir(allocator: std.mem.Allocator, paths: *const Paths, name: ?[]const u8) ![]const u8 {
 	const eff = name orelse "default";
 	return try std.fs.path.join(allocator, &.{ paths.base_data, "instances", eff });

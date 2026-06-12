@@ -73,6 +73,17 @@ pub fn build(b: *std.Build) void {
 	l7_mod.addImport("filter", filter_mod);
 	l7_mod.addImport("rules_module", rules_mod);
 
+	// Plugin verb. Shares config/save/reload with the rules module (plugin
+	// rule merges hot-reload like any other rules edit) and shells out to
+	// nix for flake resolution; links libc for the process plumbing.
+	const plugin_mod = b.createModule(.{
+		.root_source_file = b.path("src/plugin/main.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	plugin_mod.addImport("rules_module", rules_mod);
+
 	// Top-level cogbox CLI.
 	const cli_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/main.zig"),
@@ -83,6 +94,7 @@ pub fn build(b: *std.Build) void {
 	cli_mod.addImport("rules_module", rules_mod);
 	cli_mod.addImport("remap_module", remap_mod);
 	cli_mod.addImport("l7_module", l7_mod);
+	cli_mod.addImport("plugin_module", plugin_mod);
 	cli_mod.addImport("l7proxy_module", l7proxy_mod);
 	cli_mod.addImport("filter", filter_mod);
 
@@ -147,6 +159,18 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_l7_tests = b.addRunArtifact(l7_tests);
 
+	const plugin_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/plugin/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	plugin_test_mod.addImport("rules_module", rules_mod);
+	const plugin_tests = b.addTest(.{
+		.root_module = plugin_test_mod,
+	});
+	const run_plugin_tests = b.addRunArtifact(plugin_tests);
+
 	const cli_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/parse.zig"),
 		.target = target,
@@ -165,5 +189,6 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_rules_tests.step);
 	test_step.dependOn(&run_remap_tests.step);
 	test_step.dependOn(&run_l7_tests.step);
+	test_step.dependOn(&run_plugin_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
 }

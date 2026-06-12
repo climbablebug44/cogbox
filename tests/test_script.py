@@ -224,6 +224,172 @@ NIX_EOF"""))
     )
     stop_instance("cc-default")
 
+with subtest("Phase Q: plugin verb folds a flake into the guest + tagged rules"):
+    # Fixture: ONE flake exposing TWO plugins. The composed runner drv must
+    # equal the pre-built cogbox-x86_64-test-plugin fixture (offline cache
+    # hit), whose userExt mirrors exactly this shape: hello module + etc
+    # marker module + scaffold no-op, in add order. Rules use both contract
+    # forms: flat cogboxPlugin.networkRules for default, nested
+    # cogboxPlugin.extra.networkRules for the named module.
+    plug_flake = "/home/testuser/cogbox-test-plugin/flake.nix"
+    machine.succeed(as_user("mkdir -p /home/testuser/cogbox-test-plugin"))
+    machine.succeed(as_user("""cat > """ + plug_flake + """ <<'NIX_EOF'
+{
+    description = "cogbox test plugin";
+    outputs = { self }: {
+        nixosModules.default = { pkgs, ... }: {
+            environment.systemPackages = [ pkgs.hello ];
+            system.extraDependencies = [ pkgs.hello ];
+        };
+        nixosModules.extra = { ... }: {
+            environment.etc."cogbox-test-extra".text = "extra\n";
+        };
+        cogboxPlugin.networkRules = [
+            { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
+        ];
+        cogboxPlugin.extra.networkRules = [
+            { allow = "10.99.0.2/32"; comment = "extra allow"; }
+        ];
+    };
+}
+NIX_EOF"""))
+
+    # Q1: dedicated rules-mode instance; ports auto-assign past work's 2223.
+    machine.succeed(as_user("cogbox init -y --name plug --network rules"))
+    plug_cfg = "/home/testuser/.config/cogbox/instances/plug/config.json"
+    plug_ssh = machine.succeed(f"jq -r .sshPort {plug_cfg}").strip()
+
+    # Q2: add. The backdoor shell's stdin IS a tty (serial console), so the
+    # rule-merge prompt would block; -y skips it (and exercises the flag).
+    # The derived name is the path basename: cogbox-test-plugin.
+    out = machine.succeed(as_user(
+        "cogbox plugin add path:/home/testuser/cogbox-test-plugin -y --name plug"
+    ))
+    assert "10.99.0.1/32" in out and "added" in out, out
+    n = machine.succeed(f"jq -r '.plugins | length' {plug_cfg}").strip()
+    assert n == "1", f"expected 1 plugin, got {n!r}"
+    nar = machine.succeed(f"jq -r '.plugins[0].narHash' {plug_cfg}").strip()
+    assert nar.startswith("sha256-"), nar
+    tag = machine.succeed(f"jq -r '.network.rules[0].plugin' {plug_cfg}").strip()
+    assert tag == "cogbox-test-plugin", f"rule not tagged at head: {tag!r}"
+    rules_out = machine.succeed(as_user("cogbox rules list --name plug"))
+    assert rules_out.splitlines()[0].startswith("1: allow 10.99.0.1/32"), rules_out
+    comp = "/home/testuser/.config/cogbox/instances/plug/plugins-flake/flake.nix"
+    comp_text = machine.succeed(f"cat {comp}")
+    assert "DO NOT EDIT" in comp_text, comp_text
+    assert '"p-cogbox-test-plugin".url' in comp_text and "narHash=" in comp_text, comp_text
+
+    # Q2b: enable a SECOND module of the same flake via #fragment. The pin
+    # must be reused (flake-level versioning), the name derives from the
+    # attr, and its per-attr rules land at the head tagged with ITS name.
+    out = machine.succeed(as_user(
+        "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#extra' -y --name plug"
+    ))
+    assert "Reusing pin" in out and "10.99.0.2/32" in out, out
+    n = machine.succeed(f"jq -r '.plugins | length' {plug_cfg}").strip()
+    assert n == "2", f"expected 2 plugins, got {n!r}"
+    attr = machine.succeed(f"jq -r '.plugins[1].attr' {plug_cfg}").strip()
+    assert attr == "extra", f"attr not recorded: {attr!r}"
+    nar_extra = machine.succeed(f"jq -r '.plugins[1].narHash' {plug_cfg}").strip()
+    assert nar_extra == nar, f"siblings diverged: {nar!r} vs {nar_extra!r}"
+    tag = machine.succeed(f"jq -r '.network.rules[0].plugin' {plug_cfg}").strip()
+    assert tag == "extra", f"extra's rule not tagged at head: {tag!r}"
+    comp_text = machine.succeed(f"cat {comp}")
+    assert 'nixosModules."default"' in comp_text, comp_text
+    assert 'inputs."p-extra".nixosModules."extra"' in comp_text, comp_text
+
+    # Q3: list shows both; duplicate add, unknown del, and a fragment that
+    # names no module all fail with exit 65.
+    out = machine.succeed(as_user("cogbox plugin list --name plug"))
+    assert "cogbox-test-plugin" in out and "#extra" in out, out
+    machine.fail(as_user(
+        "cogbox plugin add path:/home/testuser/cogbox-test-plugin -y --name plug"
+    ))
+    machine.fail(as_user("cogbox plugin del nosuch --name plug"))
+    machine.fail(as_user(
+        "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#nonexistent' -y --name plug"
+    ))
+
+    # Q4: boot. The wrapper sees .plugins non-empty, re-execs with the
+    # composition flake; the rebuilt runner resolves as a cache hit against
+    # the pre-built test-plugin fixture. Both modules AND both merged rules
+    # must be live: hello on PATH, the extra module's /etc marker present,
+    # 10.99.0.1 and 10.99.0.2 allowed (plugin rules precede the seeded
+    # 10.0.0.0/8 deny).
+    boot_and_wait("cc-plug", "--name plug", ssh_port=plug_ssh)
+    hello_path = machine.succeed(
+        as_user("cogbox ssh --name plug 'readlink -f $(command -v hello)'")
+    ).strip()
+    assert hello_path.startswith("/nix/store/") and "hello-" in hello_path, hello_path
+    machine.succeed(
+        as_user(f"cogbox ssh --name plug 'nix-store --check-validity {hello_path}'")
+    )
+    machine.succeed(as_user("cogbox ssh --name plug 'test -f /etc/cogbox-test-extra'"))
+    machine.succeed(probe("plug", "10.99.0.1"))
+    machine.succeed(probe("plug", "10.99.0.2"))
+
+    # Q4b: disable a subset while RUNNING: del of the extra plugin drops
+    # exactly its tagged rule (hot-reloaded -> .2 unreachable now), while
+    # its module stays until restart (/etc marker survives).
+    machine.succeed(as_user("cogbox plugin del extra -y --name plug"))
+    machine.fail(probe("plug", "10.99.0.2"))
+    machine.succeed(probe("plug", "10.99.0.1"))
+    machine.succeed(as_user("cogbox ssh --name plug 'test -f /etc/cogbox-test-extra'"))
+
+    # Q5: update. No change -> up to date. Then extend the fixture's rules
+    # (modules untouched, so the runner drv stays the cached one) and update
+    # again: the lock re-pins and the replaced tagged rules hot-reload into
+    # the RUNNING instance.
+    out = machine.succeed(as_user("cogbox plugin update --name plug"))
+    assert "up to date" in out, out
+    machine.succeed(as_user("""cat > """ + plug_flake + """ <<'NIX_EOF'
+{
+    description = "cogbox test plugin";
+    outputs = { self }: {
+        nixosModules.default = { pkgs, ... }: {
+            environment.systemPackages = [ pkgs.hello ];
+            system.extraDependencies = [ pkgs.hello ];
+        };
+        nixosModules.extra = { ... }: {
+            environment.etc."cogbox-test-extra".text = "extra\n";
+        };
+        cogboxPlugin.networkRules = [
+            { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
+            { allow = "10.99.0.2/32"; comment = "second allow"; }
+        ];
+        cogboxPlugin.extra.networkRules = [
+            { allow = "10.99.0.2/32"; comment = "extra allow"; }
+        ];
+    };
+}
+NIX_EOF"""))
+    out = machine.succeed(as_user("cogbox plugin update --name plug"))
+    assert "updated to" in out and "10.99.0.2/32" in out, out
+    nar2 = machine.succeed(f"jq -r '.plugins[0].narHash' {plug_cfg}").strip()
+    assert nar2 != nar and nar2.startswith("sha256-"), (nar, nar2)
+    n = machine.succeed(
+        f"jq -r '[.network.rules[] | select(.plugin == \"cogbox-test-plugin\")] | length' {plug_cfg}"
+    ).strip()
+    assert n == "2", f"expected 2 tagged rules after update, got {n!r}"
+    machine.succeed(probe("plug", "10.99.0.2"))
+    stop_instance("cc-plug", name="plug")
+
+    # Q6: del removes the entry, exactly the tagged rules, and the
+    # composition flake; the next boot falls back to the baked-in runner
+    # (no re-exec), so hello is gone.
+    machine.succeed(as_user("cogbox plugin del cogbox-test-plugin -y --name plug"))
+    n = machine.succeed(f"jq -r '.plugins | length' {plug_cfg}").strip()
+    assert n == "0", f"expected 0 plugins after del, got {n!r}"
+    n = machine.succeed(
+        f"jq -r '[.network.rules[] | select(.plugin != null)] | length' {plug_cfg}"
+    ).strip()
+    assert n == "0", f"tagged rules survived del: {n!r}"
+    machine.fail(f"test -e {comp}")
+    boot_and_wait("cc-plug", "--name plug", ssh_port=plug_ssh)
+    machine.fail(as_user("cogbox ssh --name plug 'command -v hello'"))
+    machine.fail(as_user("cogbox ssh --name plug 'test -f /etc/cogbox-test-extra'"))
+    stop_instance("cc-plug", name="plug")
+
 with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     boot_and_wait("cc-default", "", ssh_port=2222)
     # All harness launchers are on $PATH inside the VM unconditionally

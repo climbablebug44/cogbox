@@ -137,6 +137,7 @@ is just `start -f`: launch, then auto-attach the console.
 | `rules` | Manage CIDR (L4) allow/deny rules for an instance |
 | `remap` | Manage TCP destination-remap rules |
 | `l7` | Manage L7 (vhost) allow/deny rules for an instance |
+| `plugin` | Manage guest plugins: flakes whose NixOS module is folded into the VM |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
 The `run` verb from earlier versions has been removed: bare `cogbox` now
@@ -153,7 +154,7 @@ Run `cogbox VERB --help` for verb-specific options.
 | `-h, --help` | every verb | Show help and exit |
 | `--no-ssh` | `start` | Don't auto-SSH after launch; just start the VM in the background and return. |
 | `-f, --foreground` | `start` | Attach the serial console after launch instead of SSHing. Detaching (`Ctrl-]`) leaves the VM running. |
-| `-y, --yes` | `start`, `init` | Skip the harness-selection prompt on first init |
+| `-y, --yes` | `start`, `init`, `plugin` | Skip the harness-selection prompt on first init / plugin confirmation prompts |
 | `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
 | `--network MODE` | `start`, `init` | `full`, `none`, or `rules` (default: rules) |
@@ -247,6 +248,28 @@ cogbox l7 add allow api.example.com --path /v1/           # terminate + path
 
 L7 rules live under `.network.l7` and require the instance's network mode
 to be `rules`. Edits hot-reload the proxy (`SIGHUP`) and passt (`SIGUSR1`).
+
+### Plugin verb
+
+Installs [plugins](#plugins) -- flakes exposing `nixosModules.default` -- into an instance.
+
+| Form | Description |
+|---|---|
+| `cogbox plugin list [-n NAME]` | List installed plugins with their pinned revision and rule count |
+| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install a plugin. `#ATTR` selects `nixosModules.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the rule-merge confirmation. |
+| `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
+| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules. Without a name, updates every plugin; each flake URL is resolved once and all of its plugins move together. |
+
+```sh
+cogbox plugin add github:illustris/panopticon?dir=flake
+cogbox plugin add 'github:org/observability#loki' -n work   # one module of a multi-plugin flake
+cogbox plugin add path:/home/me/myplugin --as dev -n work
+cogbox plugin update
+cogbox plugin del panopticon
+```
+
+Module changes take effect at the next `cogbox restart`; merged network
+rules hot-reload immediately, like any other `rules` edit.
 
 ### Console and monitor
 
@@ -737,6 +760,79 @@ the flake.
 - The first launch *with* a customized flake fetches and caches every
   cogbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs
   network access on that one launch. Subsequent launches reuse the cache.
+
+### Plugins
+
+Plugins package the per-instance extension pattern above into something
+installable: a git repo (or any flake source) that carries a NixOS module
+plus, optionally, the firewall rules it needs. `cogbox plugin add` is the
+CLI workflow for what previously required hand-editing the instance flake
+and hand-merging rules.
+
+**The contract.** A plugin is a NixOS module exposed by a flake. One flake
+can carry any number of plugins, and any subset of them can be enabled per
+instance:
+
+- `nixosModules.<attr>` -- the plugin module, selected by the URL fragment
+  (`URL#attr`); a bare URL means `nixosModules.default`. Folded into the
+  guest like the per-instance flake's module. `pkgs` resolves to cogbox's
+  nixpkgs (the same caveat as the scaffold: declare a differently-named
+  input to use your own).
+- `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects
+  in `config.json`'s `.network.rules` schema for that module. For the
+  default module the flat form `cogboxPlugin.networkRules` also works:
+
+  ```nix
+  nixosModules.loki = ...;
+  cogboxPlugin.loki.networkRules = [
+      { allow = "10.251.36.17/32"; comment = "loki backend"; }
+  ];
+  ```
+
+`FLAKE_URL` can be anything nix accepts: `github:owner/repo`,
+`git+https://...`, `path:/abs/dir`, with `?dir=` for flakes in a
+subdirectory.
+
+**Pinning.** Versioning is per flake, not per plugin. `add` resolves the
+URL with `nix flake metadata`, records the locked URL, rev, and narHash in
+`config.json` (`.plugins`), and runs `nix flake archive` so the plugin and
+its transitive inputs land in the local store -- subsequent starts resolve
+the pins offline. Enabling another module of an already-installed flake
+reuses the existing pin, so all plugins from one flake stay at one rev;
+`update` resolves each distinct URL once and moves all of its plugins
+together. To hold a flake at a specific rev, pin it in the URL itself
+(`...?rev=<sha>` or `github:owner/repo/<sha>`) -- a distinct URL pins
+independently. The clone-less model means there is no working copy to
+manage: `update` re-resolves the *original* URL (network) and re-pins only
+when the content changed.
+
+**Network rules.** If the plugin declares `cogboxPlugin.networkRules` and
+the instance is in `rules` mode, `add` shows the rules and asks before
+merging (auto-confirmed with `-y` or when stdin is not a tty). Merged
+rules are inserted **at the top of the rule list** -- rules are
+first-match-wins and the seeded ruleset is "RFC1918/bogon denies, then
+`allow 0.0.0.0/0`", so a plugin's allows for private backend IPs only work
+ahead of the denies. Review the prompt: a malicious plugin could suggest
+`allow 0.0.0.0/0`. Each merged rule carries a `"plugin": "<name>"` field,
+which is how `del` and `update` remove or replace exactly the rules that
+plugin brought in (your own edits to the same CIDRs are untouched).
+
+**Composition.** Plugin state is materialized as a generated flake at
+`~/.config/cogbox/instances/<name>/plugins-flake/flake.nix` (marked DO NOT
+EDIT; regenerated from `config.json` by every `plugin` command, `update`
+included -- run `cogbox plugin update` if it ever goes missing). It
+declares one pinned input per plugin plus the instance's own `flake/` as
+input `user`, and exposes a single `nixosModules.default` importing all of
+them, user module last. At launch the wrapper points `--override-input
+userExtensions` at this flake instead of the plain instance flake whenever
+`.plugins` is non-empty, so plugins and manual flake.nix edits compose.
+The plugin name `user` is reserved for this reason.
+
+**Trust.** Adding a plugin evaluates third-party nix code at add time
+(pure eval, IFD disabled) and *builds* it into the guest at the next
+start. Treat `cogbox plugin add` like installing software: only add flakes
+you trust. The suggested-rules prompt exists so a plugin cannot silently
+widen the instance's egress policy.
 
 ### authorized_keys
 

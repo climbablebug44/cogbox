@@ -1,0 +1,165 @@
+// Argument parser for `cogbox plugin`. The verb wrapper resolves the
+// instance (-n/--name) and paths; this parses what's left:
+//
+//   cogbox plugin ... list
+//   cogbox plugin ... add FLAKE_URL [--as PLUGIN] [-y]
+//   cogbox plugin ... del PLUGIN [-y]
+//   cogbox plugin ... update [PLUGIN]
+//
+// The plugin-name override is --as (not --name) so it can't collide with the
+// instance selector, which every cogbox verb spells -n/--name.
+
+const std = @import("std");
+
+pub const Cmd = union(enum) {
+	list,
+	add: AddArgs,
+	del: DelArgs,
+	update: UpdateArgs,
+};
+
+pub const AddArgs = struct {
+	url: []const u8,
+	as: ?[]const u8 = null,
+	yes: bool = false,
+};
+
+pub const DelArgs = struct {
+	plugin: []const u8,
+	yes: bool = false,
+};
+
+pub const UpdateArgs = struct {
+	plugin: ?[]const u8 = null,
+};
+
+pub const ParseError = error{
+	MissingSubcommand,
+	UnknownSubcommand,
+	MissingUrl,
+	MissingPlugin,
+	InvalidArgs,
+};
+
+pub fn parse(argv: []const []const u8) ParseError!Cmd {
+	if (argv.len == 0) return error.MissingSubcommand;
+	const sub = argv[0];
+	const rest = argv[1..];
+
+	if (std.mem.eql(u8, sub, "list")) {
+		if (rest.len != 0) return error.InvalidArgs;
+		return .list;
+	}
+	if (std.mem.eql(u8, sub, "add")) return parseAdd(rest);
+	if (std.mem.eql(u8, sub, "del")) return parseDel(rest);
+	if (std.mem.eql(u8, sub, "update")) return parseUpdate(rest);
+	return error.UnknownSubcommand;
+}
+
+fn parseAdd(args: []const []const u8) ParseError!Cmd {
+	var url: ?[]const u8 = null;
+	var as: ?[]const u8 = null;
+	var yes = false;
+
+	var i: usize = 0;
+	while (i < args.len) : (i += 1) {
+		const a = args[i];
+		if (std.mem.eql(u8, a, "--as")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			as = args[i];
+		} else if (std.mem.startsWith(u8, a, "--as=")) {
+			as = a[5..];
+		} else if (std.mem.eql(u8, a, "-y") or std.mem.eql(u8, a, "--yes")) {
+			yes = true;
+		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
+			return error.InvalidArgs;
+		} else {
+			if (url != null) return error.InvalidArgs;
+			url = a;
+		}
+	}
+
+	const u = url orelse return error.MissingUrl;
+	return .{ .add = .{ .url = u, .as = as, .yes = yes } };
+}
+
+fn parseDel(args: []const []const u8) ParseError!Cmd {
+	var plugin: ?[]const u8 = null;
+	var yes = false;
+
+	for (args) |a| {
+		if (std.mem.eql(u8, a, "-y") or std.mem.eql(u8, a, "--yes")) {
+			yes = true;
+		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
+			return error.InvalidArgs;
+		} else {
+			if (plugin != null) return error.InvalidArgs;
+			plugin = a;
+		}
+	}
+
+	const p = plugin orelse return error.MissingPlugin;
+	return .{ .del = .{ .plugin = p, .yes = yes } };
+}
+
+fn parseUpdate(args: []const []const u8) ParseError!Cmd {
+	if (args.len > 1) return error.InvalidArgs;
+	if (args.len == 1) {
+		if (std.mem.startsWith(u8, args[0], "-")) return error.InvalidArgs;
+		return .{ .update = .{ .plugin = args[0] } };
+	}
+	return .{ .update = .{} };
+}
+
+// --- Tests ---
+
+const t = std.testing;
+
+test "list parses, rejects extra args" {
+	try t.expect((try parse(&.{"list"})) == .list);
+	try t.expectError(error.InvalidArgs, parse(&.{ "list", "x" }));
+}
+
+test "add with url only" {
+	const c = try parse(&.{ "add", "github:owner/repo" });
+	try t.expectEqualStrings("github:owner/repo", c.add.url);
+	try t.expect(c.add.as == null);
+	try t.expect(!c.add.yes);
+}
+
+test "add with --as and -y" {
+	const c = try parse(&.{ "add", "path:/x/y", "--as", "dev", "-y" });
+	try t.expectEqualStrings("dev", c.add.as.?);
+	try t.expect(c.add.yes);
+	const c2 = try parse(&.{ "add", "--as=dev2", "path:/x/y", "--yes" });
+	try t.expectEqualStrings("dev2", c2.add.as.?);
+	try t.expect(c2.add.yes);
+}
+
+test "add missing url / extra positional / unknown flag" {
+	try t.expectError(error.MissingUrl, parse(&.{"add"}));
+	try t.expectError(error.InvalidArgs, parse(&.{ "add", "a", "b" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "add", "a", "--frob" }));
+}
+
+test "del parses" {
+	const c = try parse(&.{ "del", "panopticon" });
+	try t.expectEqualStrings("panopticon", c.del.plugin);
+	const c2 = try parse(&.{ "del", "panopticon", "-y" });
+	try t.expect(c2.del.yes);
+	try t.expectError(error.MissingPlugin, parse(&.{"del"}));
+}
+
+test "update with and without name" {
+	const all = try parse(&.{"update"});
+	try t.expect(all.update.plugin == null);
+	const one = try parse(&.{ "update", "panopticon" });
+	try t.expectEqualStrings("panopticon", one.update.plugin.?);
+	try t.expectError(error.InvalidArgs, parse(&.{ "update", "a", "b" }));
+}
+
+test "unknown / missing subcommand" {
+	try t.expectError(error.UnknownSubcommand, parse(&.{"frob"}));
+	try t.expectError(error.MissingSubcommand, parse(&.{}));
+}
