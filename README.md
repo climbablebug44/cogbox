@@ -15,8 +15,8 @@ Currently supported harnesses: `claude-code`
 ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)),
 `opencode` ([opencode](https://github.com/sst/opencode)), and
 `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)). The
-architecture is harness-agnostic; adding more is a matter of declaring
-their host paths and launcher in `flake.nix`.
+architecture is harness-agnostic; see [Harnesses](docs/harnesses.md)
+for the model and how to add more.
 
 ## Quick start
 
@@ -40,11 +40,7 @@ The following paths will be created:
   ~/.config/cogbox/instances/default/config.json  (default settings)
   ~/.config/cogbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
   ~/.local/share/cogbox/instances/default/  (VM data)
-  ~/.claude/  (claude-code config)
-  ~/.claude.json  (claude-code auth)
-  ~/.config/opencode/  (opencode config)
-  ~/.local/share/opencode/  (opencode data)
-  ~/.codex/  (codex home)
+  ...
 
 Continue? [y/N]
 ```
@@ -53,18 +49,23 @@ The VM then starts in the background and, by default, `cogbox` waits for
 the guest's SSH server to come up and drops you straight into an SSH
 session. When you exit the session the VM keeps running (stop it with
 `cogbox stop`). Pass `--no-ssh` to just start it and return, or `-f` to
-watch it boot on the serial console instead (foreground: `Ctrl-]` detaches
-without stopping the VM).
+watch it boot on the serial console instead (`Ctrl-]` detaches without
+stopping the VM).
 
 Each enabled harness ships a launcher inside the VM: `c` for
 `claude-code`, `oc` for `opencode`, `cx` for `codex`. All three binaries
 are installed unconditionally (subject to per-architecture availability),
 so once the VM boots any of them is on `$PATH`.
 
-If a harness's host state already exists when you run cogbox for the
-first time, the harness selection prompt is skipped and only those
-harnesses are activated -- so existing single-harness installs are
-unaffected.
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [Network filtering](docs/network-filtering.md) | Network modes; L4 CIDR rules; TCP destination remap (SOCKS5); L7 vhost filtering with terminate/passthrough tiers and path constraints; threat model and enforcement internals |
+| [Per-instance extensions](docs/extensions.md) | Extending one instance's NixOS config through its `flake/flake.nix` |
+| [Plugins](docs/plugins.md) | Installable, versioned extensions: the flake contract, pinning, plugin-supplied firewall rules, the generated composition flake |
+| [Harnesses](docs/harnesses.md) | The harness model, per-harness full-auto wiring, adding a harness |
+| [Internals](docs/internals.md) | Directory layout, runtime dir + 9p shares, fw_cfg injection, launch-time patching, re-exec mechanism, host path overrides |
 
 ## Named instances
 
@@ -84,65 +85,41 @@ nix run github:illustris/cogbox -- list
 ```
 
 Ports are auto-assigned when an instance is first created (default starts
-at SSH 2222 / HTTP 8080; each new instance increments by one). You can
-override ports by editing the instance config. Each instance is also assigned
-its own L7 loopback-port triple (`l7PortBase` in config.json, default 18443),
-so multiple L7-enabled instances coexist without colliding -- see
-["L7 host filtering"](#l7-host-filtering).
+at SSH 2222 / HTTP 8080; each new instance increments by one), including a
+per-instance L7 port triple (`l7PortBase`). Override by editing the
+instance config.
 
-Harness authentication and base config are shared across all instances:
+Harness authentication and base config are shared across all instances;
+each instance overlays its own changes on top, so per-instance harness
+settings persist independently (see [Harnesses](docs/harnesses.md)).
 
-| Harness | Host config | Host auth/data |
-|---|---|---|
-| claude-code | `~/.claude/` | `~/.claude.json` |
-| opencode | `~/.config/opencode/` | `~/.local/share/opencode/` (includes `auth.json`) |
-| codex | `~/.codex/` | `~/.codex/` (includes `auth.json`) |
-
-Each instance gets its own overlay on top of the shared config, so
-per-instance harness settings persist independently.
-
-The guest's kernel hostname is set to `cogbox-<instance>` at boot
-(e.g. `cogbox-default`, `cogbox-work`), so shell prompts and SSH
-banners distinguish concurrent instances.
-
-Interactive login shells start in `/var/lib/cogbox` (the persisted,
-host-shared data dir) rather than root's home, so the autologin session
-opens where the instance's state lives.
+The guest's hostname is `cogbox-<instance>` (e.g. `cogbox-work`), and
+interactive shells start in `/var/lib/cogbox`, the persisted host-shared
+data dir.
 
 ## CLI
 
 cogbox uses a verb-based CLI. Bare `cogbox` (no verb) is sugar for
-`cogbox start`, so the most common invocation stays short. By default
-`start` launches the VM in the background and then opens an SSH session
-into it; `--no-ssh` skips that and just returns.
-
-The VM always runs as a background daemon. Its serial console and QEMU
-monitor each live on a per-instance Unix socket, so you can attach and
-detach freely (Ctrl-] detaches) without ever stopping the VM. "Foreground"
-is just `start -f`: launch, then auto-attach the console.
-
-### Verbs
+`cogbox start`. The VM always runs as a background daemon; its serial
+console and QEMU monitor live on per-instance Unix sockets, so you can
+attach and detach (`Ctrl-]`) freely without stopping the VM.
 
 | Verb | Description |
 |---|---|
-| `start` | Init if needed, launch the VM in the background, then SSH into it (default verb). With `--no-ssh` it just returns; with `-f` it attaches the serial console after launch. |
-| `console` | Attach the serial console of a running instance. `Ctrl-]` detaches; the VM keeps running. |
-| `monitor` | Attach the QEMU (HMP) monitor of a running instance. `Ctrl-]` detaches. |
+| `start` | Init if needed, launch in the background, then SSH in (default verb). `--no-ssh` just returns; `-f` attaches the serial console. |
+| `console` | Attach the serial console of a running instance (`Ctrl-]` detaches) |
+| `monitor` | Attach the QEMU (HMP) monitor of a running instance |
 | `stop` | Stop a running instance (SIGTERM, then SIGKILL with `--force`) |
 | `restart` | `stop` then `start` |
 | `status` | Print whether an instance is running, plus ports/net mode |
 | `list` | List all instances. `--json` for machine-readable output |
 | `init` | Create config + host directories without launching |
 | `ssh` | Connect to a running instance via SSH |
-| `rules` | Manage CIDR (L4) allow/deny rules for an instance |
-| `remap` | Manage TCP destination-remap rules |
-| `l7` | Manage L7 (vhost) allow/deny rules for an instance |
-| `plugin` | Manage guest plugins: flakes whose NixOS module is folded into the VM |
+| `rules` | Manage CIDR (L4) allow/deny rules -- [docs](docs/network-filtering.md#l4-cidr-rules) |
+| `remap` | Manage TCP destination-remap rules -- [docs](docs/network-filtering.md#tcp-destination-remap) |
+| `l7` | Manage L7 (vhost) allow/deny rules -- [docs](docs/network-filtering.md#l7-host-filtering) |
+| `plugin` | Manage guest plugins -- [docs](docs/plugins.md) |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
-
-The `run` verb from earlier versions has been removed: bare `cogbox` now
-starts the VM in the background and SSHes into it, `cogbox --no-ssh` just
-starts it, and `cogbox -f` is the foreground (serial-console) equivalent.
 
 Run `cogbox VERB --help` for verb-specific options.
 
@@ -152,8 +129,8 @@ Run `cogbox VERB --help` for verb-specific options.
 |---|---|---|
 | `-n, --name NAME` | every verb that takes an instance | Instance name (default: `default`) |
 | `-h, --help` | every verb | Show help and exit |
-| `--no-ssh` | `start` | Don't auto-SSH after launch; just start the VM in the background and return. |
-| `-f, --foreground` | `start` | Attach the serial console after launch instead of SSHing. Detaching (`Ctrl-]`) leaves the VM running. |
+| `--no-ssh` | `start` | Don't auto-SSH after launch; start in the background and return |
+| `-f, --foreground` | `start` | Attach the serial console after launch instead of SSHing |
 | `-y, --yes` | `start`, `init`, `plugin` | Skip the harness-selection prompt on first init / plugin confirmation prompts |
 | `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
@@ -178,441 +155,47 @@ that run only.
 | 70 | EX_SOFTWARE: internal/system error |
 | 75 | EX_TEMPFAIL: already running, port collision |
 
-### Rules verb
-
-| Form | Description |
-|---|---|
-| `cogbox rules list [-n NAME]` | List current rules with 1-based indices |
-| `cogbox rules add allow\|deny CIDR [--at N] [-n NAME]` | Add a rule. Appends by default; `--at N` inserts at 1-based position N. See ["How rules are evaluated and edited"](#how-rules-are-evaluated-and-edited) for why position matters. |
-| `cogbox rules del INDEX [-n NAME]` | Delete a rule by index |
-| `cogbox rules set [-n NAME]` | Replace all rules from stdin |
-
-CIDR rules accept optional `tcp`/`udp` and `:PORT` qualifiers when
-hand-edited in `config.json` (the CLI currently only emits the
-unqualified form). The runtime file format is:
-
-```
-allow 10.0.0.0/8                 # any proto, any port
-allow tcp 10.0.0.0/8             # tcp, any port
-deny  0.0.0.0/0:25               # any proto, port 25
-allow tcp 0.0.0.0/0:443          # tcp, port 443
-```
-
-### Remap verb
-
-A second, independent table redirects outbound TCP connects from
-specific `(cidr, port)` destinations to a loopback target on the host.
-When a match fires, the shim drives a SOCKS5 v5 CONNECT handshake on
-the connecting fd, carrying the original `(ip, port)` to the target
-proxy. v1 supports TCP only; the target must be a single host.
-
-| Form | Description |
-|---|---|
-| `cogbox remap list [-n NAME]` | List current remap rules with 1-based indices |
-| `cogbox remap add FROM TO [--at N] [-n NAME]` | Add a rule. `FROM` and `TO` are single quoted args, e.g. `"tcp 0.0.0.0/0:443"` and `"tcp 127.0.0.1:18080"`. |
-| `cogbox remap del INDEX [-n NAME]` | Delete a rule by index |
-| `cogbox remap set [-n NAME]` | Replace all rules from stdin (one `FROM -> TO` per line) |
-
-Example: send every outbound TCP/443 connection through a SOCKS5 proxy
-running on `127.0.0.1:18080`:
+### Examples
 
 ```sh
-cogbox remap add "tcp 0.0.0.0/0:443" "tcp 127.0.0.1:18080"
+# Lifecycle
+cogbox init --name work             # create without starting
+cogbox --name work                  # start + SSH in
+cogbox ssh --name work htop         # one-off remote command
+cogbox status --name work
+cogbox stop --name work
+
+# Console access
+cogbox -f                           # start and watch it boot
+cogbox console                      # attach the console later
+cogbox monitor                      # QEMU monitor ((qemu) prompt)
 ```
 
-The CIDR + remap tables share one runtime rules file; edits to either
-verb rewrite both sections cleanly without dropping the other layer.
+## Network filtering
 
-If the instance is running, rule changes take effect immediately (the
-runtime rules file is regenerated and passt receives `SIGUSR1` to reload).
-
-### L7 verb
-
-While `rules` whitelists a destination *IP*, `l7` whitelists individual
-*vhosts* behind a shared load-balancer IP. See
-["L7 host filtering"](#l7-host-filtering) for the model and threat caveats.
-
-| Form | Description |
-|---|---|
-| `cogbox l7 list [-n NAME]` | List current L7 rules and the instance mode |
-| `cogbox l7 add allow\|deny HOST [--passthrough \| --path P \| --terminate [--insecure-upstream]] [--at N] [-n NAME]` | Add a rule. `HOST` is an exact name, a `*.suffix` wildcard, or a bare `*`. Hosts **terminate by default**; `--passthrough` opts a host out (SNI-only, for cert-pinned clients). `--path`/`--terminate` force terminate; `--insecure-upstream` skips upstream cert verification (implies terminate). |
-| `cogbox l7 del INDEX [-n NAME]` | Delete a rule by index |
-| `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
-| `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance default tier (terminate if unset) |
+The default `rules` mode gives the sandbox working public internet while
+blocking LAN, link-local, and cloud-metadata ranges. On top of that, L7
+rules whitelist individual vhosts behind shared IPs, with TLS termination
+for `Host`/path enforcement. Rule edits hot-reload into a running VM.
 
 ```sh
-cogbox l7 add allow api.example.com                       # terminate (default)
-cogbox l7 add allow pinned.example.com --passthrough      # SNI-only (cert pinned)
-cogbox l7 add allow api.example.com --path /v1/           # terminate + path
+cogbox rules add allow 192.168.1.50/32 --at 8    # open one LAN host (position matters)
+cogbox l7 add allow api.example.com              # one vhost, not its LB siblings
+cogbox l7 add allow git.example.com --path /myorg/
+nix run github:illustris/cogbox -- --network none   # or: no network at all
 ```
 
-L7 rules live under `.network.l7` and require the instance's network mode
-to be `rules`. Edits hot-reload the proxy (`SIGHUP`) and passt (`SIGUSR1`).
-
-### Plugin verb
-
-Installs [plugins](#plugins) -- flakes exposing `nixosModules.default` -- into an instance.
-
-| Form | Description |
-|---|---|
-| `cogbox plugin list [-n NAME]` | List installed plugins with their pinned revision and rule count |
-| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install a plugin. `#ATTR` selects `nixosModules.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the rule-merge confirmation. |
-| `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
-| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules. Without a name, updates every plugin; each flake URL is resolved once and all of its plugins move together. |
-
-```sh
-cogbox plugin add github:illustris/panopticon?dir=flake
-cogbox plugin add 'github:org/observability#loki' -n work   # one module of a multi-plugin flake
-cogbox plugin add path:/home/me/myplugin --as dev -n work
-cogbox plugin update
-cogbox plugin del panopticon
-```
-
-Module changes take effect at the next `cogbox restart`; merged network
-rules hot-reload immediately, like any other `rules` edit.
-
-### Console and monitor
-
-The VM is always a background daemon. QEMU's guest serial console and a human
-(HMP) QEMU monitor each listen on a per-instance Unix socket in the runtime
-directory, so you can attach a terminal to either one, detach, and reattach
-as often as you like -- the VM is never interrupted.
-
-| Form | Description |
-|---|---|
-| `cogbox start -f [-n NAME]` | Launch in the background, then immediately attach the serial console (foreground). |
-| `cogbox console [-n NAME]` | Attach the serial console of an already-running instance. Recent console history is replayed first, then the session goes live. |
-| `cogbox monitor [-n NAME]` | Attach the QEMU monitor (the `(qemu)` prompt) of a running instance. Type commands like `info status`, `info block`, `system_powerdown`. |
-
-Press **`Ctrl-]`** to detach from either; the VM keeps running and you return
-to your shell. Only one attachment is possible at a time per socket (QEMU's
-character-device sockets are single-client).
-
-The full guest serial output of the current session is always captured to
-`<runtime>/console.log` regardless of whether a console is attached, and the
-daemon's own stdout/stderr (passt, QEMU warnings) go to `<runtime>/cogbox.log`.
-
-```sh
-# Start in the background, then watch it boot
-nix run github:illustris/cogbox -- -f
-
-# Attach later from another terminal
-nix run github:illustris/cogbox -- console
-nix run github:illustris/cogbox -- monitor --name work
-```
-
-### SSH verb
-
-| Form | Description |
-|---|---|
-| `cogbox ssh [-n NAME] [REMOTE_COMMAND...]` | Connect to a running instance over SSH. Resolves the live port and bind address from the runtime directory. Disables host-key checking since the guest's root disk is ephemeral and host keys regenerate on every boot. Use `--` to separate cogbox flags from the remote command if it begins with a flag-shaped argument. |
-
-```sh
-# Prepare runtime directory without booting
-nix run github:illustris/cogbox -- init
-
-# Launch with 8 cores and 16 GB RAM
-nix run github:illustris/cogbox -- --vcpu 8 --mem 16384
-
-# Create a named instance without starting it
-nix run github:illustris/cogbox -- init --name work
-
-# Launch with no outbound network
-nix run github:illustris/cogbox -- --network none
-
-# Background lifecycle
-nix run github:illustris/cogbox -- start
-nix run github:illustris/cogbox -- status
-nix run github:illustris/cogbox -- ssh htop
-nix run github:illustris/cogbox -- stop
-
-# Init in rules mode (gets the seeded bogon-deny ruleset by default).
-# To allow a specific LAN host, insert an allow before the matching deny;
-# see the "rules" network mode section for the full pattern.
-nix run github:illustris/cogbox -- init --name secure
-```
-
-## Network modes
-
-Three modes are available. `full` and `rules` use
-[passt](https://passt.top/) for networking, which supports all IP protocols
-including ICMP. `none` uses QEMU's built-in SLIRP with `restrict=on`.
-
-### full
-
-Unrestricted networking via passt. All IP protocols (TCP, UDP, ICMP, etc.)
-work. No extra privileges needed.
-
-### none
-
-QEMU's SLIRP `restrict=on` blocks all outbound traffic from the guest.
-SSH and HTTP port forwards from the host still work. No extra privileges
-needed.
-
-Note: every supported harness needs access to a model provider's API
-(`claude-code` -> Anthropic; `opencode` -> the configured provider).
-In `none` mode they won't function unless API access is provided
-through another channel (e.g., SSH port forwarding).
-
-### rules (default)
-
-Ordered CIDR allow/deny rules enforced via an LD_PRELOAD filter on
-[passt](https://passt.top/). First match wins; default policy is deny.
-No extra privileges needed. All IP protocols (TCP, UDP, ICMP) are
-subject to the rules.
-
-A new instance is seeded with deny rules for private (RFC1918), link-local
-(including cloud metadata `169.254.169.254`), and bogon ranges, followed
-by `allow 0.0.0.0/0` for the public internet. Net effect: working internet
-out of the box, with LAN and metadata services blocked. Rule objects may
-optionally carry a `comment` field; it's preserved through edits and
-shown by `rules list` but ignored by the filter.
-
-```json
-{
-    "network": {
-        "rules": [
-            {"deny":  "0.0.0.0/8",       "comment": "this network (RFC 1122)"},
-            {"deny":  "10.0.0.0/8",      "comment": "RFC1918 private"},
-            {"deny":  "100.64.0.0/10",   "comment": "carrier-grade NAT (RFC 6598)"},
-            {"deny":  "169.254.0.0/16",  "comment": "link-local incl. cloud metadata 169.254.169.254"},
-            {"deny":  "172.16.0.0/12",   "comment": "RFC1918 private"},
-            {"deny":  "192.0.0.0/24",    "comment": "IETF protocol assignments (RFC 6890)"},
-            {"deny":  "192.0.2.0/24",    "comment": "TEST-NET-1 documentation (RFC 5737)"},
-            {"deny":  "192.168.0.0/16",  "comment": "RFC1918 private"},
-            {"deny":  "198.18.0.0/15",   "comment": "benchmark testing (RFC 2544)"},
-            {"deny":  "198.51.100.0/24", "comment": "TEST-NET-2 documentation (RFC 5737)"},
-            {"deny":  "203.0.113.0/24",  "comment": "TEST-NET-3 documentation (RFC 5737)"},
-            {"deny":  "224.0.0.0/4",     "comment": "multicast (RFC 5771)"},
-            {"deny":  "240.0.0.0/4",     "comment": "reserved/broadcast incl. 255.255.255.255"},
-            {"allow": "0.0.0.0/0",       "comment": "public internet"}
-        ]
-    }
-}
-```
-
-#### How rules are evaluated and edited
-
-Rules are evaluated top-to-bottom on every outbound packet; the first
-matching rule wins, and a packet that matches no rule is denied.
-**Position matters**: a rule only fires if no earlier rule matches the
-same address first.
-
-The `rules add` command **appends by default** -- the new rule lands at
-the bottom of the list, after the seeded `allow 0.0.0.0/0` catch-all.
-That position is almost always wrong: the catch-all matches everything
-public, so an appended `deny` or `allow` for a public address is
-unreachable. Pass `--at N` to insert at 1-based position `N`, shifting
-existing rules down. To see current positions, run `rules list`.
-
-Two practical patterns:
-
-**Allow a specific LAN host** -- insert the allow ahead of the matching
-deny. Use `rules list` to find the right index for the deny:
-
-```sh
-cogbox rules list
-# ...
-# 8: deny 192.168.0.0/16  # RFC1918 private
-# ...
-cogbox rules add allow 192.168.1.50/32 --at 8
-```
-
-**Block a specific public address** -- insert the deny ahead of the
-trailing `allow 0.0.0.0/0`. Easiest is `--at 1` so it runs before all
-existing rules:
-
-```sh
-cogbox rules add deny 8.8.8.8/32 --at 1
-```
-
-Implicit rules (applied before user rules, not configurable):
-- **DNS (port 53)** is always allowed so hostname resolution works
-- **Loopback (127.0.0.0/8, ::1)** is always denied to prevent the VM
-  from accessing host services via passt's gateway-to-loopback mapping
-
-The filter works by intercepting passt's outbound `connect()`,
-`sendto()`, `sendmsg()`, and `sendmmsg()` syscalls. Since passt is the
-VM's only network path, this is a complete enforcement point. The filter
-is a Zig shared library (`libnetfilter.so`) loaded via `LD_PRELOAD`;
-initialization runs before passt enables its seccomp sandbox.
-
-#### L7 host filtering
-
-L4 rules whitelist a destination *IP*. That is not enough when several
-virtual hosts share one load-balancer IP: allowing the LB lets the sandbox
-reach **every** backend on it by guessing the `Host`/SNI. The `l7` layer
-whitelists individual vhosts instead.
-
-When `.network.l7` has any rule, cogbox starts a small host-side proxy and
-funnels **all** guest 80/443 traffic to it (via an auto-injected `remap`).
-For each connection the proxy reads the vhost from the TLS **SNI** (HTTPS)
-or **Host** header (HTTP), checks it against your `allow`/`deny` list
-(first match, default deny; patterns are exact / `*.suffix` / `*`), and on
-allow **re-resolves that name itself, host-side**, then splices the bytes
-through. Re-resolution is the point: the guest's chosen IP is discarded, so
-
-- allowing one vhost does **not** expose siblings on the same IP, and
-- DNS-based load balancing (rotating/shared IPs) keeps working, because the
-  proxy always resolves the allowed name fresh.
-
-```sh
-cogbox l7 add allow api.example.com        # only this vhost on its LB
-```
-
-The proxy and its mitmproxy terminate backend bind **per-instance** loopback
-ports (a contiguous triple from each instance's `l7PortBase`: TLS funnel /
-HTTP funnel / terminate hop), so several L7-enabled instances run on one host
-without one instance's guest traffic funnelling into another's proxy. If the
-proxy can't bind its ports (a stale proxy or another process holding them),
-`cogbox start` **aborts** rather than booting a VM whose funnel can't reach
-its proxy.
-
-#### How L7 composes with L4
-
-The proxy re-resolves the allowed name **host-side** (it never trusts the
-guest's IP or a guest-supplied Host/SNI as a destination), so an L7 rule
-refines the L4 IP policy by name. For each re-resolved IP, on funneled web
-traffic:
-
-| vhost vs. L7 rules | decision |
-|---|---|
-| explicitly **allowed** | **dial** -- supersedes an L4 IP *block* |
-| explicitly **denied** | **drop** -- supersedes an L4 IP *allow* |
-| **not in any rule** | defer to L4 (dial if the IP is allowed, drop if blocked) |
-
-…and a **non-overridable hard floor** (loopback, this-network `0.0.0.0/8`,
-and link-local incl. cloud metadata `169.254.169.254`) is *always* dropped,
-even for an allowed vhost.
-
-**Path constraints fail closed.** When an `allow` rule names a host but adds a
-path prefix (`allow api.example.com /v1/`), a request to that host on an
-*uncovered* path (e.g. `/v2/`) is **dropped**, not deferred to L4 -- otherwise
-the constraint would be silently bypassed whenever the IP is independently
-L4-allowed (the usual "allow the internet at L4, restrict vhosts at L7" setup).
-A `deny` rule with a path (`deny api.example.com /admin/`) only blocks that
-prefix and leaves other paths to L4, since you're carving out a hole, not
-whitelisting. On HTTPS this is enforced by the terminate tier; on cleartext
-HTTP the proxy enforces it inline from the request line.
-
-So to reach an internal vhost on a private LB, you just allow the **name** --
-no L4 IP rule, and you never open that IP for anything else:
-
-```sh
-# 10.10.10.10 hosts a.internal and b.internal; reach ONLY a.internal:
-cogbox l7 add allow a.internal          # leave 10.10.10.10 blocked (default deny 10/8)
-# a.internal -> allowed -> dialed;  b.internal -> unlisted -> IP blocked -> dropped
-```
-
-Conversely, sibling isolation only applies where the LB's **IP is blocked**.
-On a public LB reachable via `allow 0.0.0.0/0`, an unlisted sibling falls back
-to L4 and is allowed; block the IP (or `l7 add deny sibling`) to restrict it.
-
-> **Wildcard caveat.** A `*.suffix` allow trusts that whole domain's DNS --
-> if an attacker can create `evil.suffix` pointing at an internal IP, it would
-> be dialed (metadata/loopback/link-local still blocked by the hard floor).
-> Exact-name allows have no such exposure (you control that name's DNS); only
-> wildcard a suffix whose DNS you trust.
-
-There are two tiers, chosen per host. **Terminate is the default**:
-
-- **Terminate (default)** -- the proxy MITMs the host's TLS via a per-instance
-  CA so it can enforce `Host == SNI` and URL paths -- see
-  ["L7 terminate tier"](#l7-terminate-tier). This breaks cert-pinned clients,
-  so opt those out with `--passthrough`.
-- **Passthrough** (`--passthrough` per host, or `l7 mode passthrough` for the
-  whole instance) -- TLS is *not* intercepted, so cert pinning is preserved,
-  but the proxy trusts the SNI it sees: a shared ingress that routes by the
-  inner `Host:`/HTTP-2 `:authority` could still be steered to a sibling on a
-  single connection, and URL paths can't be inspected on HTTPS.
-
-**Harness API endpoints auto-passthrough.** Because terminate is the default,
-the in-guest agents' own control-plane endpoints (`api.anthropic.com`,
-`api.openai.com`, `chatgpt.com`, ...) are automatically kept in passthrough, so
-the harnesses keep working out of the box (notably rustls clients that may not
-honor the injected CA) and their API tokens stay end-to-end. An explicit
-`--terminate` on such a host overrides it; provider-agnostic harnesses (e.g.
-opencode) should `--passthrough` their configured provider host.
-
-**Caveats** (documented, not silently assumed safe):
-
-- **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the
-  funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP.
-  DNS (port 53) still works.
-- Loopback, this-network, and link-local/metadata vhosts are never reachable
-  through the proxy (the hard floor) -- consistent with the sandbox's LAN
-  posture for those specific ranges.
-
-#### L7 terminate tier
-
-By default every allowed host is routed through a TLS-terminating proxy
-([mitmproxy](https://mitmproxy.org/)) so cogbox can see inside HTTPS (use
-`--passthrough` to opt a host out, or a `--path` prefix to add path
-enforcement). This closes the passthrough gaps:
-
-- enforces `Host == SNI` (a connection whose decrypted `Host:`/`:authority`
-  disagrees with the negotiated SNI is rejected with `403`), and
-- enforces **URL path prefixes** (`--path /v1/`), boundary-aware and applied
-  to the normalized, percent-decoded path.
-
-```sh
-cogbox l7 add allow git.example.com --path /myorg/   # only this path prefix
-cogbox l7 mode terminate                             # terminate every L7 host
-```
-
-How it works: every rules-mode instance runs mitmproxy with a **per-instance
-CA** (auto-generated under `~/.config/cogbox/instances/<name>/l7-ca/`, key
-stays host-side at mode `0600`) -- started at every boot, even with no L7
-rules yet, so that hot-added rules terminate immediately and the CA is in the
-guest trust store from the start (it can only be injected at launch). The CA **certificate** (never the key) is
-injected into the guest at boot via `fw_cfg` and assembled into
-`/run/cogbox/ca-bundle.crt`; the harness launchers and login shells point
-`SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`GIT_SSL_CAINFO`/`REQUESTS_CA_BUNDLE`/
-`NODE_EXTRA_CA_CERTS` at it. The Zig proxy still does all SSRF/CIDR vetting
-and hands mitmproxy only a pre-vetted IP; mitmproxy mints a per-SNI leaf,
-applies the rules, and re-originates upstream TLS validated against the
-*real* system trust.
-
-**Upstream cert verification (`--insecure-upstream`).** Because the proxy
-re-originates TLS, it -- not the guest -- validates the upstream certificate
-(against the real system trust, by SNI). The guest's `curl -k` can't relax
-this: `-k` only covers the guest<->proxy leg, which is the always-valid minted
-leaf. So a terminate host whose upstream has a self-signed or name-mismatched
-cert fails with mitmproxy's `502 Bad Gateway -- Certificate verify failed`
-(common for internal services). Mark such a host `--insecure-upstream` to skip
-verification on **its** proxy<->upstream leg only -- the operator's per-host
-equivalent of `curl -k`:
-
-```sh
-cogbox l7 add allow internal.svc --insecure-upstream    # MITM, don't verify its upstream cert
-cogbox l7 add allow internal.svc --path /v1/ --insecure-upstream
-```
-
-Verification stays **on** for every other host (fail closed); the flag is a
-deliberate per-target exception. If you only need to *whitelist* a bad-cert
-host (no path/`Host` enforcement), prefer passthrough instead -- there the
-guest keeps end-to-end TLS and its own `curl -k`.
-
-Terminate caveats:
-
-- This is an **intentional MITM**: for terminate hosts the proxy sees
-  plaintext (host-process-only, never persisted). Cert pinning is **broken**
-  for those hosts -- clients that pin a specific cert/CA (some Go and mobile
-  apps) will fail; leave them on passthrough.
-- Clients that ship their **own** trust store and ignore the OS store + env
-  vars (e.g. Rust `rustls` pinned to the bundled `webpki-roots` crate) won't
-  trust the instance CA. The `codex` harness is Rust and uses `rustls`, but
-  it links `rustls-native-certs`/`native-tls` and references `SSL_CERT_FILE`
-  with **no** bundled `webpki-roots` (per binary inspection of 0.139.0), so it
-  loads system roots and should honor the injected CA -- worth a quick runtime
-  check. Passthrough is unaffected regardless.
-- HTTP/2 to the client is disabled (http/1.1 only) so every request's
-  authority is checked against the SNI.
+First match wins and position matters; L7 has two tiers (terminate
+default, passthrough for cert-pinned clients) and several deliberate
+caveats. **Read [network filtering](docs/network-filtering.md)** for rule
+semantics, the L4/L7 composition table, the threat model, and the
+enforcement internals.
 
 ## Configuration
 
-All settings are in `~/.config/cogbox/` (or `$XDG_CONFIG_HOME/cogbox/`).
-Edit them and restart the VM -- no rebuild needed.
+All settings are in `~/.config/cogbox/` (or `$XDG_CONFIG_HOME/cogbox/`),
+one subdir per instance under `instances/<name>/`. Edit and restart the
+VM -- no rebuild needed.
 
 ### config.json
 
@@ -635,296 +218,42 @@ Edit them and restart the VM -- no rebuild needed.
 | `mem` | int | 32768 | RAM in megabytes |
 | `sshPort` | int | 2222 | Host port forwarded to guest SSH (22) |
 | `httpPort` | int | 8080 | Host port forwarded to guest 8080 |
-| `overlaySize` | string | `128M` | Persistent harness overlay image (shared across all harnesses; per-harness subdirs inside) |
+| `overlaySize` | string | `128M` | Persistent harness overlay image |
 | `storeOverlaySize` | string | `16G` | Writable nix store tmpfs |
 | `bindAddr` | string | `127.0.0.1` | Host bind address for port forwards |
-| `network` | string/object | seeded `rules` | Network mode: `"full"`, `"none"`, or `{"rules":[...]}` |
+| `network` | string/object | seeded `rules` | `"full"`, `"none"`, or `{"rules":[...]}` |
+| `l7PortBase` | int | 18443 | Base of the instance's L7 loopback port triple |
+| `plugins` | array | absent | Managed by `cogbox plugin` -- see [Plugins](docs/plugins.md) |
 
 Only include the keys you want to change -- missing keys use the defaults.
 
-### Per-instance configuration
-
-Each instance has its own config dir under
-`~/.config/cogbox/instances/<name>/`. The default instance uses the
-reserved name `default`, so the config layout mirrors the data layout:
-
-```
-~/.config/cogbox/
-  authorized_keys              # shared SSH keys (fallback for all instances)
-  instances/
-    default/
-      config.json              # default instance settings (sshPort 2222)
-      flake/
-        flake.nix              # per-instance NixOS extensions (no-op default)
-    work/
-      config.json              # auto-generated with unique ports
-      flake/
-        flake.nix              # extend NixOS config for this instance
-      authorized_keys          # optional per-instance SSH keys
-    personal/
-      config.json
-      flake/
-        flake.nix
-```
-
-Each instance config has the same format. SSH keys fall back to the
-shared top-level `authorized_keys` unless a per-instance file exists.
-
-Data (VM state, overlays) is stored per-instance under
-`~/.local/share/cogbox/instances/<name>/`. The default instance uses
-the reserved name `default`, so all instances are siblings and a
-default-instance boot does not 9p-share named-instance state into the
-default guest:
-
-```
-~/.local/share/cogbox/
-  instances/
-    default/                   # default instance data
-      harness-overlay.img      # shared across claude-code, opencode
-      .config/active-harnesses # newline-separated list of active harnesses
-    work/                      # named instance data
-      harness-overlay.img
-    personal/
-      harness-overlay.img
-```
-
-### Per-instance NixOS extensions (flake.nix)
-
-Each instance owns a tiny flake at
-`~/.config/cogbox/instances/<name>/flake/flake.nix`. When that file
-differs from the scaffolded default, the wrapper re-execs itself via `nix
-run --override-input userExtensions path:<instance-config-dir>/flake`, so
-whatever NixOS module the user puts in that flake is folded into the
-microvm closure. An unedited scaffold matches byte-for-byte and the
-re-exec is skipped, so a default install boots without any extra `nix`
-evaluation. The flake lives in its own subdirectory so unrelated edits to
-sibling files (`config.json`, `authorized_keys`) don't bust the flake's
-source hash.
-
-The scaffold written on first init exposes a no-op `nixosModules.default`:
-
-```nix
-{
-    description = "cogbox per-instance extensions";
-
-    outputs = { self }: {
-        nixosModules.default = { pkgs, lib, ... }: {
-            # Add per-instance packages and modules here.
-        };
-    };
-}
-```
-
-`pkgs` here resolves to cogbox's nixpkgs -- the wrapper passes
-`--override-input userExtensions/nixpkgs` so any `nixpkgs` input the user
-declares is replaced by cogbox's. To use a *different* nixpkgs in one
-instance, declare a separately-named input (e.g. `nixpkgs-custom`) and
-reference it explicitly in the module.
-
-#### Example: pre-populate the nix store with HBase build deps
-
-A bare `nix shell nixpkgs#hbase` inside the VM otherwise refetches HBase
-on every boot (the writable nix store overlay is a tmpfs). Land HBase in
-the system closure instead, so it's registered in the guest's nix DB at
-boot and resolves locally:
-
-```nix
-# ~/.config/cogbox/instances/hbase/flake/flake.nix
-{
-    outputs = { self }: {
-        nixosModules.default = { pkgs, ... }: {
-            environment.systemPackages = with pkgs; [ hbase openjdk21 maven ];
-            system.extraDependencies  = with pkgs; [ hbase openjdk21 maven ];
-        };
-    };
-}
-```
-
-`environment.systemPackages` puts the binaries on PATH inside the VM;
-`system.extraDependencies` ensures the build-time inputs are also part of
-the closure, so `nix develop nixpkgs#hbase` (or any other workflow that
-realises those deps) finds them already realised.
-
-The wrapper rebuilds the microvm runner with this module included on the
-next launch. Subsequent launches reuse the cached build until you edit
-the flake.
-
-#### Notes
-
-- The first time `nix run` evaluates a per-instance `path:` flake, it
-  writes a `flake.lock` next to the user's `flake.nix` (inside the
-  `flake/` subdir). This is normal.
-- The mechanism re-execs once per launch (guarded internally so the loop
-  ends after one hop). Non-launch verbs (`list`, `status`, `stop`,
-  `rules`, `ssh`) never re-exec; neither does an unedited scaffold.
-- The first launch *with* a customized flake fetches and caches every
-  cogbox flake input (microvm.nix, nixfs, nix-mcp, etc.) -- it needs
-  network access on that one launch. Subsequent launches reuse the cache.
-
-### Plugins
-
-Plugins package the per-instance extension pattern above into something
-installable: a git repo (or any flake source) that carries a NixOS module
-plus, optionally, the firewall rules it needs. `cogbox plugin add` is the
-CLI workflow for what previously required hand-editing the instance flake
-and hand-merging rules.
-
-**The contract.** A plugin is a NixOS module exposed by a flake. One flake
-can carry any number of plugins, and any subset of them can be enabled per
-instance:
-
-- `nixosModules.<attr>` -- the plugin module, selected by the URL fragment
-  (`URL#attr`); a bare URL means `nixosModules.default`. Folded into the
-  guest like the per-instance flake's module. `pkgs` resolves to cogbox's
-  nixpkgs (the same caveat as the scaffold: declare a differently-named
-  input to use your own).
-- `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects
-  in `config.json`'s `.network.rules` schema for that module. For the
-  default module the flat form `cogboxPlugin.networkRules` also works:
-
-  ```nix
-  nixosModules.loki = ...;
-  cogboxPlugin.loki.networkRules = [
-      { allow = "10.251.36.17/32"; comment = "loki backend"; }
-  ];
-  ```
-
-`FLAKE_URL` can be anything nix accepts: `github:owner/repo`,
-`git+https://...`, `path:/abs/dir`, with `?dir=` for flakes in a
-subdirectory.
-
-**Pinning.** Versioning is per flake, not per plugin. `add` resolves the
-URL with `nix flake metadata`, records the locked URL, rev, and narHash in
-`config.json` (`.plugins`), and runs `nix flake archive` so the plugin and
-its transitive inputs land in the local store -- subsequent starts resolve
-the pins offline. Enabling another module of an already-installed flake
-reuses the existing pin, so all plugins from one flake stay at one rev;
-`update` resolves each distinct URL once and moves all of its plugins
-together. To hold a flake at a specific rev, pin it in the URL itself
-(`...?rev=<sha>` or `github:owner/repo/<sha>`) -- a distinct URL pins
-independently. The clone-less model means there is no working copy to
-manage: `update` re-resolves the *original* URL (network) and re-pins only
-when the content changed.
-
-**Network rules.** If the plugin declares `cogboxPlugin.networkRules` and
-the instance is in `rules` mode, `add` shows the rules and asks before
-merging (auto-confirmed with `-y` or when stdin is not a tty). Merged
-rules are inserted **at the top of the rule list** -- rules are
-first-match-wins and the seeded ruleset is "RFC1918/bogon denies, then
-`allow 0.0.0.0/0`", so a plugin's allows for private backend IPs only work
-ahead of the denies. Review the prompt: a malicious plugin could suggest
-`allow 0.0.0.0/0`. Each merged rule carries a `"plugin": "<name>"` field,
-which is how `del` and `update` remove or replace exactly the rules that
-plugin brought in (your own edits to the same CIDRs are untouched).
-
-**Composition.** Plugin state is materialized as a generated flake at
-`~/.config/cogbox/instances/<name>/plugins-flake/flake.nix` (marked DO NOT
-EDIT; regenerated from `config.json` by every `plugin` command, `update`
-included -- run `cogbox plugin update` if it ever goes missing). It
-declares one pinned input per plugin plus the instance's own `flake/` as
-input `user`, and exposes a single `nixosModules.default` importing all of
-them, user module last. At launch the wrapper points `--override-input
-userExtensions` at this flake instead of the plain instance flake whenever
-`.plugins` is non-empty, so plugins and manual flake.nix edits compose.
-The plugin name `user` is reserved for this reason.
-
-**Trust.** Adding a plugin evaluates third-party nix code at add time
-(pure eval, IFD disabled) and *builds* it into the guest at the next
-start. Treat `cogbox plugin add` like installing software: only add flakes
-you trust. The suggested-rules prompt exists so a plugin cannot silently
-widen the instance's egress policy.
-
 ### authorized_keys
 
-SSH public keys, one per line (same format as `~/.ssh/authorized_keys`).
-On first init the shared file is seeded from `~/.ssh/*.pub` plus any keys
-loaded in the running ssh-agent (`ssh-add -L`); pass `--no-auto-keys` to
-keep it empty. At launch, the wrapper copies either the per-instance
-`authorized_keys` (if present) or the shared top-level one into the
-instance's data dir, where the VM reads it at boot.
-
-```sh
-# Add another key after init
-cp ~/.ssh/id_ed25519.pub ~/.config/cogbox/authorized_keys
-
-# Connect via the ssh subcommand (resolves port/host automatically)
-cogbox ssh                          # default instance
-cogbox ssh --name work              # named instance
-cogbox ssh --name work htop         # one-off remote command
-
-# Or use ssh directly if you prefer
-ssh -p 2222 root@localhost
-```
-
-Without SSH keys, the VM console is accessible directly in the terminal
+SSH public keys, one per line. On first init the shared file
+(`~/.config/cogbox/authorized_keys`) is seeded from `~/.ssh/*.pub` plus
+any keys in the running ssh-agent; pass `--no-auto-keys` to keep it
+empty. A per-instance `instances/<name>/authorized_keys` overrides the
+shared file. Without SSH keys, the VM console is accessible directly
 (root autologin is enabled).
 
-### Host-side paths
+### Extending the guest
 
-Override where data lives on the host with environment variables:
+Two mechanisms, both folding NixOS modules into the instance's VM:
 
-| Variable | Default | Description |
-|---|---|---|
-| `COGBOX_DATA` | `$XDG_DATA_HOME/cogbox` (i.e. `~/.local/share/cogbox`) | Persistent data root. Each instance lives at `$COGBOX_DATA/instances/<name>/`; the default uses the reserved name `default`. |
-| `COGBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host claude-code config (overlay lower in VM) |
-| `COGBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
-| `COGBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
-| `COGBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
-| `COGBOX_CODEX_HOME` | `$HOME/.codex` | Host codex home (config, auth, sessions; overlay lower in VM) |
+- **[Per-instance flake](docs/extensions.md)** -- edit
+  `instances/<name>/flake/flake.nix` to add packages, services, mounts;
+  applied on the next start.
+- **[Plugins](docs/plugins.md)** -- install versioned extensions from any
+  flake URL, optionally with the firewall rules they need:
 
-```sh
-COGBOX_DATA=/mnt/fast/cogbox nix run .
-```
+  ```sh
+  cogbox plugin add github:myorg/myplugin?dir=flake
+  cogbox plugin add 'github:org/observability#loki' -n work
+  cogbox plugin update
+  ```
 
-## How it works
-
-QEMU's 9p share sources must be absolute paths known at build time. The
-wrapper creates a per-instance symlink directory pointing to the user's
-actual paths, so the built VM image works for any user. Runtime state
-lives under `$XDG_RUNTIME_DIR/cogbox` (typically
-`/run/user/$UID/cogbox`); named instances append a `-<name>`
-suffix. Each has its own symlinks and PID lock:
-
-```
-$XDG_RUNTIME_DIR/cogbox[-<name>]/
-  data/                  -> $COGBOX_DATA/instances/<name>
-  claude-code-config     -> $COGBOX_CLAUDE_CONFIG
-  claude-code-auth       -> $COGBOX_CLAUDE_AUTH
-  opencode-config        -> $COGBOX_OPENCODE_CONFIG
-  opencode-data          -> $COGBOX_OPENCODE_DATA
-  codex-home             -> $COGBOX_CODEX_HOME
-  .harness-stubs/        # empty stubs for inactive harnesses (so QEMU
-                         # 9p sources resolve even when the host has no
-                         # state for a given harness)
-```
-
-If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no
-active logind session), the wrapper falls back to
-`/tmp/cogbox-runtime-$UID/` per the XDG spec.
-
-Runtime settings (vcpu, memory, ports) are applied by patching the microvm
-runner script's QEMU arguments at launch time. Settings that affect the
-guest (overlay sizes, SSH keys) are written to the instance's data
-directory where systemd services inside the VM pick them up at boot. The
-wrapper patches the QEMU runner's 9p share source paths to point at the
-instance-specific runtime directory, so the same VM image serves all
-instances.
-
-In `rules` network mode, the wrapper loads a Zig shared library
-(`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts
-outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and
-checks destination addresses against the configured CIDR rules. Denied
-connections receive `ENETUNREACH`. The library initializes via
-`.init_array` (before `main()`) so that all file I/O for rule loading
-completes before passt activates its seccomp-bpf sandbox. Rules can be
-hot-reloaded at runtime via `SIGUSR1` to the passt process.
-
-The `cogbox rules` subcommands (`list`, `add`, `del`, `set`) are
-implemented inside the same Zig binary as the rest of the cogbox CLI.
-They edit `config.json`, regenerate the runtime rules file, and signal
-the running passt -- so rule changes take effect without restarting the
-VM. The CLI shares the on-disk rule format parser with the LD_PRELOAD
-filter, so the formats stay in sync.
+Host-side data locations can be overridden with `COGBOX_*` environment
+variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 
 ## Defaults
 
@@ -942,57 +271,10 @@ filter, so the formats stay in sync.
 Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
 `nixfs`.
 Harness binaries (with launchers): `claude-code` (`c`), `opencode`
-(`oc`), and `codex` (`cx`), all on `x86_64-linux` and `aarch64-linux`
-only (sourced from `numtide/llm-agents.nix`).
+(`oc`), and `codex` (`cx`), on `x86_64-linux` and `aarch64-linux`
+(sourced from `numtide/llm-agents.nix`).
 Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 (where the `nix-mcp` flake publishes a build).
-
-## Harnesses
-
-A *harness* is a coding-agent CLI that cogbox installs in the guest
-and mounts host state for. The currently-supported harnesses are
-`claude-code` (launcher: `c`), `opencode` (launcher: `oc`), and
-`codex` (launcher: `cx`).
-
-The harness model is symmetric and opt-in:
-
-- **All harness binaries are always installed** in the guest (subject
-  to per-architecture availability), so any active VM has every
-  launcher on `$PATH`.
-- **Host state is created only for harnesses you actually use.** On
-  first init, the wrapper checks for any pre-existing harness config
-  on the host and treats those harnesses as active. If none are found,
-  it prompts you to choose. The active list is recorded at
-  `<datadir>/.config/active-harnesses`.
-- **A single overlay image** (`harness-overlay.img`) backs persistent
-  state for all harnesses, with per-harness subdirectories inside
-  (`/var/lib/harness-rw/<harness>/<pathkey>/{upper,work}` and
-  `/var/lib/harness-rw/<harness>/{cache,state}` for ephemeral paths).
-  Resizing `overlaySize` covers all harnesses at once.
-
-To add a harness after init, either create its host config dir
-manually and re-launch, or set `COGBOX_<HARNESS>_<KEY>` to point at
-an existing dir.
-
-A note about `node_modules/`: if a host harness config dir contains a
-`node_modules/` tree, it is exposed read-only into the VM via the 9p
-lowerdir share. To avoid streaming hundreds of megabytes through 9p on
-every boot, keep heavy package installs out of harness config dirs.
-
-How "full auto" is wired per harness:
-- `c` (claude-code) sets `IS_SANDBOX=1` and passes `--dangerously-skip-permissions`.
-- `oc` (opencode) sets `OPENCODE_PERMISSION='"allow"'`. Opencode
-  `JSON.parse`s that env var and merges it into `config.permission`;
-  the string shorthand normalises to `{"*": "allow"}`, which expands
-  to a single rule that matches every tool and pattern at evaluation
-  time. opencode's own `--dangerously-skip-permissions` flag exists
-  only on the `run` subcommand (one-shot mode) and is rejected by the
-  default TUI command's strict yargs parser, so the env-var path is
-  the universal bypass.
-- `cx` (codex) sets `IS_SANDBOX=1` and passes
-  `--dangerously-bypass-approvals-and-sandbox`, codex's documented escape
-  hatch that skips all confirmation prompts and disables codex's own
-  command sandbox. The outer microvm provides the actual sandbox.
 
 ## Limitations
 
@@ -1000,16 +282,15 @@ How "full auto" is wired per harness:
   `riscv64-linux`.
 - Per-harness platform availability varies. `claude-code`, `opencode`,
   and `codex` all come from `numtide/llm-agents.nix`, which builds them
-  for `x86_64-linux` and `aarch64-linux` only. On `riscv64-linux` none
-  of these harnesses ship out of the box and would have to be installed
-  manually inside the VM.
+  for `x86_64-linux` and `aarch64-linux` only.
 - One instance per name at a time (PID lock per runtime directory).
   Multiple differently-named instances can run simultaneously.
 - The writable nix store overlay is a tmpfs -- installed packages do not
-  persist across VM reboots
+  persist across VM reboots (but see
+  [pre-populating the store](docs/extensions.md#example-pre-populate-the-nix-store-with-build-deps)).
 - Changing `overlaySize` only affects newly created overlay images; delete
-  the overlay image to recreate with a new size
+  the overlay image to recreate with a new size.
 - Network `rules` mode filters at the passt syscall level; traffic
   handled internally by passt (ARP, DHCP, gateway ping responses) is not
-  subject to user rules. The implicit loopback deny prevents access to
-  host services via the passt gateway.
+  subject to user rules. See
+  [enforcement internals](docs/network-filtering.md#enforcement-internals).

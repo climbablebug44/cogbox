@@ -188,7 +188,7 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	const module_attr = attr orelse "default";
 	const has_module = try nix.evalHasNixosModule(allocator, io, meta.locked_url, module_attr);
 	if (!has_module) {
-		die(allocator, io, "plugin flake does not expose nixosModules.{s} (see README \"Plugins\")", .{module_attr}, 65);
+		die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65);
 	}
 
 	archiveFlake(ctx, meta.locked_url);
