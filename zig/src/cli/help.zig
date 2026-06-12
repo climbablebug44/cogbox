@@ -403,25 +403,28 @@ pub const PLUGIN =
 	\\all of its plugins together. Pin a specific rev nix-style in the URL
 	\\itself (e.g. ?rev=...) to hold a flake back.
 	\\
-	\\A plugin may also declare firewall rules in config.json's .network.rules
-	\\schema, via `cogboxPlugin.<attr>.networkRules` (or the flat
-	\\`cogboxPlugin.networkRules` for the default module), e.g.
-	\\  cogboxPlugin.networkRules = [ { allow = "10.0.0.1/32"; comment = "api"; } ];
+	\\A plugin may also declare firewall rules, tagged with the plugin's name
+	\\so del/update remove or replace exactly those rules:
+	\\  cogboxPlugin.<attr>.networkRules  L4 CIDR rules (.network.rules schema)
+	\\  cogboxPlugin.<attr>.l7Rules       L7 vhost rules (.network.l7.rules
+	\\                                    schema, incl. terminate/passthrough/
+	\\                                    path/insecure_upstream)
+	\\(flat cogboxPlugin.networkRules / .l7Rules for the default module), e.g.
+	\\  cogboxPlugin.l7Rules = [ { allow = "api.internal"; terminate = true; } ];
 	\\On add/update these are shown for confirmation and inserted AT THE TOP of
-	\\the rule list (first match wins, so plugin allows must precede the seeded
-	\\RFC1918 denies), tagged with the plugin's name so del/update remove or
-	\\replace exactly those rules. Rule changes hot-reload; module changes need
+	\\their rule lists (first match wins, so plugin allows must precede the
+	\\seeded RFC1918 denies). Rule changes hot-reload; module changes need
 	\\'cogbox restart'.
 	\\
 	\\Adding a plugin evaluates and later builds third-party nix code -- only
 	\\add flakes you trust.
 	\\
 	\\Examples:
-	\\  cogbox plugin add github:illustris/panopticon?dir=flake
+	\\  cogbox plugin add github:myorg/myplugin?dir=flake
 	\\  cogbox plugin add 'github:org/observability#loki' -n work
 	\\  cogbox plugin add path:/home/me/myplugin --as dev -n work
 	\\  cogbox plugin update
-	\\  cogbox plugin del panopticon
+	\\  cogbox plugin del myplugin
 	\\
 ;
 

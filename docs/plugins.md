@@ -14,7 +14,8 @@ cogbox plugin del myplugin                                  # remove module + it
 A plugin is a NixOS module exposed by a flake. One flake can carry any number of plugins, and any subset of them can be enabled per instance:
 
 - `nixosModules.<attr>` -- the plugin module, selected by the URL fragment (`URL#attr`); a bare URL means `nixosModules.default`. Folded into the guest like the per-instance flake's module. `pkgs` resolves to cogbox's nixpkgs (the same caveat as the [extension scaffold](extensions.md#which-nixpkgs-pkgs-is): declare a differently-named input to use your own).
-- `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects in `config.json`'s `.network.rules` schema for that module. For the default module the flat form `cogboxPlugin.networkRules` also works.
+- `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects in `config.json`'s `.network.rules` schema for that module (L4 CIDR allows/denies). For the default module the flat form `cogboxPlugin.networkRules` also works.
+- `cogboxPlugin.<attr>.l7Rules` (optional) -- a list of [L7 vhost rules](network-filtering.md#l7-host-filtering) in the `.network.l7.rules` schema: `allow`/`deny` keyed to a host pattern, plus the optional tier fields `terminate`, `passthrough`, `path`, `insecure_upstream` (same constraints as `cogbox l7 add`). Flat form `cogboxPlugin.l7Rules` for the default module. Prefer these over IP allows when the plugin's backend sits behind a shared LB or reverse proxy: an L7 allow reaches exactly that vhost, not its siblings on the same IP.
 
 A minimal multi-plugin flake:
 
@@ -30,8 +31,8 @@ A minimal multi-plugin flake:
         cogboxPlugin.networkRules = [
             { allow = "10.0.0.1/32"; comment = "mimir backend"; }
         ];
-        cogboxPlugin.loki.networkRules = [
-            { allow = "10.0.0.2/32"; comment = "loki backend"; }
+        cogboxPlugin.loki.l7Rules = [
+            { allow = "loki.internal.example"; terminate = true; comment = "loki vhost on the shared LB"; }
         ];
     };
 }
@@ -64,9 +65,9 @@ A `.plugins` entry in `config.json` looks like:
 
 ## Network rules
 
-If the plugin declares network rules and the instance is in `rules` mode, `add` shows the rules and asks before merging (auto-confirmed with `-y` or when stdin is not a tty). Merged rules are inserted **at the top of the rule list** -- rules are first-match-wins and the seeded ruleset is "RFC1918/bogon denies, then `allow 0.0.0.0/0`", so a plugin's allows for private backend IPs only work ahead of the denies. Review the prompt: a malicious plugin could suggest `allow 0.0.0.0/0`.
+If the plugin declares network rules (L4 and/or L7) and the instance is in `rules` mode, `add` shows them all and asks once before merging (auto-confirmed with `-y` or when stdin is not a tty). Merged rules are inserted **at the top of their respective rule list** -- both lists are first-match-wins, and the seeded L4 ruleset is "RFC1918/bogon denies, then `allow 0.0.0.0/0`", so a plugin's allows for private backend IPs only work ahead of the denies. Review the prompt: a malicious plugin could suggest `allow 0.0.0.0/0`, or an L7 `allow *`.
 
-Each merged rule carries a `"plugin": "<name>"` field, which is how `del` and `update` remove or replace exactly the rules that plugin brought in (your own edits to the same CIDRs are untouched). Rule changes hot-reload into a running instance through the same path as `cogbox rules` edits; module changes need a `cogbox restart`.
+Each merged rule carries a `"plugin": "<name>"` field, which is how `del` and `update` remove or replace exactly the rules that plugin brought in (your own edits to the same CIDRs or hosts are untouched). Rule changes hot-reload into a running instance through the same path as `cogbox rules`/`l7` edits; module changes need a `cogbox restart`. Note that merging a plugin's first `l7Rules` into an instance activates [L7 filtering](network-filtering.md#l7-host-filtering) for it, with everything that implies (80/443 funneled through the host-side proxy, QUIC/IPv6 denied).
 
 Instances not in `rules` mode still get the module; the suggested rules are skipped with a warning.
 

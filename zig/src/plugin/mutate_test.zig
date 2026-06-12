@@ -34,19 +34,19 @@ test "pluginsArray creates the array once and reuses it" {
 	try t.expect(mutate.existingPluginsArray(&parsed.value) != null);
 
 	try mutate.appendPlugin(arena, arr, .{
-		.name = "panopticon",
-		.url = "github:o/panopticon",
-		.locked_url = "github:o/panopticon/abc?narHash=sha256-A",
+		.name = "myplugin",
+		.url = "github:o/myplugin",
+		.locked_url = "github:o/myplugin/abc?narHash=sha256-A",
 		.rev = "abc",
 		.nar_hash = "sha256-A",
 	});
 	const again = try mutate.pluginsArray(&parsed.value, arena);
 	try t.expectEqual(@as(usize, 1), again.items.len);
-	try t.expectEqual(@as(?usize, 0), mutate.findPlugin(again, "panopticon"));
+	try t.expectEqual(@as(?usize, 0), mutate.findPlugin(again, "myplugin"));
 	try t.expect(mutate.findPlugin(again, "nope") == null);
 
 	const obj = again.items[0].object;
-	try t.expectEqualStrings("github:o/panopticon", mutate.entryField(obj, "url").?);
+	try t.expectEqualStrings("github:o/myplugin", mutate.entryField(obj, "url").?);
 	try t.expectEqualStrings("abc", mutate.entryField(obj, "rev").?);
 }
 
@@ -191,6 +191,58 @@ test "validatePluginRule" {
 	try t.expectError(error.BadAction, mutate.validatePluginRule(items[1]));
 	try t.expectError(error.BadAction, mutate.validatePluginRule(items[2]));
 	try t.expectError(error.InvalidCidr, mutate.validatePluginRule(items[3]));
+}
+
+test "validatePluginL7Rule" {
+	var ok_rules = try parseDoc(
+		\\[{"allow": "api.example.com"},
+		\\ {"allow": "api.example.com", "terminate": true, "comment": "x"},
+		\\ {"allow": "git.example.com", "path": "/org/"},
+		\\ {"allow": "pinned.example.com", "passthrough": true},
+		\\ {"allow": "internal.svc", "insecure_upstream": true},
+		\\ {"deny": "*.evil.example"},
+		\\ {"deny": "*"}]
+	);
+	defer ok_rules.deinit();
+	for (ok_rules.value.array.items) |r| try mutate.validatePluginL7Rule(r);
+
+	var bad = try parseDoc(
+		\\[{"comment": "no action"},
+		\\ {"allow": "a.test", "deny": "b.test"},
+		\\ {"allow": "not a host!"},
+		\\ {"allow": "a.test", "path": "noslash"},
+		\\ {"allow": "a.test", "terminate": "yes"},
+		\\ {"allow": "a.test", "passthrough": true, "terminate": true},
+		\\ {"allow": "a.test", "passthrough": true, "path": "/v1/"}]
+	);
+	defer bad.deinit();
+	const items = bad.value.array.items;
+	try t.expectError(error.BadAction, mutate.validatePluginL7Rule(items[0]));
+	try t.expectError(error.BadAction, mutate.validatePluginL7Rule(items[1]));
+	try t.expectError(error.InvalidHost, mutate.validatePluginL7Rule(items[2]));
+	try t.expectError(error.BadPath, mutate.validatePluginL7Rule(items[3]));
+	try t.expectError(error.BadFlag, mutate.validatePluginL7Rule(items[4]));
+	try t.expectError(error.ConflictingTier, mutate.validatePluginL7Rule(items[5]));
+	try t.expectError(error.ConflictingTier, mutate.validatePluginL7Rule(items[6]));
+}
+
+test "tagged-rule helpers work on an l7 rules array" {
+	var parsed = try parseDoc(
+		\\{"network": {"l7": {"rules": [{"allow": "keep.test"}]}}}
+	);
+	defer parsed.deinit();
+	const arena = parsed.arena.allocator();
+	const l7_arr = &parsed.value.object.getPtr("network").?.object.getPtr("l7").?.object.getPtr("rules").?.array;
+
+	var incoming = try parseDoc("[{\"allow\": \"api.test\", \"terminate\": true}]");
+	defer incoming.deinit();
+	try mutate.prependTaggedRules(arena, l7_arr, "plug", incoming.value.array.items);
+	try t.expectEqual(@as(usize, 2), l7_arr.items.len);
+	try t.expectEqualStrings("plug", mutate.ruleTag(l7_arr.items[0]).?);
+	try t.expect(l7_arr.items[0].object.get("terminate").?.bool);
+	try t.expectEqual(@as(usize, 1), mutate.countTaggedRules(l7_arr, "plug"));
+	try t.expectEqual(@as(usize, 1), mutate.removeTaggedRules(l7_arr, "plug"));
+	try t.expectEqualStrings("keep.test", l7_arr.items[0].object.get("allow").?.string);
 }
 
 test "round-trip: tagged rules and plugins survive writeJqTab" {

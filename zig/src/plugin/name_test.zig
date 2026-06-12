@@ -25,8 +25,8 @@ test "git+https strips host and .git" {
 }
 
 test "path flakes use the basename" {
-	try expectName("panopticon", "path:/home/me/src/panopticon");
-	try expectName("panopticon", "path:/home/me/src/panopticon/");
+	try expectName("myplugin", "path:/home/me/src/myplugin");
+	try expectName("myplugin", "path:/home/me/src/myplugin/");
 	try expectName("plugin", "/abs/dir/plugin");
 }
 
@@ -69,7 +69,7 @@ test "deriveNameFromAttr sanitizes" {
 }
 
 test "validator grammar" {
-	try t.expect(name.isValidPluginName("panopticon"));
+	try t.expect(name.isValidPluginName("myplugin"));
 	try t.expect(name.isValidPluginName("a-b-c"));
 	try t.expect(!name.isValidPluginName(""));
 	try t.expect(!name.isValidPluginName("1abc"));

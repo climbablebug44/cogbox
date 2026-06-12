@@ -54,15 +54,16 @@ pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, url: []const
 	return std.mem.eql(u8, std.mem.trim(u8, out.stdout, " \t\r\n"), "true");
 }
 
-/// `nix eval URL#cogboxPlugin."<attr>".networkRules --json` (or the flat
-/// legacy path `cogboxPlugin.networkRules` when `attr` is null). IFD is
-/// blocked: reading the rules must never trigger a build of untrusted code
-/// at add time. `attr` must satisfy name.isValidAttr.
-pub fn evalNetworkRules(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: ?[]const u8) !RunOut {
+/// `nix eval URL#cogboxPlugin."<attr>".<leaf> --json` (or the flat path
+/// `cogboxPlugin.<leaf>` when `attr` is null). `leaf` is `networkRules`
+/// (L4 CIDR rules) or `l7Rules` (vhost rules). IFD is blocked: reading the
+/// rules must never trigger a build of untrusted code at add time. `attr`
+/// must satisfy name.isValidAttr; `leaf` is always caller-controlled.
+pub fn evalPluginRules(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: ?[]const u8, leaf: []const u8) !RunOut {
 	const installable = if (attr) |a|
-		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.\"{s}\".networkRules", .{ url, a })
+		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.\"{s}\".{s}", .{ url, a, leaf })
 	else
-		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.networkRules", .{url});
+		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.{s}", .{ url, leaf });
 	defer allocator.free(installable);
 	return runNix(allocator, io, &.{ "eval", installable, "--json", "--no-allow-import-from-derivation" });
 }

@@ -144,9 +144,9 @@ test "add missing url / extra positional / unknown flag" {
 }
 
 test "del parses" {
-	const c = try parse(&.{ "del", "panopticon" });
-	try t.expectEqualStrings("panopticon", c.del.plugin);
-	const c2 = try parse(&.{ "del", "panopticon", "-y" });
+	const c = try parse(&.{ "del", "myplugin" });
+	try t.expectEqualStrings("myplugin", c.del.plugin);
+	const c2 = try parse(&.{ "del", "myplugin", "-y" });
 	try t.expect(c2.del.yes);
 	try t.expectError(error.MissingPlugin, parse(&.{"del"}));
 }
@@ -154,8 +154,8 @@ test "del parses" {
 test "update with and without name" {
 	const all = try parse(&.{"update"});
 	try t.expect(all.update.plugin == null);
-	const one = try parse(&.{ "update", "panopticon" });
-	try t.expectEqualStrings("panopticon", one.update.plugin.?);
+	const one = try parse(&.{ "update", "myplugin" });
+	try t.expectEqualStrings("myplugin", one.update.plugin.?);
 	try t.expectError(error.InvalidArgs, parse(&.{ "update", "a", "b" }));
 }
 

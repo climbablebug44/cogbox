@@ -9,6 +9,7 @@
 const std = @import("std");
 const rules_module = @import("rules_module");
 const rule = rules_module.rule;
+const l7_rule = @import("l7_module").rule;
 
 pub const Entry = struct {
 	name: []const u8,
@@ -110,6 +111,51 @@ pub fn validatePluginRule(v: std.json.Value) RuleError!void {
 	const p = rule.ruleAction(v.object) orelse return error.BadAction;
 	var line_buf: [128]u8 = undefined;
 	if (!rule.validateActionCidr(p.action, p.cidr, &line_buf)) return error.InvalidCidr;
+}
+
+pub const L7RuleError = error{
+	NotAnObject,
+	BadAction,
+	InvalidHost,
+	BadPath,
+	BadFlag,
+	ConflictingTier,
+	OutOfMemory,
+};
+
+/// Validate one plugin-declared L7 rule: an object with exactly one of
+/// allow/deny keyed to a valid SNI/Host pattern, plus the optional tier
+/// fields the `l7` verb writes (`path`, `terminate`, `insecure_upstream`,
+/// `passthrough`), with the same constraints `l7 add` enforces:
+/// passthrough excludes everything that forces terminate.
+pub fn validatePluginL7Rule(v: std.json.Value) L7RuleError!void {
+	if (v != .object) return error.NotAnObject;
+	const has_allow = v.object.get("allow") != null;
+	const has_deny = v.object.get("deny") != null;
+	if (has_allow == has_deny) return error.BadAction;
+	const p = l7_rule.ruleAction(v.object) orelse return error.BadAction;
+	if (!l7_rule.validateHost(p.host)) return error.InvalidHost;
+
+	var has_path = false;
+	if (v.object.get("path")) |pv| {
+		if (pv != .string or pv.string.len == 0 or pv.string[0] != '/') return error.BadPath;
+		has_path = true;
+	}
+	var terminate = has_path;
+	var insecure = false;
+	var passthrough = false;
+	for ([_]struct { key: []const u8, dst: *bool }{
+		.{ .key = "terminate", .dst = &terminate },
+		.{ .key = "insecure_upstream", .dst = &insecure },
+		.{ .key = "passthrough", .dst = &passthrough },
+	}) |f| {
+		if (v.object.get(f.key)) |fv| {
+			if (fv != .bool) return error.BadFlag;
+			if (fv.bool) f.dst.* = true;
+		}
+	}
+	if (insecure) terminate = true;
+	if (passthrough and terminate) return error.ConflictingTier;
 }
 
 /// Prepend `incoming` as a contiguous block at the head of the rules array

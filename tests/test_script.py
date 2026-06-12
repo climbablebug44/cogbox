@@ -247,6 +247,9 @@ with subtest("Phase Q: plugin verb folds a flake into the guest + tagged rules")
         cogboxPlugin.networkRules = [
             { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
         ];
+        cogboxPlugin.l7Rules = [
+            { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
+        ];
         cogboxPlugin.extra.networkRules = [
             { allow = "10.99.0.2/32"; comment = "extra allow"; }
         ];
@@ -266,12 +269,18 @@ NIX_EOF"""))
         "cogbox plugin add path:/home/testuser/cogbox-test-plugin -y --name plug"
     ))
     assert "10.99.0.1/32" in out and "added" in out, out
+    assert "l7 allow plugin-l7.test [terminate]" in out, out
     n = machine.succeed(f"jq -r '.plugins | length' {plug_cfg}").strip()
     assert n == "1", f"expected 1 plugin, got {n!r}"
     nar = machine.succeed(f"jq -r '.plugins[0].narHash' {plug_cfg}").strip()
     assert nar.startswith("sha256-"), nar
     tag = machine.succeed(f"jq -r '.network.rules[0].plugin' {plug_cfg}").strip()
     assert tag == "cogbox-test-plugin", f"rule not tagged at head: {tag!r}"
+    # The plugin's L7 vhost rule lands tagged in .network.l7.rules too.
+    tag = machine.succeed(f"jq -r '.network.l7.rules[0].plugin' {plug_cfg}").strip()
+    assert tag == "cogbox-test-plugin", f"l7 rule not tagged at head: {tag!r}"
+    term = machine.succeed(f"jq -r '.network.l7.rules[0].terminate' {plug_cfg}").strip()
+    assert term == "true", f"l7 terminate flag lost: {term!r}"
     rules_out = machine.succeed(as_user("cogbox rules list --name plug"))
     assert rules_out.splitlines()[0].startswith("1: allow 10.99.0.1/32"), rules_out
     comp = "/home/testuser/.config/cogbox/instances/plug/plugins-flake/flake.nix"
@@ -357,6 +366,9 @@ NIX_EOF"""))
             { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
             { allow = "10.99.0.2/32"; comment = "second allow"; }
         ];
+        cogboxPlugin.l7Rules = [
+            { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
+        ];
         cogboxPlugin.extra.networkRules = [
             { allow = "10.99.0.2/32"; comment = "extra allow"; }
         ];
@@ -384,6 +396,8 @@ NIX_EOF"""))
         f"jq -r '[.network.rules[] | select(.plugin != null)] | length' {plug_cfg}"
     ).strip()
     assert n == "0", f"tagged rules survived del: {n!r}"
+    n = machine.succeed(f"jq -r '.network.l7.rules | length' {plug_cfg}").strip()
+    assert n == "0", f"tagged l7 rules survived del: {n!r}"
     machine.fail(f"test -e {comp}")
     boot_and_wait("cc-plug", "--name plug", ssh_port=plug_ssh)
     machine.fail(as_user("cogbox ssh --name plug 'command -v hello'"))

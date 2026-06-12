@@ -19,6 +19,8 @@ pub const nix = @import("nix.zig");
 const rules_module = @import("rules_module");
 const config = rules_module.config;
 const rule = rules_module.rule;
+const l7_module = @import("l7_module");
+const l7_rule = l7_module.rule;
 
 pub fn dispatch(
 	allocator: std.mem.Allocator,
@@ -86,6 +88,7 @@ fn cmdList(ctx: Ctx, loaded: *config.Loaded) !void {
 	}
 
 	const rules_arr = rulesOrNull(loaded);
+	const l7_arr = l7RulesOrNull(loaded);
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(ctx.allocator);
 
@@ -93,7 +96,8 @@ fn cmdList(ctx: Ctx, loaded: *config.Loaded) !void {
 		if (item != .object) continue;
 		const n = mutate.entryField(item.object, "name") orelse "?";
 		const u = mutate.entryField(item.object, "url") orelse "?";
-		const rules_n = if (rules_arr) |ra| mutate.countTaggedRules(ra, n) else 0;
+		const rules_n = (if (rules_arr) |ra| mutate.countTaggedRules(ra, n) else 0) +
+			(if (l7_arr) |la| mutate.countTaggedRules(la, n) else 0);
 		const frag: []const u8 = if (mutate.entryField(item.object, "attr")) |a| a else "";
 		const line = try std.fmt.allocPrint(
 			ctx.allocator,
@@ -193,30 +197,45 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 	archiveFlake(ctx, meta.locked_url);
 
-	// Optional suggested firewall rules.
-	var rules_parsed: ?std.json.Parsed(std.json.Value) = null;
-	defer if (rules_parsed) |*p| p.deinit();
-	const incoming: []const std.json.Value = blk: {
-		rules_parsed = evalRules(ctx, meta.locked_url, attr);
-		const p = rules_parsed orelse break :blk &.{};
+	// Optional suggested firewall rules: L4 CIDR + L7 vhost, one confirmation.
+	var l4_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (l4_parsed) |*p| p.deinit();
+	const incoming_l4: []const std.json.Value = blk: {
+		l4_parsed = evalRules(ctx, meta.locked_url, attr);
+		const p = l4_parsed orelse break :blk &.{};
+		break :blk p.value.array.items;
+	};
+	var l7_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (l7_parsed) |*p| p.deinit();
+	const incoming_l7: []const std.json.Value = blk: {
+		l7_parsed = evalL7Rules(ctx, meta.locked_url, attr);
+		const p = l7_parsed orelse break :blk &.{};
 		break :blk p.value.array.items;
 	};
 
 	var merged = false;
-	if (incoming.len > 0) {
+	const total_rules = incoming_l4.len + incoming_l7.len;
+	if (total_rules > 0) {
 		if (rulesOrNull(loaded)) |rules_arr| {
 			try announce(ctx, "Suggested network rules from '{s}':", .{plugin_name});
-			for (incoming) |r| try printRuleLine(ctx, "+", r);
-			const prompt = try std.fmt.allocPrint(allocator, "Merge these {d} rule(s) at the top of the rule list?", .{incoming.len});
+			for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
+			for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
+			const prompt = try std.fmt.allocPrint(allocator, "Merge these {d} rule(s) at the top of the rule lists?", .{total_rules});
 			defer allocator.free(prompt);
 			if (!a.yes and !try confirm(ctx, prompt)) {
 				try announce(ctx, "Aborted.", .{});
 				return;
 			}
-			try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, plugin_name, incoming);
+			if (incoming_l4.len > 0) {
+				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, plugin_name, incoming_l4);
+			}
+			if (incoming_l7.len > 0) {
+				const l7_arr = try ensureL7Rules(loaded);
+				try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, plugin_name, incoming_l7);
+			}
 			merged = true;
 		} else {
-			try warn(ctx, "instance is not in rules mode; skipping {d} suggested network rule(s)", .{incoming.len});
+			try warn(ctx, "instance is not in rules mode; skipping {d} suggested rule(s)", .{total_rules});
 		}
 	}
 
@@ -251,7 +270,9 @@ fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	};
 
 	const rules_arr = rulesOrNull(loaded);
-	const tagged = if (rules_arr) |ra| mutate.countTaggedRules(ra, d.plugin) else 0;
+	const l7_arr = l7RulesOrNull(loaded);
+	const tagged = (if (rules_arr) |ra| mutate.countTaggedRules(ra, d.plugin) else 0) +
+		(if (l7_arr) |la| mutate.countTaggedRules(la, d.plugin) else 0);
 
 	const prompt = try std.fmt.allocPrint(allocator, "Remove plugin '{s}' and its {d} network rule(s)?", .{ d.plugin, tagged });
 	defer allocator.free(prompt);
@@ -261,7 +282,8 @@ fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	}
 
 	_ = plugins_arr.orderedRemove(idx);
-	const removed = if (rules_arr) |ra| mutate.removeTaggedRules(ra, d.plugin) else 0;
+	var removed = if (rules_arr) |ra| mutate.removeTaggedRules(ra, d.plugin) else 0;
+	removed += if (l7_arr) |la| mutate.removeTaggedRules(la, d.plugin) else 0;
 
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
@@ -358,30 +380,52 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 
 		archiveFlake(ctx, meta.locked_url);
 
-		var rules_parsed: ?std.json.Parsed(std.json.Value) = null;
-		defer if (rules_parsed) |*p| p.deinit();
-		const incoming: []const std.json.Value = blk: {
-			rules_parsed = evalRules(ctx, meta.locked_url, attr);
-			const p = rules_parsed orelse break :blk &.{};
+		var l4_parsed: ?std.json.Parsed(std.json.Value) = null;
+		defer if (l4_parsed) |*p| p.deinit();
+		const incoming_l4: []const std.json.Value = blk: {
+			l4_parsed = evalRules(ctx, meta.locked_url, attr);
+			const p = l4_parsed orelse break :blk &.{};
+			break :blk p.value.array.items;
+		};
+		var l7_parsed: ?std.json.Parsed(std.json.Value) = null;
+		defer if (l7_parsed) |*p| p.deinit();
+		const incoming_l7: []const std.json.Value = blk: {
+			l7_parsed = evalL7Rules(ctx, meta.locked_url, attr);
+			const p = l7_parsed orelse break :blk &.{};
 			break :blk p.value.array.items;
 		};
 
 		if (rulesOrNull(loaded)) |rules_arr| {
-			const old_count = mutate.countTaggedRules(rules_arr, n);
-			if (old_count > 0 or incoming.len > 0) {
+			const old_l7 = l7RulesOrNull(loaded);
+			const old_count = mutate.countTaggedRules(rules_arr, n) +
+				(if (old_l7) |la| mutate.countTaggedRules(la, n) else 0);
+			if (old_count > 0 or incoming_l4.len + incoming_l7.len > 0) {
 				try announce(ctx, "{s}: network rules", .{n});
 				for (rules_arr.items) |r| {
 					if (mutate.ruleTag(r)) |tag| {
 						if (std.mem.eql(u8, tag, n)) try printRuleLine(ctx, "-", r);
 					}
 				}
-				for (incoming) |r| try printRuleLine(ctx, "+", r);
+				if (old_l7) |la| {
+					for (la.items) |r| {
+						if (mutate.ruleTag(r)) |tag| {
+							if (std.mem.eql(u8, tag, n)) try printL7RuleLine(ctx, "-", r);
+						}
+					}
+				}
+				for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
+				for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
 				_ = mutate.removeTaggedRules(rules_arr, n);
-				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, n, incoming);
+				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, n, incoming_l4);
+				if (old_l7) |la| _ = mutate.removeTaggedRules(la, n);
+				if (incoming_l7.len > 0) {
+					const l7_arr = try ensureL7Rules(loaded);
+					try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, n, incoming_l7);
+				}
 				rules_touched = true;
 			}
-		} else if (incoming.len > 0) {
-			try warn(ctx, "{s}: instance is not in rules mode; skipping {d} suggested network rule(s)", .{ n, incoming.len });
+		} else if (incoming_l4.len + incoming_l7.len > 0) {
+			try warn(ctx, "{s}: instance is not in rules mode; skipping {d} suggested rule(s)", .{ n, incoming_l4.len + incoming_l7.len });
 		}
 
 		try mutate.relockPlugin(loaded.treeAllocator(), item, .{
@@ -433,33 +477,38 @@ fn archiveFlake(ctx: Ctx, locked_url: []const u8) void {
 	}
 }
 
-/// Evaluate the plugin's suggested rules: cogboxPlugin."<attr>".networkRules,
-/// with the flat legacy path cogboxPlugin.networkRules as fallback for the
-/// default module. Returns the parsed tree when the output exists and is a
-/// valid rule list; null when the flake doesn't declare it. Invalid rule
-/// entries are fatal (the plugin is malformed).
-fn evalRules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+/// Evaluate one of the plugin's suggested-rule lists:
+/// cogboxPlugin."<attr>".<leaf>, with the flat path cogboxPlugin.<leaf> as
+/// fallback for the default module. Returns the parsed tree when the output
+/// exists and is a JSON list; null when the flake doesn't declare it.
+fn evalRuleList(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8, leaf: []const u8) ?std.json.Parsed(std.json.Value) {
 	const allocator = ctx.allocator;
-	var out = nix.evalNetworkRules(allocator, ctx.io, locked_url, attr orelse "default") catch return null;
+	var out = nix.evalPluginRules(allocator, ctx.io, locked_url, attr orelse "default", leaf) catch return null;
 	if (!out.ok and attr == null and nix.stderrSaysMissingAttribute(out.stderr)) {
 		// No cogboxPlugin.default -- fall back to the flat form.
 		out.deinit(allocator);
-		out = nix.evalNetworkRules(allocator, ctx.io, locked_url, null) catch return null;
+		out = nix.evalPluginRules(allocator, ctx.io, locked_url, null, leaf) catch return null;
 	}
 	defer out.deinit(allocator);
 	if (!out.ok) {
 		if (!nix.stderrSaysMissingAttribute(out.stderr)) {
-			warn(ctx, "could not read cogboxPlugin.networkRules: {s}", .{nix.stderrTail(out.stderr)}) catch {};
+			warn(ctx, "could not read cogboxPlugin.{s}: {s}", .{ leaf, nix.stderrTail(out.stderr) }) catch {};
 		}
 		return null;
 	}
 
 	const parsed = std.json.parseFromSlice(std.json.Value, allocator, out.stdout, .{}) catch {
-		die(allocator, ctx.io, "cogboxPlugin.networkRules did not evaluate to JSON", .{}, 65);
+		die(allocator, ctx.io, "cogboxPlugin.{s} did not evaluate to JSON", .{leaf}, 65);
 	};
 	if (parsed.value != .array) {
-		die(allocator, ctx.io, "cogboxPlugin.networkRules must be a list of rule objects", .{}, 65);
+		die(allocator, ctx.io, "cogboxPlugin.{s} must be a list of rule objects", .{leaf}, 65);
 	}
+	return parsed;
+}
+
+/// L4 CIDR rules (cogboxPlugin.<attr>.networkRules), validated.
+fn evalRules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+	const parsed = evalRuleList(ctx, locked_url, attr, "networkRules") orelse return null;
 	for (parsed.value.array.items, 0..) |r, i| {
 		mutate.validatePluginRule(r) catch |err| {
 			const what: []const u8 = switch (err) {
@@ -468,10 +517,49 @@ fn evalRules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Pars
 				error.InvalidCidr => "invalid CIDR",
 				error.OutOfMemory => "out of memory",
 			};
-			die(allocator, ctx.io, "invalid cogboxPlugin.networkRules[{d}]: {s}", .{ i, what }, 65);
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.networkRules[{d}]: {s}", .{ i, what }, 65);
 		};
 	}
 	return parsed;
+}
+
+/// L7 vhost rules (cogboxPlugin.<attr>.l7Rules), validated with the same
+/// constraints `l7 add` enforces.
+fn evalL7Rules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+	const parsed = evalRuleList(ctx, locked_url, attr, "l7Rules") orelse return null;
+	for (parsed.value.array.items, 0..) |r, i| {
+		mutate.validatePluginL7Rule(r) catch |err| {
+			const what: []const u8 = switch (err) {
+				error.NotAnObject => "not an object",
+				error.BadAction => "must have exactly one of allow/deny",
+				error.InvalidHost => "invalid host pattern",
+				error.BadPath => "path must be a string starting with /",
+				error.BadFlag => "tier flags must be booleans",
+				error.ConflictingTier => "passthrough excludes terminate/path/insecure_upstream",
+				error.OutOfMemory => "out of memory",
+			};
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.l7Rules[{d}]: {s}", .{ i, what }, 65);
+		};
+	}
+	return parsed;
+}
+
+/// .network.l7.rules, created on demand (merge path; rules mode is already
+/// established by the caller).
+fn ensureL7Rules(loaded: *config.Loaded) !*std.json.Array {
+	const net = try loaded.network();
+	const l7 = try l7_module.ensureL7Object(net, loaded.treeAllocator());
+	return &l7.object.getPtr("rules").?.array;
+}
+
+/// .network.l7.rules if it already exists; never creates it (del/list path).
+fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
+	const net = loaded.network() catch return null;
+	const l7 = net.object.getPtr("l7") orelse return null;
+	if (l7.* != .object) return null;
+	const r = l7.object.getPtr("rules") orelse return null;
+	if (r.* != .array) return null;
+	return &r.array;
 }
 
 /// Regenerate (or remove, when no plugins are left) the composition flake
@@ -527,6 +615,52 @@ fn printRuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
 		try announce(ctx, "  {s} {s} {s}  # {s}", .{ sign, action, p.cidr, c });
 	} else {
 		try announce(ctx, "  {s} {s} {s}", .{ sign, action, p.cidr });
+	}
+}
+
+fn printL7RuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
+	if (r != .object) return;
+	const p = l7_rule.ruleAction(r.object) orelse return;
+	const action = switch (p.action) {
+		.allow => "allow",
+		.deny => "deny",
+	};
+
+	var suffix: std.ArrayList(u8) = .empty;
+	defer suffix.deinit(ctx.allocator);
+	var is_terminate = false;
+	if (r.object.get("path")) |pv| {
+		if (pv == .string) {
+			try suffix.append(ctx.allocator, ' ');
+			try suffix.appendSlice(ctx.allocator, pv.string);
+			is_terminate = true;
+		}
+	}
+	if (r.object.get("terminate")) |tv| {
+		if (tv == .bool and tv.bool) is_terminate = true;
+	}
+	var is_insecure = false;
+	if (r.object.get("insecure_upstream")) |iv| {
+		if (iv == .bool and iv.bool) {
+			is_insecure = true;
+			is_terminate = true;
+		}
+	}
+	var is_passthrough = false;
+	if (r.object.get("passthrough")) |pv| {
+		if (pv == .bool and pv.bool) is_passthrough = true;
+	}
+	if (is_passthrough) {
+		try suffix.appendSlice(ctx.allocator, " [passthrough]");
+	} else {
+		if (is_terminate) try suffix.appendSlice(ctx.allocator, " [terminate]");
+		if (is_insecure) try suffix.appendSlice(ctx.allocator, " [insecure]");
+	}
+
+	if (l7_rule.ruleComment(r.object)) |c| {
+		try announce(ctx, "  {s} l7 {s} {s}{s}  # {s}", .{ sign, action, p.host, suffix.items, c });
+	} else {
+		try announce(ctx, "  {s} l7 {s} {s}{s}", .{ sign, action, p.host, suffix.items });
 	}
 }
 

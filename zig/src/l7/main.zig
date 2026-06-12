@@ -64,7 +64,8 @@ pub fn dispatch(
 /// Ensure `.network.l7` is `{ "rules": [] }`-shaped. No `mode` is written:
 /// an absent mode means the default tier (terminate), and `l7 mode passthrough`
 /// writes it explicitly when the operator opts the instance out.
-fn ensureL7Object(net: *std.json.Value, arena: std.mem.Allocator) !*std.json.Value {
+/// Pub: the plugin verb merges plugin-declared L7 rules through this too.
+pub fn ensureL7Object(net: *std.json.Value, arena: std.mem.Allocator) !*std.json.Value {
 	if (net.object.getPtr("l7") == null) {
 		var obj: std.json.ObjectMap = .empty;
 		try obj.put(arena, try arena.dupe(u8, "rules"), .{ .array = std.json.Array.init(arena) });

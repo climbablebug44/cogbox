@@ -8,7 +8,7 @@ test "render refuses zero plugins" {
 
 test "golden render: one plugin" {
 	const out = try compose.render(t.allocator, "default", "/home/u/.config/cogbox/instances/default/flake", &.{
-		.{ .name = "panopticon", .locked_url = "github:o/panopticon/abc123?narHash=sha256-AAAA" },
+		.{ .name = "myplugin", .locked_url = "github:o/myplugin/abc123?narHash=sha256-AAAA" },
 	});
 	defer t.allocator.free(out);
 
@@ -20,13 +20,13 @@ test "golden render: one plugin" {
 		"\n" ++
 		"\tinputs = {\n" ++
 		"\t\tuser.url = \"path:/home/u/.config/cogbox/instances/default/flake\";\n" ++
-		"\t\t\"p-panopticon\".url = \"github:o/panopticon/abc123?narHash=sha256-AAAA\";\n" ++
+		"\t\t\"p-myplugin\".url = \"github:o/myplugin/abc123?narHash=sha256-AAAA\";\n" ++
 		"\t};\n" ++
 		"\n" ++
 		"\toutputs = { self, user, ... }@inputs: {\n" ++
 		"\t\tnixosModules.default = {\n" ++
 		"\t\t\timports = [\n" ++
-		"\t\t\t\tinputs.\"p-panopticon\".nixosModules.\"default\"\n" ++
+		"\t\t\t\tinputs.\"p-myplugin\".nixosModules.\"default\"\n" ++
 		"\t\t\t\tuser.nixosModules.default\n" ++
 		"\t\t\t];\n" ++
 		"\t\t};\n" ++
