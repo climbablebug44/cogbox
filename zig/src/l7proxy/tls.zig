@@ -1,17 +1,32 @@
 // Pure TLS ClientHello SNI extraction. No allocation, no IO -- the proxy
 // feeds it the bytes it has peeked so far and gets back one of:
-//   .sni       -> the host_name, copied into the caller's out buffer
+//   .sni       -> the cleartext host_name (copied into the caller's out
+//                 buffer) plus an `ech` flag noting whether an
+//                 encrypted_client_hello extension accompanied it
 //   .need_more -> the ClientHello isn't fully buffered yet; read more, retry
-//   .deny      -> malformed, no SNI, or an encrypted_client_hello (ECH) is
-//                 present (we never serve ECH-fronted hosts)
+//   .deny      -> malformed, or no cleartext SNI at all
+//
+// We do NOT deny merely because ECH is present: Chrome/Chromium send a GREASE
+// ECH extension on every handshake by default, so a blanket deny would drop
+// every browser client even though the real SNI is sitting in cleartext right
+// beside it. The cleartext SNI *can* be a decoy for an encrypted inner name,
+// so the `ech` flag is surfaced for the caller to act on per tier (the worker
+// allows ECH on the terminate tier, where mitmproxy enforces Host==SNI on the
+// decrypted request, and refuses it on the splice tier, which trusts the
+// cleartext SNI for routing).
 //
 // All length fields are bounds-checked against a hostile guest; every
 // out-of-range access yields .deny rather than a panic.
 
 const std = @import("std");
 
+pub const Sni = struct {
+	name: []const u8, // aliases the caller's out buffer
+	ech: bool, // an ECH extension accompanied this cleartext SNI
+};
+
 pub const PeekResult = union(enum) {
-	sni: []const u8, // aliases the caller's out buffer
+	sni: Sni,
 	need_more,
 	deny,
 };
@@ -112,22 +127,25 @@ fn parseClientHello(body: []const u8, out_sni: []u8) PeekResult {
 
 	var ec = Cursor{ .b = ext_bytes };
 	var found: ?[]const u8 = null;
+	var ech = false;
 	while (ec.remaining() >= 4) {
 		const etype = ec.readU16().?;
 		const elen = ec.readU16().?;
 		const edata = ec.take(elen) orelse return .deny;
-		// ECH present anywhere -> refuse, even if a cleartext outer SNI is
-		// also offered: the real (inner) name could be a denied sibling.
-		if (etype == ext_ech) return .deny;
+		// Note ECH but keep parsing: the cleartext SNI is still extracted and
+		// the caller decides what to do with an ECH-bearing hello per tier
+		// (the inner name could be a denied sibling, so the splice path refuses
+		// it; terminate is safe because mitmproxy re-checks Host==SNI).
+		if (etype == ext_ech) ech = true;
 		if (etype == ext_server_name and found == null) {
 			found = parseServerName(edata) orelse return .deny;
 		}
 	}
 
-	const name = found orelse return .deny; // no SNI -> deny
+	const name = found orelse return .deny; // no cleartext SNI -> can't classify
 	if (name.len == 0 or name.len > out_sni.len) return .deny;
 	@memcpy(out_sni[0..name.len], name);
-	return .{ .sni = out_sni[0..name.len] };
+	return .{ .sni = .{ .name = out_sni[0..name.len], .ech = ech } };
 }
 
 fn parseServerName(data: []const u8) ?[]const u8 {
@@ -148,7 +166,8 @@ fn parseServerName(data: []const u8) ?[]const u8 {
 
 const t = std.testing;
 
-// Build a minimal TLS record-wrapped ClientHello carrying a single SNI.
+// Build a minimal TLS record-wrapped ClientHello. `server_name` is emitted as
+// an SNI extension unless empty; `with_ech` adds a stub ECH extension.
 fn buildHello(buf: []u8, server_name: []const u8, with_ech: bool) []u8 {
 	var hs: [1024]u8 = undefined;
 	var n: usize = 0;
@@ -172,25 +191,27 @@ fn buildHello(buf: []u8, server_name: []const u8, with_ech: bool) []u8 {
 	const ext_len_pos = n;
 	n += 2; // placeholder for extensions length
 	const ext_start = n;
-	// server_name extension
-	const sni_inner = 2 + 1 + 2 + server_name.len; // list_len + type + name_len + name
-	hs[n] = 0x00;
-	hs[n + 1] = 0x00;
-	n += 2; // ext type server_name
-	hs[n] = @intCast((sni_inner >> 8) & 0xff);
-	hs[n + 1] = @intCast(sni_inner & 0xff);
-	n += 2; // ext data len
-	const list_len = 1 + 2 + server_name.len;
-	hs[n] = @intCast((list_len >> 8) & 0xff);
-	hs[n + 1] = @intCast(list_len & 0xff);
-	n += 2; // server_name_list length
-	hs[n] = 0x00;
-	n += 1; // name_type host_name
-	hs[n] = @intCast((server_name.len >> 8) & 0xff);
-	hs[n + 1] = @intCast(server_name.len & 0xff);
-	n += 2; // name length
-	@memcpy(hs[n .. n + server_name.len], server_name);
-	n += server_name.len;
+	// server_name extension (omitted when server_name is empty)
+	if (server_name.len > 0) {
+		const sni_inner = 2 + 1 + 2 + server_name.len; // list_len + type + name_len + name
+		hs[n] = 0x00;
+		hs[n + 1] = 0x00;
+		n += 2; // ext type server_name
+		hs[n] = @intCast((sni_inner >> 8) & 0xff);
+		hs[n + 1] = @intCast(sni_inner & 0xff);
+		n += 2; // ext data len
+		const list_len = 1 + 2 + server_name.len;
+		hs[n] = @intCast((list_len >> 8) & 0xff);
+		hs[n + 1] = @intCast(list_len & 0xff);
+		n += 2; // server_name_list length
+		hs[n] = 0x00;
+		n += 1; // name_type host_name
+		hs[n] = @intCast((server_name.len >> 8) & 0xff);
+		hs[n + 1] = @intCast(server_name.len & 0xff);
+		n += 2; // name length
+		@memcpy(hs[n .. n + server_name.len], server_name);
+		n += server_name.len;
+	}
 	if (with_ech) {
 		hs[n] = 0xfe;
 		hs[n + 1] = 0x0d;
@@ -230,7 +251,8 @@ test "extractSni single record" {
 	var out: [256]u8 = undefined;
 	const r = extractSni(hello, &out);
 	try t.expect(r == .sni);
-	try t.expectEqualStrings("vhost-a.test", r.sni);
+	try t.expectEqualStrings("vhost-a.test", r.sni.name);
+	try t.expect(!r.sni.ech);
 }
 
 test "extractSni need_more on truncation" {
@@ -242,9 +264,23 @@ test "extractSni need_more on truncation" {
 	try t.expect(r == .need_more);
 }
 
-test "extractSni denies ECH even with cleartext outer SNI" {
+test "extractSni reports ECH alongside a cleartext SNI (does not deny)" {
+	// Chrome's default GREASE ECH lands here: the real name is in cleartext, so
+	// we return it with .ech = true and let the worker decide per tier. A
+	// blanket deny here would drop every Chromium client.
 	var raw: [1200]u8 = undefined;
 	const hello = buildHello(&raw, "vhost-a.test", true);
+	var out: [256]u8 = undefined;
+	const r = extractSni(hello, &out);
+	try t.expect(r == .sni);
+	try t.expectEqualStrings("vhost-a.test", r.sni.name);
+	try t.expect(r.sni.ech);
+}
+
+test "extractSni denies ECH with no cleartext SNI" {
+	// Pure-ECH hello (no outer server_name): unclassifiable, must deny.
+	var raw: [1200]u8 = undefined;
+	const hello = buildHello(&raw, "", true);
 	var out: [256]u8 = undefined;
 	try t.expect(extractSni(hello, &out) == .deny);
 }
@@ -263,12 +299,10 @@ test "extractSni denies malformed length (no OOB)" {
 	try t.expect(r == .deny or r == .need_more);
 }
 
-test "extractSni no-SNI denies" {
-	// Build a hello then strip its single extension by hand: easiest is a
-	// hello with empty server_name list which parseServerName rejects.
+test "extractSni no-extensions hello denies" {
+	// A hello with no extensions at all (and thus no SNI) cannot be classified.
 	var raw: [1200]u8 = undefined;
-	const hello = buildHello(&raw, "x", false);
+	const hello = buildHello(&raw, "", false);
 	var out: [256]u8 = undefined;
-	// sanity: the helper hello has SNI
-	try t.expect(extractSni(hello, &out) == .sni);
+	try t.expect(extractSni(hello, &out) == .deny);
 }

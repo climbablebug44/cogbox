@@ -52,6 +52,40 @@ machine.succeed("ip addr add 10.99.0.2/32 dev lo")
 machine.succeed("systemd-run --unit=test-listener --collect nc -l -k -p 9000")
 machine.wait_for_open_port(9000)
 
+# Node-side helper for the L7 ECH regression tests (Phases K/L). Crafts a TLS
+# ClientHello carrying a cleartext SNI plus, optionally, an ECH extension
+# (0xfe0d) -- the GREASE ECH that Chrome/Chromium send on every handshake --
+# and pushes it through the proxy's SOCKS5 front door exactly like the guest
+# shim does. Usage: ech-hello.py <proxy_port> <dest_ip> <sni> <ech:0|1>.
+# Prints "socks-ok" once the proxy accepts the SOCKS connection. We don't
+# complete a real TLS handshake; the assertions read the proxy's decision off
+# its log. (curl/openssl never send ECH, so this is the only way to exercise
+# the ECH path in the VM.)
+ech_hello_script = r'''
+import socket, struct, sys
+port = int(sys.argv[1]); dst = sys.argv[2]; sni = sys.argv[3].encode(); ech = sys.argv[4] == "1"
+def u16(x): return struct.pack(">H", x)
+sni_entry = b"\x00" + u16(len(sni)) + sni          # name_type host_name + name
+sni_list = u16(len(sni_entry)) + sni_entry
+exts = u16(0x0000) + u16(len(sni_list)) + sni_list  # server_name extension
+if ech:
+    exts += u16(0xfe0d) + u16(1) + b"\x00"          # stub ECH extension
+body = (b"\x03\x03" + b"\x00" * 32 + b"\x00"         # version + random + empty session_id
+        + b"\x00\x02\x13\x01" + b"\x01\x00"          # one cipher suite + null compression
+        + u16(len(exts)) + exts)
+hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
+rec = b"\x16\x03\x01" + u16(len(hs)) + hs
+s = socket.create_connection(("127.0.0.1", port), timeout=8)
+s.sendall(b"\x05\x01\x00")
+assert s.recv(2) == b"\x05\x00", "socks greeting"
+s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(dst) + u16(443))
+assert s.recv(16)[:2] == b"\x05\x00", "socks connect"
+s.sendall(rec)
+print("socks-ok")
+s.close()
+'''
+machine.succeed("cat > /tmp/ech-hello.py << 'PY_EOF'\n" + ech_hello_script + "\nPY_EOF")
+
 with subtest("Phase A: CLI / state without booting"):
     # A1: first-run init for the default instance, network=none.
     # A non-interactive stdin auto-selects all harnesses, so claude-code,
@@ -950,6 +984,27 @@ serve(80, handle_http)
     rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
     assert rc != 0, f"vhost-b should be blocked again after del, rc={rc}"
 
+    # ECH on the passthrough/splice tier is REFUSED: routing trusts the
+    # cleartext SNI, so a real ECH could front a denied sibling. vhost-a is
+    # still allowed (passthrough), but an ECH-bearing hello for it must be
+    # dropped with the dedicated reason.
+    wlog = "/run/user/1000/cogbox-work/cogbox.log"
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 1")
+    assert "socks-ok" in out, out
+    machine.wait_until_succeeds(
+        f"tail -n +{before + 1} {wlog} | grep -q ech-on-splice", timeout=10
+    )
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "host=vhost-a.test" in new, new
+    # A non-ECH hello for the same vhost is NOT refused for ECH (it proceeds to
+    # the splice) -- proves the refusal keys on ECH, not on the host.
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 0")
+    machine.succeed("sleep 2")
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "ech-on-splice" not in new, new
+
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
 
@@ -1033,6 +1088,21 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
         "--resolve vhost-a.test:443:203.0.113.5 https://vhost-a.test/allowed/"
     )))
     assert rc != 0, "minted leaf must not validate against the system store alone"
+
+    # ECH on the terminate tier is ACCEPTED: mitmproxy is the TLS endpoint and
+    # its addon re-checks Host==SNI on the decrypted request, so ECH can't
+    # smuggle a different host. The proxy must classify the cleartext SNI and
+    # enter the terminate handoff -- NOT reject it as unclassifiable (the bug
+    # this fix addresses) nor as ech-on-splice (that's the passthrough tier).
+    # This is what unblocks Chrome's default GREASE ECH against a terminate vhost.
+    wlog = "/run/user/1000/cogbox-work/cogbox.log"
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 1")
+    assert "socks-ok" in out, out
+    machine.succeed("sleep 2")
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "unclassifiable-or-no-sni" not in new, f"ECH hello wrongly rejected at SNI peek: {new!r}"
+    assert "ech-on-splice" not in new, f"terminate vhost wrongly refused ECH: {new!r}"
 
     stop_instance("cc-work", name="work")
 

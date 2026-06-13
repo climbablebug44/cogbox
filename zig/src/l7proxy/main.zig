@@ -198,7 +198,7 @@ fn acceptLoop(listen_fd: c_int) void {
 const Orig = struct { addr: filter.IpAddr, port: u16 };
 
 const Classified = union(enum) {
-	tls: []const u8, // SNI
+	tls: tls.Sni, // SNI + whether an ECH extension accompanied it
 	http: http.Parsed,
 	deny,
 };
@@ -221,14 +221,16 @@ fn worker(client_fd: c_int) void {
 	var host: []const u8 = undefined;
 	var path: ?[]const u8 = null;
 	var is_tls = false;
+	var ech = false;
 	switch (cl) {
 		.deny => {
 			logReject(orig, "?", "unclassifiable-or-no-sni");
 			return;
 		},
 		.tls => |s| {
-			host = s;
+			host = s.name;
 			is_tls = true;
+			ech = s.ech;
 		},
 		.http => |p| {
 			host = p.host;
@@ -244,6 +246,18 @@ fn worker(client_fd: c_int) void {
 	const needs_term = l7_rs.needsTerminate(host);
 	const verdict = l7_rs.evaluate(host, path);
 	unlockRules();
+
+	// ECH policy: an ECH extension means the cleartext SNI we keyed on may be a
+	// decoy for an encrypted inner name. On the splice path we route purely on
+	// that SNI, so a real ECH could front a denied sibling -- refuse. On the
+	// terminate path mitmproxy is the TLS endpoint and its addon re-checks
+	// Host==SNI on the decrypted request, so ECH (GREASE or real) can't smuggle
+	// a different host past it; let it through (this is what unblocks Chrome,
+	// whose default GREASE ECH would otherwise be denied here).
+	if (is_tls and ech and !needs_term) {
+		logReject(orig, host, "ech-on-splice");
+		return;
+	}
 
 	if (is_tls and needs_term) {
 		// Terminate tier: re-resolve + vet here (SSRF/CIDR stays authoritative
