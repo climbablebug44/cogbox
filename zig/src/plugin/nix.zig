@@ -39,19 +39,48 @@ pub fn flakeArchive(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !
 	return runNix(allocator, io, &.{ "flake", "archive", "--json", url });
 }
 
-/// `nix eval URL#nixosModules --apply 'm: m ? "<attr>"' --json` ->
-/// "true"/"false". A failed eval (no nixosModules output at all) reads as
-/// missing. `attr` must satisfy name.isValidAttr (it is interpolated into a
-/// nix expression).
-pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: []const u8) !bool {
+/// Outcome of the nixosModules.<attr> contract check. `missing` is the
+/// contract violation ("this flake is not a cogbox plugin"); `failed` is
+/// everything else that can go wrong with the eval (fetch error, eval error
+/// inside the flake) and carries nix's stderr (caller owns it). Conflating
+/// the two would misreport any broken URL as a missing module.
+pub const ModuleCheck = union(enum) {
+	present,
+	missing,
+	failed: []u8,
+};
+
+/// `nix eval URL#nixosModules --apply 'm: m ? "<attr>"' --json`. `attr` must
+/// satisfy name.isValidAttr (it is interpolated into a nix expression).
+pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: []const u8) !ModuleCheck {
 	const installable = try std.fmt.allocPrint(allocator, "{s}#nixosModules", .{url});
 	defer allocator.free(installable);
 	const apply = try std.fmt.allocPrint(allocator, "m: m ? \"{s}\"", .{attr});
 	defer allocator.free(apply);
 	var out = try runNix(allocator, io, &.{ "eval", installable, "--apply", apply, "--json" });
 	defer out.deinit(allocator);
-	if (!out.ok) return false;
-	return std.mem.eql(u8, std.mem.trim(u8, out.stdout, " \t\r\n"), "true");
+	return switch (classifyModuleCheck(out.ok, out.stdout, out.stderr)) {
+		.present => .present,
+		.missing => .missing,
+		.failed => .{ .failed = try allocator.dupe(u8, out.stderr) },
+	};
+}
+
+/// Pure classification of the eval result: a clean "true" is present, a clean
+/// "false" or a "flake does not provide attribute ... 'nixosModules'" error is
+/// missing, any other failure is real and must be surfaced. The missing-attr
+/// match is deliberately narrower than stderrSaysMissingAttribute: it requires
+/// nix's flake-output phrase naming 'nixosModules', so a plugin flake whose
+/// own eval error happens to contain "has no attribute" cannot smuggle a real
+/// failure back into the misleading contract message.
+pub fn classifyModuleCheck(ok: bool, stdout: []const u8, stderr: []const u8) std.meta.Tag(ModuleCheck) {
+	if (ok) {
+		const is_true = std.mem.eql(u8, std.mem.trim(u8, stdout, " \t\r\n"), "true");
+		return if (is_true) .present else .missing;
+	}
+	const no_output = std.mem.indexOf(u8, stderr, "does not provide attribute") != null and
+		std.mem.indexOf(u8, stderr, "'nixosModules'") != null;
+	return if (no_output) .missing else .failed;
 }
 
 /// `nix eval URL#cogboxPlugin."<attr>".<leaf> --json` (or the flat path
@@ -93,10 +122,22 @@ pub const MetaError = error{
 	OutOfMemory,
 };
 
-/// Parse `nix flake metadata --json` output. `.url` is nix's locked URL; if
-/// it doesn't already carry a narHash query param (github:/git+ refs don't),
-/// `.locked.narHash` is appended (percent-encoded) so the URL alone pins the
-/// content and resolves from the local store offline.
+/// Whether nix's git or hg fetcher serves this locked URL. Covers the
+/// `git+`/`hg+` transport spellings and the bare legacy `git://` protocol
+/// (which nix accepts and locks WITHOUT a `git+` prefix). These fetchers
+/// pass unrecognized query params through to the remote.
+pub fn isGitOrHgUrl(url: []const u8) bool {
+	return std.mem.startsWith(u8, url, "git+") or
+		std.mem.startsWith(u8, url, "hg+") or
+		std.mem.startsWith(u8, url, "git://");
+}
+
+/// Parse `nix flake metadata --json` output. `.url` is nix's locked URL.
+/// For github:/path:/tarball refs that don't already carry a narHash query
+/// param, `.locked.narHash` is appended (percent-encoded) so the URL alone
+/// pins the content and resolves from the local store offline. git/hg refs
+/// never get the param (their fetchers would hand it to the remote); they
+/// are pinned by rev alone and resolve offline via the fetcher cache.
 pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) MetaError!Meta {
 	const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
 		return error.BadMetadata;
@@ -123,6 +164,16 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) MetaEr
 
 	const locked_url = blk: {
 		if (std.mem.indexOf(u8, url_v.string, "narHash=") != null) {
+			break :blk try allocator.dupe(u8, url_v.string);
+		}
+		// git/hg locked URLs must NOT grow a narHash param: nix's git and hg
+		// fetchers consume only their own query params (ref, rev, shallow,
+		// ...) and pass everything else through to the remote, so the forge
+		// would be asked for a repo literally named "...?narHash=..." and
+		// refuse. The rev pins those URLs (clean trees; the caller warns on
+		// rev-less dirty-tree locks); offline starts come from the fetcher
+		// cache that `nix flake archive` populates.
+		if (isGitOrHgUrl(url_v.string)) {
 			break :blk try allocator.dupe(u8, url_v.string);
 		}
 		const sep: u8 = if (std.mem.indexOfScalar(u8, url_v.string, '?') != null) '&' else '?';

@@ -189,10 +189,19 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	};
 	defer meta.deinit(allocator);
 
+	// A git/hg lock without a rev is a dirty worktree: the locked URL can't
+	// carry a narHash (the fetcher would hand it to the remote) and has no
+	// rev, so nothing pins it -- the guest module floats with the worktree
+	// across restarts.
+	if (meta.rev == null and nix.isGitOrHgUrl(meta.locked_url)) {
+		try warn(ctx, "source tree is dirty: the lock has no rev, so the plugin floats with the worktree (commit, then `cogbox plugin update`, to pin)", .{});
+	}
+
 	const module_attr = attr orelse "default";
-	const has_module = try nix.evalHasNixosModule(allocator, io, meta.locked_url, module_attr);
-	if (!has_module) {
-		die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65);
+	switch (try nix.evalHasNixosModule(allocator, io, meta.locked_url, module_attr)) {
+		.present => {},
+		.missing => die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65),
+		.failed => |stderr| die(allocator, io, "could not evaluate flake '{s}':\n{s}", .{ meta.locked_url, nix.stderrTail(stderr) }, 65),
 	}
 
 	archiveFlake(ctx, meta.locked_url);

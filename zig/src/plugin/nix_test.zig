@@ -31,21 +31,88 @@ test "parseMetadata: path flake already carries narHash, no rev" {
 	try t.expectEqualStrings("sha256-zzz=", m.nar_hash);
 }
 
-test "parseMetadata: git+https with ?dir gets & separator" {
+test "parseMetadata: git scheme never grows a narHash param" {
+	// nix's git fetcher passes unknown query params through to the remote
+	// URL, so an appended narHash corrupts the repo path the forge sees
+	// (observed as a bogus "namespace not found" on git+ssh). The locked
+	// URL must come through verbatim; the narHash still lands in .nar_hash.
 	const json =
 		\\{"locked":{"narHash":"sha256-q=","rev":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","type":"git","url":"https://e.com/g/r"},
 		\\ "url":"git+https://e.com/g/r?dir=flake&rev=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
 	;
 	var m = try nix.parseMetadata(t.allocator, json);
 	defer m.deinit(t.allocator);
-	try t.expect(std.mem.startsWith(u8, m.locked_url, "git+https://e.com/g/r?dir=flake&rev="));
-	try t.expect(std.mem.endsWith(u8, m.locked_url, "&narHash=sha256-q%3D"));
+	try t.expectEqualStrings("git+https://e.com/g/r?dir=flake&rev=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", m.locked_url);
+	try t.expectEqualStrings("sha256-q=", m.nar_hash);
+}
+
+test "parseMetadata: git+ssh locked URL stays verbatim" {
+	const json =
+		\\{"locked":{"lastModified":1700000000,"narHash":"sha256-Zz0=","ref":"refs/heads/master","rev":"0123456789abcdef0123456789abcdef01234567","type":"git","url":"ssh://git@forge.example/org/repo"},
+		\\ "url":"git+ssh://git@forge.example/org/repo?ref=refs/heads/master&rev=0123456789abcdef0123456789abcdef01234567"}
+	;
+	var m = try nix.parseMetadata(t.allocator, json);
+	defer m.deinit(t.allocator);
+	try t.expectEqualStrings("git+ssh://git@forge.example/org/repo?ref=refs/heads/master&rev=0123456789abcdef0123456789abcdef01234567", m.locked_url);
+	try t.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", m.rev.?);
+	try t.expectEqualStrings("sha256-Zz0=", m.nar_hash);
+}
+
+test "parseMetadata: bare git:// scheme never grows a narHash param" {
+	// The legacy git protocol locks WITHOUT a git+ prefix; it is served by
+	// the same fetcher that hands unknown query params to the remote.
+	const json =
+		\\{"locked":{"narHash":"sha256-g=","rev":"0123abcd0123abcd0123abcd0123abcd0123abcd","type":"git","url":"git://e.com/g/r"},
+		\\ "url":"git://e.com/g/r?ref=refs/heads/master&rev=0123abcd0123abcd0123abcd0123abcd0123abcd"}
+	;
+	var m = try nix.parseMetadata(t.allocator, json);
+	defer m.deinit(t.allocator);
+	try t.expectEqualStrings("git://e.com/g/r?ref=refs/heads/master&rev=0123abcd0123abcd0123abcd0123abcd0123abcd", m.locked_url);
+}
+
+test "parseMetadata: hg scheme never grows a narHash param" {
+	const json =
+		\\{"locked":{"narHash":"sha256-h=","rev":"0123abcd0123abcd0123abcd0123abcd0123abcd","type":"hg","url":"https://e.com/h/r"},
+		\\ "url":"hg+https://e.com/h/r?rev=0123abcd0123abcd0123abcd0123abcd0123abcd"}
+	;
+	var m = try nix.parseMetadata(t.allocator, json);
+	defer m.deinit(t.allocator);
+	try t.expectEqualStrings("hg+https://e.com/h/r?rev=0123abcd0123abcd0123abcd0123abcd0123abcd", m.locked_url);
 }
 
 test "parseMetadata: malformed input" {
 	try t.expectError(error.BadMetadata, nix.parseMetadata(t.allocator, "not json"));
 	try t.expectError(error.BadMetadata, nix.parseMetadata(t.allocator, "{\"url\":\"x\"}"));
 	try t.expectError(error.BadMetadata, nix.parseMetadata(t.allocator, "{\"url\":\"x\",\"locked\":{}}"));
+}
+
+test "classifyModuleCheck: present / missing / failed" {
+	// Clean evals: --apply 'm: m ? "attr"' prints true or false.
+	try t.expectEqual(.present, nix.classifyModuleCheck(true, "true\n", ""));
+	try t.expectEqual(.missing, nix.classifyModuleCheck(true, "false\n", ""));
+	// No nixosModules output at all: still a contract violation, not a failure.
+	try t.expectEqual(.missing, nix.classifyModuleCheck(
+		false,
+		"",
+		"error: flake 'git+file:///x' does not provide attribute 'packages.x86_64-linux.nixosModules', 'legacyPackages.x86_64-linux.nixosModules' or 'nixosModules'",
+	));
+	// A fetch error must NOT be misread as a missing module (the bug that
+	// reported every broken locked URL as "does not expose nixosModules").
+	try t.expectEqual(.failed, nix.classifyModuleCheck(
+		false,
+		"",
+		"fatal: Could not read from remote repository.\nerror: Cannot find Git revision '0123456' in ref 'refs/heads/master'",
+	));
+	// So must an eval error inside the plugin flake.
+	try t.expectEqual(.failed, nix.classifyModuleCheck(false, "", "error: boom: deliberately broken"));
+	// A plugin's own eval error containing a missing-attribute phrase must
+	// not smuggle the failure back into the contract message: only nix's
+	// flake-output error naming 'nixosModules' counts as missing.
+	try t.expectEqual(.failed, nix.classifyModuleCheck(
+		false,
+		"",
+		"error: attribute 'foo' missing\n       at /nix/store/x-source/flake.nix:4:7\nerror: input set has no attribute 'bar'",
+	));
 }
 
 test "stderr helpers" {

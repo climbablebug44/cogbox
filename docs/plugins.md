@@ -61,7 +61,9 @@ A `.plugins` entry in `config.json` looks like:
 }
 ```
 
-`url` is exactly what you typed (minus the fragment) and is what `update` re-resolves; `lockedUrl` carries the rev and narHash so the composition flake's inputs are deterministic and offline-substitutable. `attr` is omitted for the default module. Dirty `path:` flakes have no `rev`; the narHash is the canonical change detector.
+`url` is exactly what you typed (minus the fragment) and is what `update` re-resolves; `lockedUrl` is what the composition flake's inputs consume. For forge, `path:`, and tarball schemes it carries the rev and narHash, making the input deterministic and offline-substitutable. For `git+`/`hg+` URLs it carries ref+rev only: nix's git and hg fetchers pass unrecognized query params (narHash included) through to the remote, which would corrupt the repository path the forge sees, so the rev alone is the pin and offline resolution relies on the fetcher cache populated at add time. The top-level `narHash` field is recorded for every scheme and is the canonical change detector (dirty `path:` flakes have no `rev`). `attr` is omitted for the default module.
+
+A **dirty git worktree** is the worst-pinned shape: its lock has neither rev nor narHash in the URL, so the recorded plugin floats with the worktree across restarts. `add` warns when this happens; commit the tree and run `cogbox plugin update` to pin properly.
 
 ## Network rules
 
@@ -96,9 +98,9 @@ Plugin state is materialized as a generated flake at `~/.config/cogbox/instances
 }
 ```
 
-At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake instead of the plain instance flake (the [same re-exec mechanism](extensions.md#how-it-works) the manual extension path uses), so plugins and manual flake.nix edits compose. Two plugins from the same flake become two pinned inputs that resolve to the same store path. No `flake.lock` is generated: the composition is only ever consumed as an input, and rev+narHash-pinned inputs leave nothing for a lock file to decide.
+At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake instead of the plain instance flake (the [same re-exec mechanism](extensions.md#how-it-works) the manual extension path uses), so plugins and manual flake.nix edits compose. Two plugins from the same flake become two pinned inputs that resolve to the same store path. No `flake.lock` is generated: the composition is only ever consumed as an input, and pinned inputs leave nothing for a lock file to decide.
 
-Because the inputs are pinned by narHash and pre-fetched by `nix flake archive` at add time, restarts of a plugin-bearing instance work offline once the runner has been built.
+Because the inputs are pinned (by narHash, or by rev for git/hg schemes) and pre-fetched by `nix flake archive` at add time, restarts of a plugin-bearing instance work offline once the runner has been built.
 
 ## Trust
 

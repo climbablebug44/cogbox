@@ -42,6 +42,9 @@ in {
 			python3
 			# Phase K's L7 origin uses a throwaway self-signed cert.
 			openssl
+			# Phase Q7 adds a plugin from a git+file:// flake; git is only
+			# needed to create the fixture repo (nix fetches via libgit2).
+			git
 		];
 
 		# Phase K (L7 vhost filtering): the host-side L7 proxy re-resolves the

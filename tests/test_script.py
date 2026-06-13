@@ -404,6 +404,91 @@ NIX_EOF"""))
     machine.fail(as_user("cogbox ssh --name plug 'test -f /etc/cogbox-test-extra'"))
     stop_instance("cc-plug", name="plug")
 
+    # Q7: git-scheme plugin URLs. REGRESSION: parseMetadata used to append
+    # ?narHash=... to the locked URL, but nix's git fetcher passes unknown
+    # query params through to the remote, so every later fetch of the pin
+    # (the contract check, the composition flake's inputs) asked the forge
+    # for a repo literally named "...?narHash=..." and failed -- misreported
+    # as "does not expose nixosModules.default". git+file:// exercises the
+    # same fetcher without network.
+    git_plug = "/home/testuser/cogbox-git-plugin"
+    machine.succeed(as_user(f"mkdir -p {git_plug}"))
+    machine.succeed(as_user("""cat > """ + git_plug + """/flake.nix <<'NIX_EOF'
+{
+    description = "cogbox git-scheme test plugin";
+    outputs = { self }: {
+        nixosModules.default = { ... }: {
+            environment.etc."cogbox-git-plugin".text = "git\\n";
+        };
+    };
+}
+NIX_EOF"""))
+    machine.succeed(as_user(
+        f"cd {git_plug} && git init -q && git add flake.nix && "
+        "git -c user.email=t@test -c user.name=t commit -qm init"
+    ))
+    out = machine.succeed(as_user(
+        f"cogbox plugin add 'git+file://{git_plug}' -y --name plug"
+    ))
+    assert "added" in out, out
+    locked = machine.succeed(f"jq -r '.plugins[0].lockedUrl' {plug_cfg}").strip()
+    assert locked.startswith("git+file://") and "rev=" in locked, locked
+    assert "narHash=" not in locked, f"narHash param corrupts git URLs: {locked!r}"
+    nar = machine.succeed(f"jq -r '.plugins[0].narHash' {plug_cfg}").strip()
+    assert nar.startswith("sha256-"), nar
+    rev = machine.succeed(f"jq -r '.plugins[0].rev' {plug_cfg}").strip()
+    assert len(rev) == 40, rev
+    # The recorded pin must itself be fetchable: this exact eval is what the
+    # contract check and the composition flake's input resolution perform.
+    out = machine.succeed(as_user(
+        "nix --extra-experimental-features 'nix-command flakes' "
+        f"eval '{locked}#nixosModules' --apply 'm: m ? \"default\"' --json"
+    )).strip()
+    assert out == "true", out
+    machine.succeed(as_user("cogbox plugin del cogbox-git-plugin -y --name plug"))
+
+    # Q7b: a DIRTY git worktree locks with neither rev nor narHash in the
+    # URL -- nothing pins it. The add must still work but warn that the
+    # plugin floats with the worktree.
+    machine.succeed(as_user(f"echo '# dirty' >> {git_plug}/flake.nix"))
+    out = machine.succeed(as_user(
+        f"cogbox plugin add 'git+file://{git_plug}' -y --name plug 2>&1"
+    ))
+    assert "added" in out, out
+    assert "source tree is dirty" in out, out
+    locked = machine.succeed(f"jq -r '.plugins[0].lockedUrl' {plug_cfg}").strip()
+    assert "rev=" not in locked and "narHash=" not in locked, locked
+    rev = machine.succeed(f"jq -r '.plugins[0].rev' {plug_cfg}").strip()
+    assert rev == "null", rev
+    machine.succeed(as_user("cogbox plugin del cogbox-git-plugin -y --name plug"))
+
+    # Q8: error reporting. An eval failure inside the plugin flake must
+    # surface nix's error, NOT the "does not expose" contract message
+    # (which used to swallow every fetch/eval failure) ...
+    bad_plug = "/home/testuser/cogbox-bad-plugin"
+    machine.succeed(as_user(f"mkdir -p {bad_plug}"))
+    machine.succeed(as_user("""cat > """ + bad_plug + """/flake.nix <<'NIX_EOF'
+{
+    outputs = { self }: {
+        nixosModules = throw "cogbox-test-deliberate-eval-error";
+    };
+}
+NIX_EOF"""))
+    rc, out = machine.execute(as_user(
+        f"cogbox plugin add path:{bad_plug} -y --name plug 2>&1"
+    ))
+    assert rc != 0, out
+    assert "could not evaluate flake" in out, out
+    assert "cogbox-test-deliberate-eval-error" in out, out
+    assert "does not expose" not in out, out
+    # ... while a flake that evaluates fine but lacks the module still gets
+    # the contract message.
+    rc, out = machine.execute(as_user(
+        "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#nonexistent' -y --name plug 2>&1"
+    ))
+    assert rc != 0, out
+    assert "does not expose nixosModules.nonexistent" in out, out
+
 with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     boot_and_wait("cc-default", "", ssh_port=2222)
     # All harness launchers are on $PATH inside the VM unconditionally

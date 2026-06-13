@@ -4,8 +4,9 @@
 // The file is a pure function of config.json's .plugins array and is
 // regenerated on every plugin mutation; cogbox-launch.sh points
 // --override-input userExtensions at its directory when plugins exist.
-// Plugin inputs are pinned by locked URL (rev + narHash), so evaluating the
-// composition never needs the network once `nix flake archive` has run.
+// Plugin inputs are pinned by locked URL (rev + narHash, or rev alone for
+// git/hg schemes whose fetchers reject extra query params), so evaluating
+// the composition never needs the network once `nix flake archive` has run.
 
 const std = @import("std");
 
