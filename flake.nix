@@ -309,6 +309,10 @@
 					ncdu
 					tmux
 					htop
+					# certutil: cogbox-l7-trust.service imports the per-instance MITM
+					# CA into root's NSS db with it (so Chromium/Playwright trust the
+					# terminate tier); also handy for inspecting that trust.
+					nss.tools
 				]
 				++ lib.concatMap (h: [ h.package (mkLauncher h) ]) (lib.attrValues harnesses)
 				++ lib.optionals hasNixMcp [
@@ -394,6 +398,26 @@
 									cp "$sys" "$bundle"
 								fi
 								chmod 0644 "$bundle"
+
+								# NSS-based clients -- notably Chromium / Playwright, which
+								# ignore the CA env vars AND the bundle file above -- read
+								# trusted roots from the per-user NSS db. Mirror the CA into
+								# root's db so browser-driven plugins trust terminate-tier
+								# leaves too. Idempotent across boots and terminate on/off:
+								# (re)create the db (the cert9.db guard avoids a certutil -N
+								# re-init prompt), drop any prior copy, re-add only when a real
+								# CA is present. Best-effort (set +e): the env-var bundle still
+								# covers non-NSS clients, so a certutil hiccup must degrade
+								# browser trust, never fail this boot-ordered unit.
+								set +e
+								db=/root/.pki/nssdb
+								mkdir -p "$db"
+								[ -e "$db/cert9.db" ] || ${pkgs.nss.tools}/bin/certutil -N --empty-password -d "sql:$db"
+								${pkgs.nss.tools}/bin/certutil -D -n cogbox-l7-ca -d "sql:$db" 2>/dev/null
+								if [ -s "$ca" ] && grep -q "BEGIN CERTIFICATE" "$ca"; then
+									${pkgs.nss.tools}/bin/certutil -A -n cogbox-l7-ca -t "C,," -i "$ca" -d "sql:$db"
+								fi
+								set -e
 							'';
 						};
 					};

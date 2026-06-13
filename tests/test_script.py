@@ -1048,6 +1048,12 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
     ))
     # Trust bundle assembled (system store + instance CA).
     machine.succeed(as_user("cogbox ssh --name work 'test -s /run/cogbox/ca-bundle.crt'"))
+    # CA also imported into root's NSS db, so NSS clients (Chromium/Playwright,
+    # which ignore the CA env vars + bundle file) trust the terminate tier.
+    nss = machine.succeed(as_user(
+        "cogbox ssh --name work 'certutil -L -d sql:/root/.pki/nssdb'"
+    ))
+    assert "cogbox-l7-ca" in nss, f"per-instance CA not in root NSS db: {nss!r}"
 
     def gterm(extra):
         cmd = (
