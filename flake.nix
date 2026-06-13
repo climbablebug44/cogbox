@@ -661,6 +661,19 @@
 		checks = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 		in {
+			# Pure-helper parity + credential-injection unit tests for the
+			# mitmproxy L7 addon. Fast (no VM); keeps the addon's host
+			# pattern / path / cred-injection logic honest on every build.
+			addon-tests = pkgs.runCommand "cogbox-addon-tests" {
+				nativeBuildInputs = [ pkgs.python3 ];
+			} ''
+				cp ${./l7-mitm-addon.py} l7-mitm-addon.py
+				mkdir tests
+				cp ${./tests/test_l7_addon.py} tests/test_l7_addon.py
+				python3 tests/test_l7_addon.py
+				touch $out
+			'';
+
 			zig-tests = pkgs.stdenv.mkDerivation {
 				pname = "cogbox-zig-tests";
 				version = "0.1.0";

@@ -83,6 +83,123 @@ check(not m.host_insecure(ri, "nope.svc"), "deny rule never insecure-allows")
 check(not m.host_insecure(ri, "unlisted.svc"), "unlisted host not insecure")
 check(m.host_insecure(ri, "box.lab.test"), "insecure wildcard host")
 
+# --- credential injection (host-side; keeps tokens out of the guest) ---
+
+# Case-insensitive header shim mirroring mitmproxy's Headers multidict, so the
+# tests catch case bugs in apply_injection (a guest may send `X-Api-Key`).
+class CIDict:
+    def __init__(self, init=None):
+        self._d = {}
+        for k, v in (init or {}).items():
+            self[k] = v
+
+    def __setitem__(self, k, v):
+        self._d[k.lower()] = v
+
+    def __getitem__(self, k):
+        return self._d[k.lower()]
+
+    def __delitem__(self, k):
+        del self._d[k.lower()]
+
+    def __contains__(self, k):
+        return k.lower() in self._d
+
+    def get(self, k, default=None):
+        return self._d.get(k.lower(), default)
+
+
+# json_path_get: dotted-path string-leaf fetch
+check(m.json_path_get({"a": {"b": "x"}}, "a.b") == "x", "json_path nested")
+check(m.json_path_get({"a": {"b": "x"}}, "a.c") is None, "json_path missing leaf")
+check(m.json_path_get({"a": "x"}, "a.b") is None, "json_path descend non-dict")
+check(m.json_path_get({"a": {"b": 5}}, "a.b") is None, "json_path non-string leaf")
+check(
+    m.json_path_get({"claudeAiOauth": {"accessToken": "sk-ant-oat01-Z"}},
+                    "claudeAiOauth.accessToken") == "sk-ant-oat01-Z",
+    "json_path claude shape",
+)
+
+# merge_beta: append oauth marker, idempotent, trim, preserve feature betas
+check(m.merge_beta(None, "oauth-2025-04-20") == "oauth-2025-04-20", "beta from None")
+check(m.merge_beta("", "oauth-2025-04-20") == "oauth-2025-04-20", "beta from blank")
+check(
+    m.merge_beta("claude-code-20250219", "oauth-2025-04-20")
+    == "claude-code-20250219,oauth-2025-04-20",
+    "beta append",
+)
+check(
+    m.merge_beta("a, oauth-2025-04-20 ,b", "oauth-2025-04-20") == "a,oauth-2025-04-20,b",
+    "beta idempotent + trim",
+)
+
+# apply_injection: anthropic-oauth replaces stub Bearer, drops x-api-key, merges beta
+h = CIDict({"Authorization": "Bearer PLACEHOLDER", "X-Api-Key": "guest-key",
+            "anthropic-beta": "claude-code-20250219"})
+m.apply_injection(h, "anthropic-oauth", "REAL-OAT")
+check(h["authorization"] == "Bearer REAL-OAT", "oauth sets real bearer")
+check("x-api-key" not in h, "oauth drops x-api-key")
+check(h["anthropic-beta"] == "claude-code-20250219,oauth-2025-04-20", "oauth merges beta")
+
+# anthropic-apikey: sets x-api-key, drops Authorization
+h = CIDict({"Authorization": "Bearer guest"})
+m.apply_injection(h, "anthropic-apikey", "REAL-KEY")
+check(h["x-api-key"] == "REAL-KEY", "apikey sets x-api-key")
+check("authorization" not in h, "apikey drops authorization")
+
+# openai-chatgpt: sets bearer + chatgpt-account-id
+h = CIDict({"Authorization": "Bearer stub"})
+m.apply_injection(h, "openai-chatgpt", "REAL-ACC", account_id="acct_123")
+check(h["authorization"] == "Bearer REAL-ACC", "chatgpt sets bearer")
+check(h["chatgpt-account-id"] == "acct_123", "chatgpt sets account id")
+h = CIDict({})
+m.apply_injection(h, "openai-chatgpt", "T")  # no account id -> header omitted
+check("chatgpt-account-id" not in h, "chatgpt omits account id when absent")
+
+# bearer (and unknown style) -> plain Bearer replace
+h = CIDict({"Authorization": "Bearer stub"})
+m.apply_injection(h, "bearer", "T")
+check(h["authorization"] == "Bearer T", "bearer style")
+h = CIDict({})
+m.apply_injection(h, "weird-unknown", "T")
+check(h["authorization"] == "Bearer T", "unknown style falls back to bearer")
+
+# CredStore: conf + cred file, host normalization, mtime hot-reload, fail-closed
+import json as _json
+import tempfile
+
+_d = tempfile.mkdtemp()
+_cred = os.path.join(_d, "creds.json")
+_conf = os.path.join(_d, "inject.json")
+
+
+def _write(path, obj, mtime):
+    with open(path, "w") as f:
+        _json.dump(obj, f)
+    os.utime(path, (mtime, mtime))
+
+
+_write(_cred, {"claudeAiOauth": {"accessToken": "OAT-1"}}, 1000)
+_write(_conf, [{"host": "api.anthropic.com", "style": "anthropic-oauth",
+                "cred_file": _cred, "token_path": "claudeAiOauth.accessToken"}], 1000)
+cs = m.CredStore(_conf)
+spec = cs.spec_for("api.anthropic.com")
+check(spec is not None, "credstore spec found")
+check(cs.spec_for("API.ANTHROPIC.COM.") is not None, "credstore host case/dot normalize")
+check(cs.spec_for("other.host") is None, "credstore no spec for unlisted host")
+check(cs.value_for(spec, "token_path") == "OAT-1", "credstore reads token v1")
+check(cs.value_for(spec, "account_id_path") is None, "credstore missing path key -> None")
+_write(_cred, {"claudeAiOauth": {"accessToken": "OAT-2"}}, 2000)  # rotate
+check(cs.value_for(spec, "token_path") == "OAT-2", "credstore hot-reloads rotated token")
+check(m.CredStore("").spec_for("api.anthropic.com") is None, "credstore disabled when no conf")
+_write(_conf, [{"host": "x.test", "style": "bearer",
+                "cred_file": os.path.join(_d, "nope.json"), "token_path": "k"}], 3000)
+cs2 = m.CredStore(_conf)
+sp2 = cs2.spec_for("x.test")
+check(sp2 is not None, "credstore spec for a host whose cred file is missing")
+check(cs2.value_for(sp2, "token_path") is None, "credstore missing cred file -> None (fail closed)")
+
+
 if fails:
     print("FAIL:", *fails, sep="\n  ")
     sys.exit(1)

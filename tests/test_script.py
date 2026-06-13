@@ -846,11 +846,14 @@ def respond(conn, scheme):
     parts = first.split(" ")
     path = parts[1] if len(parts) > 1 else "?"
     host = ""
+    auth = ""
     for h in data.split("\r\n"):
         if h.lower().startswith("host:"):
             host = h.split(":", 1)[1].strip()
-    loghit("%s host=%s path=%s" % (scheme, host, path))
-    body = ("ok %s host=%s path=%s" % (scheme, host, path)).encode()
+        elif h.lower().startswith("authorization:"):
+            auth = h.split(":", 1)[1].strip()
+    loghit("%s host=%s path=%s auth=%s" % (scheme, host, path, auth))
+    body = ("ok %s host=%s path=%s auth=%s" % (scheme, host, path, auth)).encode()
     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
                  % (len(body), body))
 def handle_tls(raw):
@@ -1176,6 +1179,88 @@ with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstrea
         timeout=20,
     )
     machine.succeed("grep -q 'host=vhost-a.test' /tmp/origin-hits.log")
+
+    stop_instance("cc-work", name="work")
+    machine.succeed("systemctl stop l7-origin")
+
+with subtest("Phase R: L7 host-side credential injection keeps the token out of the guest"):
+    # Inject mode: a harness's request to a terminate host has its auth header
+    # REPLACED host-side (in the mitmproxy addon, after decryption) with the real
+    # token read off the host FS, so the guest only ever carries a stub. Proven
+    # end-to-end: the guest sends a PLACEHOLDER bearer; the origin -- reached only
+    # because mitmproxy forwards the decrypted, rewritten request (terminate +
+    # --insecure-upstream) -- must observe the REAL token and never the
+    # placeholder. The real token lives only in a host-side file the guest VM
+    # cannot read (it is not on any 9p share, fw_cfg slot, or env that crosses in).
+    machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
+    machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
+    machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
+
+    # Host-side secret: a stand-in cred file holding the REAL token, 0600, owned
+    # by the launching user. The mitmdump addon reads it host-side; it is NEVER
+    # shared into the guest.
+    real_token = "REAL-OAT-do-not-leak-7f3a"
+    machine.succeed(as_user(
+        "printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"" + real_token + "\"}}' "
+        "> /home/testuser/host-creds.json && chmod 600 /home/testuser/host-creds.json"
+    ))
+    # Inject-conf maps the terminate vhost -> that host cred file + token path.
+    # Lives host-side only (never $RUNTIME, never 9p-shared). `bearer` style sets
+    # a plain `Authorization: Bearer <token>`.
+    inject_conf = "/home/testuser/l7-inject.json"
+    machine.succeed(as_user(
+        "printf '%s' "
+        "'[{\"host\":\"vhost-a.test\",\"style\":\"bearer\","
+        "\"cred_file\":\"/home/testuser/host-creds.json\","
+        "\"token_path\":\"claudeAiOauth.accessToken\"}]' > " + inject_conf
+    ))
+
+    # Terminate + insecure-upstream so the rewritten request actually reaches the
+    # self-signed origin (mitmproxy is the TLS endpoint; the addon injects).
+    machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
+    machine.succeed(as_user(
+        "cogbox l7 add allow vhost-a.test --insecure-upstream --name work"
+    ))
+
+    # Boot with injection enabled. v0 is env-driven (COGBOX_L7_INJECT_CONF);
+    # the daemon is setsid'd but inherits this env. (The config-driven, default-on
+    # path lands in a later phase.)
+    machine.succeed(as_user(
+        f"COGBOX_L7_INJECT_CONF={inject_conf} cogbox start --no-ssh --name work"
+    ))
+    machine.wait_until_succeeds(
+        as_user(f"ssh {SSH_OPTS} -p 2223 root@127.0.0.1 true"), timeout=600,
+    )
+    # The addon actually loaded the inject-conf (passed through start_l7mitm).
+    machine.succeed(
+        "grep -qa '/home/testuser/l7-inject.json' /proc/$(cat "
+        "/run/user/1000/cogbox-work/l7mitm.pid)/environ"
+    )
+
+    # The guest sends a PLACEHOLDER bearer; injection must overwrite it before
+    # the request leaves the host. The origin echoes the auth it received.
+    placeholder = "PLACEHOLDER-guest-token"
+    body_cmd = (
+        "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
+        "--resolve vhost-a.test:443:203.0.113.5 "
+        "-H 'Authorization: Bearer " + placeholder + "' https://vhost-a.test/"
+    )
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name work " + shlex.quote(
+            body_cmd + " | grep -q 'auth=Bearer " + real_token + "'")),
+        timeout=20,
+    )
+    # Ground truth at the origin: it saw the REAL token, NEVER the placeholder.
+    hits = machine.succeed("cat /tmp/origin-hits.log")
+    assert ("auth=Bearer " + real_token) in hits, f"injected token missing at origin: {hits!r}"
+    assert placeholder not in hits, f"guest placeholder leaked upstream: {hits!r}"
+
+    # The real token never crossed into the guest: it is in no guest-readable
+    # mount, the inject-conf and cred file are host-only.
+    rc_leak, _ = machine.execute(as_user(
+        "cogbox ssh --name work " + shlex.quote(
+            "grep -rqsI '" + real_token + "' /root /etc /var/lib /run/cogbox")))
+    assert rc_leak != 0, "real token must not be present anywhere in the guest"
 
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")

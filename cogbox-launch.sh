@@ -885,7 +885,19 @@ start_l7mitm() {
 	# addon has decided, so a denied request never opens a connection to the
 	# upstream (and a deny to an unreachable upstream still returns 403 rather
 	# than dropping the client's TLS handshake).
+	#
+	# Host-side credential injection: when an inject-conf is present, the addon
+	# replaces a harness's request auth header with the real token read off the
+	# host FS (mitmdump runs host-side as the launching user), so the guest only
+	# ever carries a stub and the long-lived token never enters the sandbox. The
+	# conf maps host -> {cred_file, token_path, style} and lives host-side only.
+	# Resolution: an explicit COGBOX_L7_INJECT_CONF wins; otherwise a launch-time
+	# step may drop the conf at the runtime default below. A missing file blanks
+	# the var so the addon falls back to legacy "guest carries its own token".
+	local inject_conf="${COGBOX_L7_INJECT_CONF:-$RUNTIME/l7-inject-conf.json}"
+	[ -f "$inject_conf" ] || inject_conf=""
 	COGBOX_L7_RULES="$RUNTIME/l7-rules" \
+	COGBOX_L7_INJECT_CONF="$inject_conf" \
 	@mitmdump@ --mode "socks5@${L7_MITM_PORT}" --listen-host 127.0.0.1 \
 		--set confdir="$ca_dir" --set http2=false --set connection_strategy=lazy \
 		-s "@l7addon@" -q &

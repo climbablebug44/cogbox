@@ -6,6 +6,7 @@ cogbox restricts what the sandboxed agent can reach on the network. Filtering is
 - [L4 CIDR rules](#l4-cidr-rules)
 - [TCP destination remap](#tcp-destination-remap)
 - [L7 host filtering](#l7-host-filtering)
+- [Host-side credential injection](#host-side-credential-injection)
 
 ## Network modes
 
@@ -239,3 +240,26 @@ Documented, not silently assumed safe:
 - **QUIC / UDP-443 and all guest IPv6** are denied while L7 is active (the funnel is IPv4/TCP-only), so clients fall back to inspectable IPv4 TCP. DNS (port 53) still works.
 - Loopback, this-network, and link-local/metadata vhosts are never reachable through the proxy (the hard floor) -- consistent with the sandbox's LAN posture for those specific ranges.
 - **Encrypted ClientHello (ECH)** is refused on **passthrough** hosts (logged `ech-on-splice`): the cleartext SNI that passthrough routes on could be a decoy for an encrypted inner name, so it can't be trusted to identify the real host. **Terminate** hosts accept ECH -- mitmproxy is the TLS endpoint and re-checks `Host == SNI` on the *decrypted* request, so an inner name can't be smuggled past it. Chrome/Chromium send a GREASE ECH extension on every handshake by default, so a browser client reaching a vhost must be on the terminate tier (the default); only an explicitly `--passthrough` vhost would drop it.
+
+## Host-side credential injection
+
+By default, cogbox inherits the harness's auth from the host by mounting the host's credential files into the guest (see [harnesses](harnesses.md)). Those files carry the agent's long-lived secrets -- for the OAuth harnesses, an `accessToken` **and a `refreshToken`** (in `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.local/share/opencode/auth.json`). A compromised or prompt-injected agent inside the sandbox can read them, so the credential -- including the refresh token, which mints fresh access tokens indefinitely -- can be exfiltrated and reused off-box, long after the instance is gone.
+
+Host-side credential injection removes the secret from the sandbox. Because the terminate tier already MITMs a host's TLS host-side, the proxy can **rewrite the request's auth header** with the real token read from the host's own credential file -- so the guest only ever carries a stub, and the real token (especially the refresh token) never crosses the 9p / fw_cfg boundary into the VM.
+
+### How it works
+
+When an **inject-conf** is present (path in `COGBOX_L7_INJECT_CONF`, passed to the mitmproxy backend by `cogbox-launch.sh`), the terminate-tier addon (`l7-mitm-addon.py`), on every decrypted request whose host matches a configured spec, **after** the allow + `Host == SNI` checks pass, replaces the auth header from a host-side credential file:
+
+- the conf is a JSON list of specs `{host, style, cred_file, token_path, account_id_path?}`;
+- the addon reads `token_path` (a dotted path, e.g. `claudeAiOauth.accessToken`) out of `cred_file` and hot-reloads it on mtime change, so a rotated access token is picked up on the next request with no restart;
+- the credential header is **set, not appended**, so any placeholder the guest sent is overwritten and never reaches the upstream;
+- if injection is configured for a host but the host-side token can't be read, the request **fails closed** (`403`) rather than forwarding the stub.
+
+`style` shapes the wire format per harness: `bearer` (`Authorization: Bearer <token>`), `anthropic-oauth` (Bearer + `anthropic-beta: …,oauth-2025-04-20`, drops `x-api-key`), `anthropic-apikey` (`x-api-key`, drops `Authorization`), `openai-chatgpt` (Bearer + `ChatGPT-Account-Id`). The conf and the credential files live **host-side only** -- they are never on a 9p share or fw_cfg slot, and `mitmdump` reads them as the launching user. For this to apply, the harness host must be on the **terminate** tier (so the addon sees the decrypted request); an explicit `cogbox l7 add allow <host> --passthrough` opts a host out of both terminate and injection (the legacy "guest carries its own token end-to-end" behavior).
+
+### What it does and does not protect
+
+**Eliminated:** theft of the long-lived **refresh token** (it never enters the guest), account takeover via a stolen credential file reused off-box, and any persistence beyond the instance lifetime -- only short-lived access tokens are ever injected, host-side, into headers the guest cannot read.
+
+**Not changed:** the guest still holds a **live, authenticated channel** to the provider while the instance runs. A compromised agent can still burn quota / cost and exfiltrate data through the model itself. Credential injection is a credential-*confidentiality* control, not a capability-*confinement* control; pair it with the L4/L7 egress rules, plus rate/cost limits and output monitoring. Note also that terminating a provider host means the **host process sees the plaintext** of that harness's model traffic (your box, never persisted) and that HTTP/2 is downgraded to HTTP/1.1 for that host.
