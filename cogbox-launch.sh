@@ -152,6 +152,79 @@ harness_summary() {
 	esac
 }
 
+# -- Host-side credential injection (keep tokens out of the sandbox) ---
+# Credential-injection specs per harness, one per line:
+#   provider_host|style|cred_file|token_path|account_id_path
+# The terminate-tier mitmproxy addon reads token_path out of cred_file
+# (host-side) and rewrites the request's auth header for provider_host, so the
+# guest only ever carries a stub. cred_file is resolved from the same H_HOST
+# paths used everywhere else. See docs/network-filtering.md.
+harness_inject_specs() {
+	case "$1" in
+		claude-code)
+			printf '%s\n' \
+				"api.anthropic.com|anthropic-oauth|${H_HOST[claude-code:config]}/.credentials.json|claudeAiOauth.accessToken|"
+			;;
+		codex)
+			printf '%s\n' \
+				"chatgpt.com|openai-chatgpt|${H_HOST[codex:home]}/auth.json|tokens.access_token|tokens.account_id" \
+				"api.openai.com|openai-chatgpt|${H_HOST[codex:home]}/auth.json|tokens.access_token|tokens.account_id"
+			;;
+		opencode)
+			# opencode is multi-provider; the anthropic OAuth provider is the
+			# common case. API-key providers (openrouter/kimi) are not yet
+			# auto-injected -- they keep the legacy guest-carries-token path.
+			printf '%s\n' \
+				"api.anthropic.com|anthropic-oauth|${H_HOST[opencode:data]}/auth.json|anthropic.access|"
+			;;
+	esac
+}
+
+# Unique provider hosts to terminate+inject for the active harnesses the user is
+# actually LOGGED INTO (host-side cred file present) -- the seed for a new
+# instance's L7 rules. Gating on cred existence (not just harness-active) matches
+# gen_inject_conf and avoids terminating a provider host for a harness with no
+# token (the `--yes` init activates all harnesses, but most have no creds).
+# Deduped; first such harness wins a shared host (claude-code precedes opencode
+# for api.anthropic.com in HARNESSES order).
+active_inject_hosts() {
+	local h host style cred token acct
+	declare -A seen
+	for h in "${ACTIVE_HARNESSES[@]}"; do
+		while IFS='|' read -r host style cred token acct; do
+			[ -z "$host" ] && continue
+			[ -n "${seen[$host]:-}" ] && continue
+			[ -f "$cred" ] || continue
+			seen[$host]=1
+			printf '%s\n' "$host"
+		done < <(harness_inject_specs "$h")
+	done
+}
+
+# Emit the inject-conf (JSON array) for the active harnesses to stdout: one spec
+# per deduped provider host whose host-side cred file EXISTS. First active
+# harness whose token file is present wins a shared host. `[]` if none -- the
+# caller then writes no conf and the addon leaves auth untouched.
+gen_inject_conf() {
+	local h host style cred token acct
+	declare -A seen
+	{
+		for h in "${ACTIVE_HARNESSES[@]}"; do
+			while IFS='|' read -r host style cred token acct; do
+				[ -z "$host" ] && continue
+				[ -n "${seen[$host]:-}" ] && continue
+				[ -f "$cred" ] || continue
+				seen[$host]=1
+				printf '%s\t%s\t%s\t%s\t%s\n' "$host" "$style" "$cred" "$token" "$acct"
+			done < <(harness_inject_specs "$h")
+		done
+	} | jq -R -s '
+		[ split("\n")[] | select(length > 0) | split("\t")
+		  | { host: .[0], style: .[1], cred_file: .[2], token_path: .[3] }
+		  + (if (.[4] // "") != "" then { account_id_path: .[4] } else {} end) ]
+	'
+}
+
 # Microvm runner has runtime paths baked in at flake build time using this
 # sentinel; the sed substitution below rewrites them to BASE_RUNTIME.
 RUNTIME_TEMPLATE="@runtimeDir@"
@@ -445,7 +518,23 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 	# metadata services to the sandbox. Loopback is omitted -- already denied
 	# implicitly in filter.zig.
 	if [ "$INIT_NETWORK" = "rules" ]; then
-		NETWORK_JQ=$(jq -nc '{
+		# Seed L7 terminate+inject rules for the provider hosts of harnesses the
+		# user is logged into (cred file present), so a new rules-mode instance
+		# keeps tokens host-side by default (the chosen posture). Nothing is
+		# seeded for a harness with no token yet; log in on the host first, or add
+		# the rule later. Opt out by `cogbox l7 mode passthrough`, per-host
+		# `cogbox l7 add allow <host> --passthrough`, or editing `.network.l7`.
+		L7_SEED_JQ='null'
+		if [ "${#ACTIVE_HARNESSES[@]}" -gt 0 ]; then
+			_inject_hosts=$(active_inject_hosts)
+			if [ -n "$_inject_hosts" ]; then
+				L7_SEED_JQ=$(printf '%s\n' "$_inject_hosts" | jq -R -s '
+					{ inject: true,
+					  rules: [ split("\n")[] | select(length > 0)
+					           | { allow: ., terminate: true, comment: "cred-inject (host-side)" } ] }')
+			fi
+		fi
+		NETWORK_JQ=$(jq -nc --argjson l7 "$L7_SEED_JQ" '{
 			rules: [
 				{deny:  "0.0.0.0/8",        comment: "this network (RFC 1122)"},
 				{deny:  "10.0.0.0/8",       comment: "RFC1918 private"},
@@ -462,7 +551,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				{deny:  "240.0.0.0/4",      comment: "reserved/broadcast incl. 255.255.255.255"},
 				{allow: "0.0.0.0/0",        comment: "public internet"}
 			]
-		}')
+		} + (if $l7 != null then { l7: $l7 } else {} end)')
 	else
 		NETWORK_JQ="\"$INIT_NETWORK\""
 	fi
@@ -789,6 +878,18 @@ done
 : > "$RUNTIME/system-l7ca"
 if [ "$NETWORK_MODE" = "rules" ]; then
 	@cogbox@ __render-rules "$ACTIVE_CONFIG" "$RUNTIME"
+	# Host-side credential injection: when the instance opts in
+	# (.network.l7.inject), generate the inject-conf for the active harnesses
+	# into the runtime default that start_l7mitm reads. Only specs whose
+	# host-side cred file exists are emitted; an empty result writes no conf
+	# (legacy guest-carries-token). An explicit COGBOX_L7_INJECT_CONF overrides.
+	if [ -z "${COGBOX_L7_INJECT_CONF:-}" ] \
+		&& jq -e '.network.l7.inject == true' "$ACTIVE_CONFIG" >/dev/null 2>&1; then
+		_inject_conf=$(gen_inject_conf)
+		if [ -n "$_inject_conf" ] && [ "$_inject_conf" != "[]" ]; then
+			printf '%s' "$_inject_conf" > "$RUNTIME/l7-inject-conf.json"
+		fi
+	fi
 fi
 
 # -- Patch the microvm runner with runtime QEMU settings -----------

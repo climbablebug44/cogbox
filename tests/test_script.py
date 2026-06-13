@@ -1265,6 +1265,78 @@ with subtest("Phase R: L7 host-side credential injection keeps the token out of 
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
 
+with subtest("Phase S: cred-inject default-on (init seeding + auto inject-conf)"):
+    # A new rules-mode instance with an active harness seeds .network.l7 with a
+    # terminate rule for the harness's provider host AND inject:true, and the
+    # launcher auto-generates the inject-conf from the host cred file -- no env
+    # var, no hand-written conf. We prove the seeding survives an l7 edit, the
+    # generated conf maps host->cred-file, and the config-driven path injects
+    # end-to-end (anthropic-oauth style) against the hermetic origin.
+    machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
+    machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
+    machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
+
+    # Make claude-code an ACTIVE harness for testuser, with a fake on-disk token.
+    fake_tok = "FAKE-CRED-TOKEN-s9k2"
+    machine.succeed(as_user("mkdir -p /home/testuser/.claude"))
+    machine.succeed(as_user(
+        "printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"" + fake_tok + "\"}}' "
+        "> /home/testuser/.claude/.credentials.json"
+    ))
+
+    # Fresh rules-mode instance -> default-on seeding kicks in.
+    machine.succeed(as_user("cogbox init -y --name injauto --network rules"))
+    icfg = "/home/testuser/.config/cogbox/instances/injauto/config.json"
+    assert machine.succeed(f"jq -r '.network.l7.inject' {icfg}").strip() == "true", \
+        machine.succeed(f"cat {icfg}")
+    seeded = machine.succeed(
+        f"jq -r '.network.l7.rules[] | select(.allow==\"api.anthropic.com\") | .terminate' {icfg}"
+    ).strip()
+    assert seeded == "true", f"api.anthropic.com not seeded terminate: {machine.succeed(f'cat {icfg}')}"
+
+    # Point the seeded host at the hermetic self-signed origin: keep terminate +
+    # inject, add insecure-upstream so the rewritten request reaches it. l7
+    # set/add must PRESERVE the sibling .network.l7.inject flag.
+    machine.succeed(as_user("printf '' | cogbox l7 set --name injauto"))
+    machine.succeed(as_user("cogbox l7 add allow api.anthropic.com --insecure-upstream --name injauto"))
+    assert machine.succeed(f"jq -r '.network.l7.inject' {icfg}").strip() == "true", \
+        "l7 edit dropped the .network.l7.inject flag"
+
+    iport = int(machine.succeed(f"jq -r '.sshPort' {icfg}").strip())
+    boot_and_wait("cc-injauto", "--name injauto", ssh_port=iport)
+    irt = "/run/user/1000/cogbox-injauto"
+
+    # Auto-generated inject-conf (no env var) maps the provider host -> the host
+    # cred file with the right style.
+    machine.succeed(
+        "jq -e '.[] | select(.host==\"api.anthropic.com\") "
+        "| select(.style==\"anthropic-oauth\") "
+        f"| select(.cred_file==\"/home/testuser/.claude/.credentials.json\")' {irt}/l7-inject-conf.json"
+    )
+
+    # Config-driven injection end-to-end: guest sends a garbage Bearer; the addon
+    # overwrites it with the real host-side token (anthropic-oauth style). Origin
+    # echoes the Authorization it received.
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name injauto " + shlex.quote(
+            "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
+            "--resolve api.anthropic.com:443:203.0.113.5 "
+            "-H 'Authorization: Bearer garbage' -H 'x-api-key: guest-key' "
+            "https://api.anthropic.com/v1/x | grep -q 'auth=Bearer " + fake_tok + "'")),
+        timeout=20,
+    )
+    hits = machine.succeed("cat /tmp/origin-hits.log")
+    assert ("auth=Bearer " + fake_tok) in hits, f"config-driven injection failed: {hits!r}"
+
+    stop_instance("cc-injauto", name="injauto")
+    machine.succeed("systemctl stop l7-origin")
+    # Clean up so later inits (Phase N) don't treat claude-code as active.
+    machine.succeed(as_user(
+        "rm -rf /home/testuser/.claude /home/testuser/.claude.json "
+        "/home/testuser/.config/cogbox/instances/injauto "
+        "/home/testuser/.local/share/cogbox/instances/injauto"
+    ))
+
 with subtest("Phase N: per-instance L7 ports (isolation + fail-closed bind)"):
     # The cross-instance bleed bug: with a single shared port, instance B's
     # funnel pointed at instance A's proxy. Per-instance ports fix it. We prove

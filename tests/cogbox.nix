@@ -53,8 +53,11 @@ in {
 		# (TEST-NET-3) is deliberately NOT in the proxy's SSRF blocklist, so a
 		# legit allow can reach it; the SSRF canary points a name at the cloud
 		# metadata IP, which the proxy MUST refuse.
+		# Phase S (cred-inject) points the REAL harness host api.anthropic.com at
+		# the same origin so the seeded terminate rule -- which must override the
+		# built-in harness auto-passthrough -- re-resolves to the local origin.
 		networking.hosts = {
-			"203.0.113.5" = [ "vhost-a.test" "vhost-b.test" ];
+			"203.0.113.5" = [ "vhost-a.test" "vhost-b.test" "api.anthropic.com" ];
 			"169.254.169.254" = [ "evil-meta.test" ];
 		};
 
