@@ -272,8 +272,7 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 
-Pre-installed tools: `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`,
-`nixfs`.
+Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism).
 Harness binaries (with launchers): `claude-code` (`c`), `opencode`
 (`oc`), and `codex` (`cx`), on `x86_64-linux` and `aarch64-linux`
 (sourced from `numtide/llm-agents.nix`).

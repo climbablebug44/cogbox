@@ -313,6 +313,18 @@
 					# CA into root's NSS db with it (so Chromium/Playwright trust the
 					# terminate tier); also handy for inspecting that trust.
 					nss.tools
+
+					# Generic CLI toolkit, broadly useful to any in-guest agent or
+					# task. Grouped by purpose; jq/curl/git are above.
+					# search / files
+					ripgrep fd bat sd
+					# data wrangling
+					yq-go duckdb miller dasel gron datamash jo
+					# http / dns / web
+					xh websocat dnsutils htmlq pup
+					# shell glue (moreutils brings sponge/ts/chronic/ifne/vipe; for
+					# parallelism `xargs -P` is already present, so no GNU parallel)
+					moreutils
 				]
 				++ lib.concatMap (h: [ h.package (mkLauncher h) ]) (lib.attrValues harnesses)
 				++ lib.optionals hasNixMcp [
