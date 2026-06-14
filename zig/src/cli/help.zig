@@ -61,6 +61,8 @@ pub const TOP_LEVEL =
 	\\  COGBOX_OPENCODE_CONFIG   Host opencode config dir
 	\\  COGBOX_OPENCODE_DATA     Host opencode data dir, includes auth.json
 	\\  COGBOX_CODEX_HOME        Host codex home dir (default: ~/.codex), includes auth.json
+	\\  COGBOX_L7_INJECT_CONF    Override the generated host-side credential-injection
+	\\                           conf (advanced/testing; see docs/network-filtering.md)
 	\\
 	\\Exit codes:
 	\\  0   success
@@ -231,6 +233,10 @@ pub const INIT =
 	\\  -y, --yes             Skip the harness-selection prompt
 	\\  -h, --help            Show this help and exit
 	\\
+	\\For a rules-mode instance, init also seeds L7 terminate + host-side
+	\\credential injection for the provider hosts of any harness you're logged
+	\\into, keeping that token out of the sandbox (see `cogbox l7 --help`).
+	\\
 	\\Idempotent. Re-running on an existing instance only seeds anything that's
 	\\missing; existing config is preserved.
 	\\
@@ -355,9 +361,15 @@ pub const L7 =
 	\\  passthrough (--passthrough)  TLS not intercepted (cert pinning preserved);
 	\\                       the proxy trusts the SNI and cannot see URL paths.
 	\\
-	\\Harness API endpoints (api.anthropic.com, api.openai.com, chatgpt.com, ...)
-	\\are auto-kept in passthrough so the in-guest agents keep working and their
-	\\tokens stay end-to-end; an explicit --terminate on such a host overrides it.
+	\\Harness API endpoints (api.anthropic.com, api.openai.com, chatgpt.com, ...):
+	\\for a harness you're logged into on the host, `cogbox init` seeds a
+	\\terminate rule + credential injection (.network.l7.inject) so the real
+	\\token is swapped in host-side and the guest carries only a stub -- the
+	\\long-lived token never enters the sandbox. Opt a host out with
+	\\--passthrough (token end-to-end, cert pinning preserved). A harness with
+	\\no host-side token, or any such host with no explicit rule, stays
+	\\auto-passthrough. See docs/network-filtering.md (host-side credential
+	\\injection).
 	\\
 	\\QUIC/UDP-443 and all guest IPv6 are denied while L7 is active (clients
 	\\fall back to inspectable IPv4 TCP).

@@ -755,6 +755,10 @@ pub const L7RuleSet = struct {
 /// still `allow` these; this only governs the tier, not allow/deny. An
 /// explicit per-host `--terminate` overrides it. Provider-agnostic harnesses
 /// (e.g. opencode) should `--passthrough` their configured provider host.
+/// Note: new instances seed an explicit `terminate`+inject rule for the
+/// provider hosts of harnesses you're logged into (cogbox-launch.sh), which
+/// wins over this fallback; the auto-passthrough below then applies only to
+/// such a host with NO explicit rule.
 const harness_passthrough_hosts = [_][]const u8{
 	"api.anthropic.com", // claude-code
 	"api.openai.com", // codex

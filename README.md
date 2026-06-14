@@ -191,9 +191,13 @@ nix run github:illustris/cogbox -- --network none   # or: no network at all
 
 First match wins and position matters; L7 has two tiers (terminate
 default, passthrough for cert-pinned clients) and several deliberate
-caveats. **Read [network filtering](docs/network-filtering.md)** for rule
-semantics, the L4/L7 composition table, the threat model, and the
-enforcement internals.
+caveats. For the OAuth harnesses, the terminate tier also injects the real
+token host-side by default, so the long-lived credential stays out of the
+sandbox and the guest carries only a stub. **Read
+[network filtering](docs/network-filtering.md)** for rule semantics, the
+L4/L7 composition table, [host-side credential
+injection](docs/network-filtering.md#host-side-credential-injection), the
+threat model, and the enforcement internals.
 
 ## Configuration
 
