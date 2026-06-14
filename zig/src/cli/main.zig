@@ -10,6 +10,7 @@ const preflight = @import("preflight.zig");
 const list_verb = @import("verbs/list.zig");
 const status_verb = @import("verbs/status.zig");
 const stop_verb = @import("verbs/stop.zig");
+const delete_verb = @import("verbs/delete.zig");
 const restart_verb = @import("verbs/restart.zig");
 const ssh_verb = @import("verbs/ssh.zig");
 const rules_verb = @import("verbs/rules.zig");
@@ -27,7 +28,7 @@ const attach = @import("attach.zig");
 const KNOWN_VERBS = [_][]const u8{
 	"start", "stop",  "restart", "status",  "list",    "init",
 	"ssh",   "rules", "remap",   "l7",      "plugin",  "console",
-	"monitor", "help",
+	"monitor", "delete", "help",
 	// Hidden re-exec / helper targets, recognized below but omitted from
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
 	// "__render-rules" (boot-time runtime-file renderer).
@@ -101,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "list")) return list_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "status")) return status_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "stop")) return stop_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "delete")) return delete_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "restart")) return restart_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "ssh")) return ssh_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);

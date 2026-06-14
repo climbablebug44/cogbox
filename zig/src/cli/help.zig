@@ -19,6 +19,7 @@ pub const TOP_LEVEL =
 	\\  monitor   Attach the QEMU monitor of a running instance (Ctrl-] detaches)
 	\\  stop      Stop a running instance
 	\\  restart   Stop then start
+	\\  delete    Delete an instance's config and persistent files
 	\\  status    Print whether an instance is running, its ports, and net mode
 	\\  list      List all instances
 	\\  init      Create instance config and host directories without launching
@@ -170,6 +171,30 @@ pub const STOP =
 	\\
 	\\Idempotent: if the instance isn't running (no PID file, or the process is
 	\\already dead), stop prints "instance 'NAME' is not running" and exits 0.
+	\\
+;
+
+pub const DELETE =
+	\\cogbox delete - delete an instance's config and persistent files
+	\\
+	\\Usage:
+	\\  cogbox delete [OPTIONS]
+	\\
+	\\Options:
+	\\  -n, --name NAME       Instance name (default: "default")
+	\\  -y, --yes             Skip the confirmation prompt
+	\\  -h, --help            Show this help and exit
+	\\
+	\\Permanently removes the instance's config dir (config.json, flake/,
+	\\plugins-flake/, authorized_keys, ...), its persistent data dir (disk
+	\\overlays and guest state), and any leftover runtime dir (sockets, logs,
+	\\pid). Refuses to delete a running instance -- stop it first with
+	\\'cogbox stop'.
+	\\
+	\\Prompts for confirmation, listing the directories to be removed, unless
+	\\-y/--yes is given (or stdin is not a terminal, as for the CLI's other
+	\\prompts). Idempotent: deleting a nonexistent instance prints a notice
+	\\and exits 0.
 	\\
 ;
 
@@ -445,6 +470,7 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "console")) return CONSOLE;
 	if (std.mem.eql(u8, verb, "monitor")) return MONITOR;
 	if (std.mem.eql(u8, verb, "stop")) return STOP;
+	if (std.mem.eql(u8, verb, "delete")) return DELETE;
 	if (std.mem.eql(u8, verb, "restart")) return RESTART;
 	if (std.mem.eql(u8, verb, "status")) return STATUS;
 	if (std.mem.eql(u8, verb, "list")) return LIST;

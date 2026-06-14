@@ -118,6 +118,7 @@ attach and detach (`Ctrl-]`) freely without stopping the VM.
 | `status` | Print whether an instance is running, plus ports/net mode |
 | `list` | List all instances. `--json` for machine-readable output |
 | `init` | Create config + host directories without launching |
+| `delete` | Delete an instance's config + persistent files (refuses if running; `-y` skips the prompt) |
 | `ssh` | Connect to a running instance via SSH |
 | `rules` | Manage CIDR (L4) allow/deny rules -- [docs](docs/network-filtering.md#l4-cidr-rules) |
 | `remap` | Manage TCP destination-remap rules -- [docs](docs/network-filtering.md#tcp-destination-remap) |
@@ -135,7 +136,7 @@ Run `cogbox VERB --help` for verb-specific options.
 | `-h, --help` | every verb | Show help and exit |
 | `--no-ssh` | `start` | Don't auto-SSH after launch; start in the background and return |
 | `-f, --foreground` | `start` | Attach the serial console after launch instead of SSHing |
-| `-y, --yes` | `start`, `init`, `plugin` | Skip the harness-selection prompt on first init / plugin confirmation prompts |
+| `-y, --yes` | `start`, `init`, `plugin`, `delete` | Skip the harness-selection prompt on first init / plugin and delete confirmation prompts |
 | `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
 | `--network MODE` | `start`, `init` | `full`, `none`, or `rules` (default: rules) |
@@ -168,6 +169,7 @@ cogbox --name work                  # start + SSH in
 cogbox ssh --name work htop         # one-off remote command
 cogbox status --name work
 cogbox stop --name work
+cogbox delete --name work            # remove its config + persistent files
 
 # Console access
 cogbox -f                           # start and watch it boot
