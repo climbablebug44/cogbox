@@ -264,6 +264,14 @@ A new rules-mode instance is **seeded for injection at init** for the harnesses 
 
 Opt a seeded host out by replacing its rule with passthrough -- `cogbox l7 add allow api.anthropic.com --passthrough` -- which drops both terminate and injection so the token goes end-to-end again (the legacy behavior); deleting the rule has the same effect. Setting `.network.l7.inject` to `false` stops the token rewriting but leaves the host on the terminate tier (still MITM'd, just not injected). Note that `cogbox l7 mode passthrough` does **not** opt a seeded host out: the seeded rule carries an explicit `terminate` that wins over the instance-default tier (`needsTerminate` precedence). An explicit `COGBOX_L7_INJECT_CONF=<path>` overrides the generated conf (used for testing or a hand-rolled mapping).
 
+### Keeping the token out of the guest
+
+Injection rewrites the request host-side, but on its own the harness's credential file is still mounted into the guest (via the config/data overlay), so a compromised agent could read it directly. When injection is active, cogbox therefore **evicts the secret file from the guest**: the 9p source for that overlay becomes a per-instance hardlink-mirror of the host dir that omits the credential file (no data copy -- the dir can be large; the mirror is sited beside the source for a same-filesystem hardlink, falling back to a copy, and fail-closed to an empty dir, never the real dir). The rest of the config dir (settings, history, `CLAUDE.md`, ...) is preserved.
+
+With the file gone, the harness launcher presents a placeholder identity so the agent still starts: the `c` launcher exports `ANTHROPIC_AUTH_TOKEN=<placeholder>` **only when `/root/.claude/.credentials.json` is absent** (the file's absence is the signal -- a non-inject instance still mounts it and uses it normally). claude-code sends the placeholder as a Bearer and never refreshes an env-supplied token; the host proxy overwrites it with the real, host-side token. Net: neither the access token nor the refresh token is ever present in the sandbox.
+
+This eviction currently covers **claude-code**. `codex` and `opencode` keep mounting their token for now (codex's non-secret account id lives in the same file; opencode is multi-provider with API-key providers that aren't injected) -- they still benefit from host-side injection but the file is not yet evicted.
+
 ### What it does and does not protect
 
 **Eliminated:** theft of the long-lived **refresh token** (it never enters the guest), account takeover via a stolen credential file reused off-box, and any persistence beyond the instance lifetime -- only short-lived access tokens are ever injected, host-side, into headers the guest cannot read.

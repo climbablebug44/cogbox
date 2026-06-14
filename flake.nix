@@ -84,6 +84,19 @@
 					name = "c";
 					flags = [ "--dangerously-skip-permissions" ];
 					env = { IS_SANDBOX = "1"; };
+					# Host-side credential injection withholds the OAuth token from
+					# the guest (its .credentials.json is dropped from the overlay).
+					# When the file is absent, present a placeholder identity so
+					# claude-code starts in headless mode with no on-disk token to
+					# proactively refresh; the host proxy overwrites the
+					# Authorization on the wire with the real, host-side token.
+					# ANTHROPIC_AUTH_TOKEN is sent verbatim as a Bearer and is never
+					# refreshed by the CLI. A non-inject instance still mounts the
+					# file, so the stub stays off there.
+					stubWhenMissing = {
+						file = "/root/.claude/.credentials.json";
+						env = { ANTHROPIC_AUTH_TOKEN = "cogbox-host-injected-placeholder"; };
+					};
 				};
 				paths = {
 					config = {
@@ -283,7 +296,21 @@
 						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") (l7CaEnv // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
-					in ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
+						# Optional cred-inject stub: export placeholder auth env only
+						# when the harness's real token file is absent from the guest
+						# (i.e. host-side injection evicted it). See stubWhenMissing.
+						stub = h.launcher.stubWhenMissing or null;
+						stubBlock = lib.optionalString (stub != null) (
+							"if [ ! -e ${lib.escapeShellArg stub.file} ]; then\n"
+							+ lib.concatMapStrings
+								(kv: "  export ${kv}\n")
+								(lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") stub.env)
+							+ "fi\n"
+						);
+					in "#!${pkgs.runtimeShell}\n"
+						+ stubBlock
+						+ ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
+						+ "\n"
 				);
 
 				# All harness mount units (overlay + ephemeral). Used to

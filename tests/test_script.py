@@ -1265,23 +1265,29 @@ with subtest("Phase R: L7 host-side credential injection keeps the token out of 
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
 
-with subtest("Phase S: cred-inject default-on (init seeding + auto inject-conf)"):
+with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token eviction)"):
     # A new rules-mode instance with an active harness seeds .network.l7 with a
     # terminate rule for the harness's provider host AND inject:true, and the
     # launcher auto-generates the inject-conf from the host cred file -- no env
     # var, no hand-written conf. We prove the seeding survives an l7 edit, the
-    # generated conf maps host->cred-file, and the config-driven path injects
-    # end-to-end (anthropic-oauth style) against the hermetic origin.
+    # generated conf maps host->cred-file, the config-driven path injects
+    # end-to-end (anthropic-oauth) against the hermetic origin, AND (v1b) the
+    # real token is EVICTED from the guest overlay while the rest of the config
+    # dir is preserved, with the launcher presenting a placeholder identity.
     machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
     machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
     machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
 
-    # Make claude-code an ACTIVE harness for testuser, with a fake on-disk token.
+    # Make claude-code an ACTIVE harness for testuser, with a fake on-disk token
+    # plus a NON-secret marker file (settings.json) to prove eviction is surgical.
     fake_tok = "FAKE-CRED-TOKEN-s9k2"
     machine.succeed(as_user("mkdir -p /home/testuser/.claude"))
     machine.succeed(as_user(
         "printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"" + fake_tok + "\"}}' "
         "> /home/testuser/.claude/.credentials.json"
+    ))
+    machine.succeed(as_user(
+        "printf '%s' '{\"marker\":\"keep-me\"}' > /home/testuser/.claude/settings.json"
     ))
 
     # Fresh rules-mode instance -> default-on seeding kicks in.
@@ -1314,9 +1320,25 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto inject-conf)"
         f"| select(.cred_file==\"/home/testuser/.claude/.credentials.json\")' {irt}/l7-inject-conf.json"
     )
 
-    # Config-driven injection end-to-end: guest sends a garbage Bearer; the addon
-    # overwrites it with the real host-side token (anthropic-oauth style). Origin
-    # echoes the Authorization it received.
+    # v1b -- token EVICTION: with inject active, the harness's secret file is
+    # dropped from the guest overlay (the hardlink-mirror omits it), while the
+    # rest of ~/.claude is preserved. The cred file is therefore ABSENT in the
+    # guest and the `c` launcher presents a placeholder identity because of it.
+    machine.succeed(as_user(
+        "cogbox ssh --name injauto 'test ! -e /root/.claude/.credentials.json'"))
+    machine.succeed(as_user(
+        "cogbox ssh --name injauto 'test -e /root/.claude/settings.json'"))
+    machine.succeed(as_user("cogbox ssh --name injauto " + shlex.quote(
+        'grep -q ANTHROPIC_AUTH_TOKEN "$(command -v c)" && [ ! -e /root/.claude/.credentials.json ]')))
+    # The host-side mirror exists and does NOT contain the secret.
+    machine.succeed(as_user(
+        "test ! -e /home/testuser/.cogbox-mirrors/injauto/claude-code-config/.credentials.json"))
+    machine.succeed(as_user(
+        "test -e /home/testuser/.cogbox-mirrors/injauto/claude-code-config/settings.json"))
+
+    # Config-driven injection end-to-end, WITH the token now evicted from the
+    # guest: guest sends a garbage Bearer; the addon overwrites it with the real
+    # host-side token (anthropic-oauth). Origin echoes the Authorization.
     machine.wait_until_succeeds(
         as_user("cogbox ssh --name injauto " + shlex.quote(
             "curl -sS --max-time 12 --cacert /run/cogbox/ca-bundle.crt "
@@ -1333,6 +1355,7 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto inject-conf)"
     # Clean up so later inits (Phase N) don't treat claude-code as active.
     machine.succeed(as_user(
         "rm -rf /home/testuser/.claude /home/testuser/.claude.json "
+        "/home/testuser/.cogbox-mirrors "
         "/home/testuser/.config/cogbox/instances/injauto "
         "/home/testuser/.local/share/cogbox/instances/injauto"
     ))

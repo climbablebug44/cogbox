@@ -225,6 +225,48 @@ gen_inject_conf() {
 	'
 }
 
+# The secret file to EVICT from the guest when injection is active, as
+# "<overlay-pathkey> <basename>". The token then never enters the sandbox: the
+# addon injects it host-side and the launcher presents a placeholder identity
+# (see flake.nix stubWhenMissing). Only claude-code is evicted for now; codex
+# (account id lives in the same file) and opencode (multi-provider, non-injected
+# API-key providers) keep the mounted-token path until their stubs are built.
+harness_secret_file() {
+	case "$1" in
+		claude-code) echo "config .credentials.json" ;;
+	esac
+}
+
+# Stage the 9p source for an active harness overlay path: normally the real host
+# dir, but when injection is active AND this path holds the harness's secret
+# file, a per-instance hardlink-mirror that OMITS that file (no data copy -- the
+# dir can be large; hardlinks need same-fs, guaranteed by siting the mirror
+# beside the source, with a copy fallback for the rare separate-mount case).
+# Echoes the path to share.
+stage_overlay_source() {
+	local h=$1 k=$2 host=$3
+	local skey sfile
+	read -r skey sfile <<< "$(harness_secret_file "$h")"
+	if [ "$INJECT_ACTIVE" != "1" ] || [ -z "$sfile" ] || [ "$skey" != "$k" ] \
+		|| [ ! -e "$host/$sfile" ]; then
+		printf '%s' "$host"
+		return
+	fi
+	local mirror; mirror="$(dirname "$host")/.cogbox-mirrors/${EFFECTIVE_NAME}/${h}-${k}"
+	rm -rf "$mirror"; mkdir -p "$mirror"
+	if cp -al "$host/." "$mirror/" 2>/dev/null || cp -a "$host/." "$mirror/" 2>/dev/null; then
+		rm -f "$mirror/$sfile"
+		printf '%s' "$mirror"
+	else
+		# Mirror failed: fail CLOSED -- never fall back to sharing the real dir
+		# (that would leak the token). Share an empty dir; the launcher's
+		# placeholder identity + host-side injection keep the harness working.
+		rm -rf "$mirror"; mkdir -p "$mirror"
+		echo "cogbox-launch: warning: could not stage sanitized $h/$k mirror; sharing empty dir (token withheld)." >&2
+		printf '%s' "$mirror"
+	fi
+}
+
 # Microvm runner has runtime paths baked in at flake build time using this
 # sentinel; the sed substitution below rewrites them to BASE_RUNTIME.
 RUNTIME_TEMPLATE="@runtimeDir@"
@@ -814,6 +856,17 @@ cogbox_cleanup() {
 	[ -n "$PASST_PID" ] && kill "$PASST_PID" 2>/dev/null
 	[ -n "$L7PROXY_PID" ] && kill "$L7PROXY_PID" 2>/dev/null
 	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
+	# Remove this instance's sanitized cred-inject mirrors (QEMU is dead now, so
+	# the 9p source is no longer in use). The mirror is hardlinks/no secret, but
+	# tidy it rather than leave it under the user's home until the next boot.
+	for _h in "${HARNESSES[@]}"; do
+		_sf=$(harness_secret_file "$_h")
+		[ -z "$_sf" ] && continue
+		_host=${H_HOST[$_h:${_sf%% *}]:-}
+		[ -n "$_host" ] || continue
+		rm -rf "$(dirname "$_host")/.cogbox-mirrors/${EFFECTIVE_NAME}"
+		rmdir "$(dirname "$_host")/.cogbox-mirrors" 2>/dev/null
+	done
 	rm -rf "$RUNTIME"
 	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
 	# fd is released when this process exits (kernel-managed); unlinking it
@@ -835,6 +888,13 @@ ln -sfn "$REAL_DATA" "$RUNTIME/data"
 # QEMU runner doesn't fail to start.
 HARNESS_STUBS="$RUNTIME/.harness-stubs"
 mkdir -p "$HARNESS_STUBS"
+# Is host-side credential injection active for this instance? If so, secret
+# files are evicted from the guest overlays below (stage_overlay_source).
+INJECT_ACTIVE=0
+if [ "$NETWORK_MODE" = "rules" ] \
+	&& jq -e '.network.l7.inject == true' "$ACTIVE_CONFIG" >/dev/null 2>&1; then
+	INJECT_ACTIVE=1
+fi
 is_active() {
 	for active in "${ACTIVE_HARNESSES[@]}"; do
 		[ "$active" = "$1" ] && return 0
@@ -849,6 +909,9 @@ for h in "${HARNESSES[@]}"; do
 		target="$RUNTIME/${h}-${k}"
 		if is_active "$h"; then
 			host=${H_HOST[$h:$k]}
+			if [ "$kind" = "overlay" ]; then
+				host="$(stage_overlay_source "$h" "$k" "$host")"
+			fi
 			ln -sfn "$host" "$target"
 		else
 			stub="$HARNESS_STUBS/${h}-${k}"
