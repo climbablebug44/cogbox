@@ -240,9 +240,12 @@ harness_secret_file() {
 # Stage the 9p source for an active harness overlay path: normally the real host
 # dir, but when injection is active AND this path holds the harness's secret
 # file, a per-instance hardlink-mirror that OMITS that file (no data copy -- the
-# dir can be large; hardlinks need same-fs, guaranteed by siting the mirror
-# beside the source, with a copy fallback for the rare separate-mount case).
-# Echoes the path to share.
+# dir can be large). The mirror lives host-only under the cogbox data root
+# ($BASE_DATA/mirrors/<instance>/); it must NOT go under REAL_DATA, which is
+# shared RW into the guest -- the hardlinks alias the real host dir, so a guest
+# write would corrupt it. Hardlinks need same-fs as the source (true when both
+# sit under $HOME); a copy fallback covers the rare separate-mount case, and we
+# fail closed to an empty dir, never the real dir. Echoes the path to share.
 stage_overlay_source() {
 	local h=$1 k=$2 host=$3
 	local skey sfile
@@ -252,7 +255,7 @@ stage_overlay_source() {
 		printf '%s' "$host"
 		return
 	fi
-	local mirror; mirror="$(dirname "$host")/.cogbox-mirrors/${EFFECTIVE_NAME}/${h}-${k}"
+	local mirror; mirror="$BASE_DATA/mirrors/${EFFECTIVE_NAME}/${h}-${k}"
 	rm -rf "$mirror"; mkdir -p "$mirror"
 	if cp -al "$host/." "$mirror/" 2>/dev/null || cp -a "$host/." "$mirror/" 2>/dev/null; then
 		rm -f "$mirror/$sfile"
@@ -858,15 +861,9 @@ cogbox_cleanup() {
 	[ -n "$L7MITM_PID" ] && kill "$L7MITM_PID" 2>/dev/null
 	# Remove this instance's sanitized cred-inject mirrors (QEMU is dead now, so
 	# the 9p source is no longer in use). The mirror is hardlinks/no secret, but
-	# tidy it rather than leave it under the user's home until the next boot.
-	for _h in "${HARNESSES[@]}"; do
-		_sf=$(harness_secret_file "$_h")
-		[ -z "$_sf" ] && continue
-		_host=${H_HOST[$_h:${_sf%% *}]:-}
-		[ -n "$_host" ] || continue
-		rm -rf "$(dirname "$_host")/.cogbox-mirrors/${EFFECTIVE_NAME}"
-		rmdir "$(dirname "$_host")/.cogbox-mirrors" 2>/dev/null
-	done
+	# tidy it rather than leave it under the data root until the next boot.
+	rm -rf "$BASE_DATA/mirrors/${EFFECTIVE_NAME}"
+	rmdir "$BASE_DATA/mirrors" 2>/dev/null
 	rm -rf "$RUNTIME"
 	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
 	# fd is released when this process exits (kernel-managed); unlinking it

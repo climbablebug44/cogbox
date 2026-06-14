@@ -1330,11 +1330,11 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
         "cogbox ssh --name injauto 'test -e /root/.claude/settings.json'"))
     machine.succeed(as_user("cogbox ssh --name injauto " + shlex.quote(
         'grep -q ANTHROPIC_AUTH_TOKEN "$(command -v c)" && [ ! -e /root/.claude/.credentials.json ]')))
-    # The host-side mirror exists and does NOT contain the secret.
-    machine.succeed(as_user(
-        "test ! -e /home/testuser/.cogbox-mirrors/injauto/claude-code-config/.credentials.json"))
-    machine.succeed(as_user(
-        "test -e /home/testuser/.cogbox-mirrors/injauto/claude-code-config/settings.json"))
+    # The host-side mirror exists under the cogbox data root (host-only, NOT in
+    # the guest-shared instances/<name>/ dir) and does NOT contain the secret.
+    mirror = "/home/testuser/.local/share/cogbox/mirrors/injauto/claude-code-config"
+    machine.succeed(as_user(f"test ! -e {mirror}/.credentials.json"))
+    machine.succeed(as_user(f"test -e {mirror}/settings.json"))
 
     # Config-driven injection end-to-end, WITH the token now evicted from the
     # guest: guest sends a garbage Bearer; the addon overwrites it with the real
@@ -1355,9 +1355,9 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
     # Clean up so later inits (Phase N) don't treat claude-code as active.
     machine.succeed(as_user(
         "rm -rf /home/testuser/.claude /home/testuser/.claude.json "
-        "/home/testuser/.cogbox-mirrors "
         "/home/testuser/.config/cogbox/instances/injauto "
-        "/home/testuser/.local/share/cogbox/instances/injauto"
+        "/home/testuser/.local/share/cogbox/instances/injauto "
+        "/home/testuser/.local/share/cogbox/mirrors/injauto"
     ))
 
 with subtest("Phase N: per-instance L7 ports (isolation + fail-closed bind)"):
