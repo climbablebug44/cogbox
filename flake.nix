@@ -123,15 +123,16 @@
 					# command parses with yargs `.strict()` and would
 					# reject it. `OPENCODE_PERMISSION` is the universal
 					# bypass: opencode JSON.parses it and merges it into
-					# `config.permission`. The string shorthand `"allow"`
-					# normalizes to `{"*": "allow"}`, which `fromConfig`
-					# expands to a single `{permission:"*", pattern:"*",
-					# action:"allow"}` rule -- matching every tool/pattern
-					# at evaluate time so opencode never raises a prompt.
+					# `config.permission`. opencode 1.16.2 requires the
+					# object form keyed by category; a bare `"allow"` string
+					# is rejected -- the schema indexes it char by char
+					# (got "a" from "allow"[0]). Set every category to `allow`
+					# so opencode never prompts (`bash` also takes a {pattern:
+					# action} map; plain `"allow"` covers all patterns).
 					flags = [];
 					env = {
 						IS_SANDBOX = "1";
-						OPENCODE_PERMISSION = ''"allow"'';
+						OPENCODE_PERMISSION = ''{"edit":"allow","bash":"allow","webfetch":"allow","doom_loop":"allow","external_directory":"allow"}'';
 					};
 				};
 				paths = {
