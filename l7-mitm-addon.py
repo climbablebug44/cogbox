@@ -178,28 +178,24 @@ RULES = Rules()
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 
 
-def json_path_get(obj, dotted):
-    """Fetch a string leaf at a dotted path (e.g. claudeAiOauth.accessToken).
-    Returns the string, or None if any segment is missing or the leaf isn't a
-    string. Mirrors the cred-file shapes in docs/harnesses.md."""
-    cur = obj
-    for part in dotted.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return None
-        cur = cur[part]
-    return cur if isinstance(cur, str) else None
-
-
 def json_path_raw(obj, dotted):
-    """Like json_path_get but returns the leaf at any type (e.g. the numeric
-    expiresAt), or None if any segment is missing. Used by the refresh path,
-    which needs the expiry number and the refresh-token string."""
+    """Fetch the leaf at a dotted path (e.g. claudeAiOauth.accessToken) at any
+    type -- e.g. the numeric expiresAt or the refresh-token string the refresh
+    path needs. Returns None if any segment is missing or not a dict. Mirrors
+    the cred-file shapes in docs/harnesses.md."""
     cur = obj
     for part in dotted.split("."):
         if not isinstance(cur, dict) or part not in cur:
             return None
         cur = cur[part]
     return cur
+
+
+def json_path_get(obj, dotted):
+    """Like json_path_raw but only for string leaves: returns the string, or
+    None if the path is missing or the leaf isn't a string."""
+    v = json_path_raw(obj, dotted)
+    return v if isinstance(v, str) else None
 
 
 def json_path_set(obj, dotted, value):

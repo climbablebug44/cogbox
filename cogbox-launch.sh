@@ -186,14 +186,15 @@ harness_inject_specs() {
 	esac
 }
 
-# Unique provider hosts to terminate+inject for the active harnesses the user is
-# actually LOGGED INTO (host-side cred file present) -- the seed for a new
-# instance's L7 rules. Gating on cred existence (not just harness-active) matches
-# gen_inject_conf and avoids terminating a provider host for a harness with no
-# token (the `--yes` init activates all harnesses, but most have no creds).
-# Deduped; first such harness wins a shared host (claude-code precedes opencode
-# for api.anthropic.com in HARNESSES order).
-active_inject_hosts() {
+# Deduped, cred-present inject specs for the active harnesses -- one TSV row per
+# provider host, the single source both active_inject_hosts (the rule seed) and
+# gen_inject_conf (the addon conf) project from, so their selection can't drift.
+# Gating on cred existence (not just harness-active) avoids terminating a provider
+# host for a harness with no token (the `--yes` init activates all harnesses, but
+# most have no creds). First such harness wins a shared host (claude-code precedes
+# opencode for api.anthropic.com in HARNESSES order). Fields, tab-separated:
+#   host style cred token acct rtok exp turl cid stub_token
+inject_specs_deduped() {
 	local h host style cred token acct rtok exp turl cid
 	declare -A seen
 	for h in "${ACTIVE_HARNESSES[@]}"; do
@@ -202,31 +203,25 @@ active_inject_hosts() {
 			[ -n "${seen[$host]:-}" ] && continue
 			[ -f "$cred" ] || continue
 			seen[$host]=1
-			printf '%s\n' "$host"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$host" "$style" "$cred" "$token" "$acct" "$rtok" "$exp" "$turl" "$cid" \
+				"$(harness_stub_token "$h")"
 		done < <(harness_inject_specs "$h")
 	done
 }
 
+# Unique provider hosts to terminate+inject for the active harnesses the user is
+# actually LOGGED INTO (host-side cred file present) -- the seed for a new
+# instance's L7 rules.
+active_inject_hosts() {
+	inject_specs_deduped | cut -f1
+}
+
 # Emit the inject-conf (JSON array) for the active harnesses to stdout: one spec
-# per deduped provider host whose host-side cred file EXISTS. First active
-# harness whose token file is present wins a shared host. `[]` if none -- the
+# per deduped provider host whose host-side cred file EXISTS. `[]` if none -- the
 # caller then writes no conf and the addon leaves auth untouched.
 gen_inject_conf() {
-	local h host style cred token acct rtok exp turl cid
-	declare -A seen
-	{
-		for h in "${ACTIVE_HARNESSES[@]}"; do
-			while IFS='|' read -r host style cred token acct rtok exp turl cid; do
-				[ -z "$host" ] && continue
-				[ -n "${seen[$host]:-}" ] && continue
-				[ -f "$cred" ] || continue
-				seen[$host]=1
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$host" "$style" "$cred" "$token" "$acct" "$rtok" "$exp" "$turl" "$cid" \
-					"$(harness_stub_token "$h")"
-			done < <(harness_inject_specs "$h")
-		done
-	} | jq -R -s '
+	inject_specs_deduped | jq -R -s '
 		[ split("\n")[] | select(length > 0) | split("\t")
 		  | { host: .[0], style: .[1], cred_file: .[2], token_path: .[3] }
 		  + (if (.[4] // "") != "" then { account_id_path: .[4] } else {} end)
@@ -1029,8 +1024,7 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	# into the runtime default that start_l7mitm reads. Only specs whose
 	# host-side cred file exists are emitted; an empty result writes no conf
 	# (legacy guest-carries-token). An explicit COGBOX_L7_INJECT_CONF overrides.
-	if [ -z "${COGBOX_L7_INJECT_CONF:-}" ] \
-		&& jq -e '.network.l7.inject == true' "$ACTIVE_CONFIG" >/dev/null 2>&1; then
+	if [ -z "${COGBOX_L7_INJECT_CONF:-}" ] && [ "$INJECT_ACTIVE" = 1 ]; then
 		_inject_conf=$(gen_inject_conf)
 		if [ -n "$_inject_conf" ] && [ "$_inject_conf" != "[]" ]; then
 			printf '%s' "$_inject_conf" > "$RUNTIME/l7-inject-conf.json"
