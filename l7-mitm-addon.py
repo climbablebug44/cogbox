@@ -26,9 +26,17 @@ and hot-reloaded on mtime change, so `cogbox l7 add/del` takes effect without
 restarting mitmproxy.
 """
 
+import fcntl
+import glob
+import hashlib
 import json
 import os
+import pwd
+import sys
+import tempfile
+import time
 import urllib.parse
+import urllib.request
 
 try:
     from mitmproxy import http, ctx
@@ -182,6 +190,35 @@ def json_path_get(obj, dotted):
     return cur if isinstance(cur, str) else None
 
 
+def json_path_raw(obj, dotted):
+    """Like json_path_get but returns the leaf at any type (e.g. the numeric
+    expiresAt), or None if any segment is missing. Used by the refresh path,
+    which needs the expiry number and the refresh-token string."""
+    cur = obj
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def json_path_set(obj, dotted, value):
+    """Set the leaf at a dotted path in an existing nested dict, in place.
+    Returns True on success. Refuses to FABRICATE structure: if any
+    intermediate segment is missing or not a dict, returns False and changes
+    nothing -- so a malformed cred file is never half-rewritten."""
+    parts = dotted.split(".")
+    cur = obj
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or not isinstance(cur.get(part), dict):
+            return False
+        cur = cur[part]
+    if not isinstance(cur, dict):
+        return False
+    cur[parts[-1]] = value
+    return True
+
+
 def merge_beta(existing, marker):
     """Add `marker` to a comma-separated anthropic-beta header if absent,
     preserving any feature betas the guest already sent (order-stable)."""
@@ -215,18 +252,100 @@ def apply_injection(headers, style, token, account_id=None):
         headers["authorization"] = "Bearer " + token
 
 
+# --- Host-side token refresh -----------------------------------------------
+# After credential eviction the guest carries only a placeholder env token and
+# can NEVER refresh (claude-code does not refresh an env token, and the refresh
+# token was deliberately kept out of the sandbox). So the host token this addon
+# injects must be kept fresh HOST-SIDE, or a long-running guest session starts
+# getting 401s the moment the access token lapses. When a spec carries a
+# `refresh` block, ensure_fresh() does the OAuth refresh-token grant here, on
+# the host, and writes the rotated tokens back to the SAME canonical cred file
+# the harness's own CLI uses (single refresh-token lineage -- a separate copy
+# would fork the lineage and the provider's rotation would invalidate one
+# side). It is serialized with flock across cogbox instances, gated on
+# near-expiry, and -- because the host's own CLI does NOT take this lock -- it
+# also re-checks the file just before writing and refuses to clobber a rotation
+# that landed concurrently (so a host-CLI refresh during our POST can't fork the
+# lineage / lock the user out).
+
+# Refresh when the access token has less than this many seconds of life left
+# (or is already expired). We trigger PROACTIVELY so the request that pays for
+# the refresh still holds a valid token -- it never 401s. Env-overridable.
+REFRESH_WINDOW_SEC = int(os.environ.get("COGBOX_L7_REFRESH_WINDOW_SEC", "600"))
+# Bound on the blocking refresh POST. A refresh stalls mitmproxy's event loop
+# for its duration, but happens at most ~once per token lifetime (hours), so a
+# brief stall is invisible; the timeout caps the worst case (hung endpoint).
+REFRESH_HTTP_TIMEOUT = int(os.environ.get("COGBOX_L7_REFRESH_TIMEOUT_SEC", "15"))
+# Per-process floor between refresh ATTEMPTS for a given cred file (set before
+# the POST, so it also throttles failures). Stops a slow/failing endpoint from
+# turning every in-window request into a blocking POST, and caps the blast
+# radius of a misconfiguration where the window exceeds the token lifetime.
+REFRESH_COOLDOWN_SEC = int(os.environ.get("COGBOX_L7_REFRESH_COOLDOWN_SEC", "60"))
+# Prefix for the write-temp. Namespaced so the launcher's eviction mirror can
+# strip any stale copy by glob (see stage_overlay_source) -- crash residue must
+# never reach a guest.
+CRED_TMP_PREFIX = ".cogbox-refresh-"
+# User-Agent for the refresh POST. The provider's OAuth host sits behind a
+# Cloudflare WAF that returns 403 "Error 1010: browser_signature_banned" to the
+# stock `Python-urllib/...` UA, so we must present a real harness-like UA. A
+# spec's refresh block may override per-provider; this default mirrors
+# claude-code's CLI UA (the exact version isn't load-bearing -- the WAF filters
+# on the UA *shape*, and claude-code refreshes against this same host).
+DEFAULT_REFRESH_UA = "claude-cli/2.1.177 (external, cli)"
+# Cross-process lock dir. MUST be host-only (never an overlay/mirror path) and
+# SHARED across instances so two proxies refreshing the same cred file
+# serialize. Keyed by a hash of the cred-file path. We never put the lock (or
+# any token copy) next to the cred file: the eviction mirror omits only the
+# cred file itself, so a sibling there could leak into the guest.
+CRED_LOCK_DIR = os.environ.get("COGBOX_L7_CRED_LOCK_DIR") or os.path.join(
+    tempfile.gettempdir(), "cogbox-cred-refresh"
+)
+
+
+def _cred_log(msg):
+    """Log a refresh event. NEVER pass a token here -- callers log only host
+    names, field names and error classes."""
+    line = "cogbox-cred: " + msg
+    if ctx is not None:
+        try:
+            ctx.log.warn(line)
+            return
+        except Exception:
+            pass
+    sys.stderr.write(line + "\n")
+
+
+def _http_post_json(url, payload, timeout, user_agent):
+    """POST `payload` as JSON and return the parsed JSON response. `user_agent`
+    is set explicitly -- the stock urllib UA is WAF-banned (see
+    DEFAULT_REFRESH_UA). Factored out as a module-level function so tests can
+    monkeypatch it without a network or a live token rotation. Runs host-side
+    over the host's own (unrestricted) egress and default trust store -- NOT
+    through this proxy."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": user_agent or DEFAULT_REFRESH_UA},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
 class CredStore:
     """Maps a request host to the real token read from a host cred file,
     hot-reloaded on mtime change -- mirroring Rules.maybe_reload(). So when the
-    refresh sidecar (or the host's own CLI) rotates the on-disk access token,
-    the next request picks it up with no addon restart. Refresh tokens are
-    never read here -- only the short-lived access token / account id."""
+    host-side refresh (ensure_fresh) or the host's own CLI rotates the on-disk
+    access token, the next request picks it up with no addon restart. The
+    refresh token is read only inside ensure_fresh, under the lock, and never
+    leaves the host."""
 
     def __init__(self, path):
         self.path = path
         self.conf_mtime = None
         self.specs = {}  # host(lower) -> spec dict
         self._file_cache = {}  # cred_file -> (mtime, parsed_json | None)
+        self._last_attempt = {}  # cred_file -> monotonic ts of last refresh attempt
 
     def _load_conf(self):
         if not self.path:
@@ -282,6 +401,245 @@ class CredStore:
             return None
         return json_path_get(data, dotted)
 
+    # -- host-side refresh --------------------------------------------------
+
+    @staticmethod
+    def _expires_sec(data, expires_at_path, unit):
+        """Epoch SECONDS at which the access token expires, or None if the
+        field is missing/non-numeric (in which case we never refresh -- we
+        cannot tell, so we leave the file alone)."""
+        if not expires_at_path:
+            return None
+        raw = json_path_raw(data, expires_at_path)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return None
+        return raw / 1000.0 if unit == "ms" else float(raw)
+
+    def _read_uncached(self, cred_file):
+        """Parse the cred file fresh (bypassing the mtime cache) -- used for the
+        re-check under the lock, where another refresher may have just written."""
+        try:
+            with open(cred_file) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _lock_file(cred_file):
+        try:
+            os.makedirs(CRED_LOCK_DIR, 0o700, exist_ok=True)
+        except OSError:
+            return None
+        h = hashlib.sha256(cred_file.encode()).hexdigest()[:16]
+        try:
+            return open(os.path.join(CRED_LOCK_DIR, h + ".lock"), "w")
+        except OSError:
+            return None
+
+    @staticmethod
+    def _owner_home(cred_file):
+        """Home dir of the cred file's OWNER, not $HOME. Under `sudo cogbox
+        start` the addon runs as root with HOME=/root, but the cred file is the
+        invoking user's; we want the user's ~/.cache, on the same filesystem as
+        their cred file. Falls back to $HOME if the passwd lookup fails."""
+        try:
+            return pwd.getpwuid(os.stat(cred_file).st_uid).pw_dir
+        except (OSError, KeyError):
+            return os.path.expanduser("~")
+
+    @classmethod
+    def _staging_dir(cls, cred_file):
+        """A HOST-ONLY directory on the same filesystem as cred_file, for the
+        write-temp. os.replace must be same-fs, but the cred dir itself is the
+        eviction mirror's source -- a token-bearing temp there can leak into the
+        guest (the mirror strips only the cred file's basename). So we prefer
+        <owner-home>/.cache/cogbox-cred-refresh when it shares the cred file's
+        filesystem, keeping the rotated-token temp entirely out of any mirrored
+        path. Returns None if no same-fs host-only dir is available; the caller
+        then falls back to the cred dir, where the launcher's mirror-scrub + the
+        under-lock stale-temp sweep are the backstop."""
+        try:
+            cred_dev = os.stat(os.path.dirname(cred_file) or ".").st_dev
+        except OSError:
+            return None
+        cand = os.path.join(cls._owner_home(cred_file), ".cache", "cogbox-cred-refresh")
+        try:
+            os.makedirs(cand, 0o700, exist_ok=True)
+            if os.stat(cand).st_dev == cred_dev:
+                return cand
+        except OSError:
+            pass
+        return None
+
+    @classmethod
+    def _atomic_write(cls, cred_file, data):
+        """Replace cred_file with `data` atomically (temp + fsync + rename),
+        preserving 0600 AND the original owner. The temp goes in a host-only
+        same-fs dir when possible (never a guest-mirrored path), else the cred
+        dir as a same-fs fallback. Owner preservation matters under `sudo cogbox
+        start`: the addon runs as root, and without it the rewritten file would
+        become root-owned and lock the invoking user's own CLI out of its
+        credentials. Never leaves a partial file: a crash mid-write leaves the
+        original intact, so no backup copy is made (a backup would be a second
+        on-disk token, which we refuse to create)."""
+        try:
+            st = os.stat(cred_file)
+            want_uid, want_gid = st.st_uid, st.st_gid
+        except OSError:
+            want_uid = want_gid = None
+        stage = cls._staging_dir(cred_file) or (os.path.dirname(cred_file) or ".")
+        fd, tmp = tempfile.mkstemp(dir=stage, prefix=CRED_TMP_PREFIX, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            # Restore the cred file's original owner (no-op when already ours,
+            # e.g. rootless; under sudo this keeps the user owning their file).
+            if want_uid is not None:
+                try:
+                    os.chown(tmp, want_uid, want_gid)
+                except OSError:
+                    pass
+            os.replace(tmp, cred_file)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def ensure_fresh(self, spec):
+        """If `spec` opts into refresh and its access token is within the expiry
+        window, refresh it host-side and write the rotated tokens back to the
+        canonical cred file. Best-effort and FAIL-SAFE: any problem leaves the
+        file untouched and the caller injects whatever token is currently on
+        disk (which, since we trigger before expiry, is still valid). Never
+        raises into the request hook; never logs a token."""
+        try:
+            rc = spec.get("refresh")
+            cred_file = spec.get("cred_file")
+            if not rc or not cred_file:
+                return
+            unit = rc.get("expires_at_unit", "ms")
+            data = self._read_json(cred_file)
+            if data is None:
+                return
+            exp = self._expires_sec(data, rc.get("expires_at_path"), unit)
+            if exp is None or exp - time.time() >= REFRESH_WINDOW_SEC:
+                return  # fresh enough, or expiry unknown -> don't touch
+
+            # Throttle attempts per cred file so a slow/failing endpoint (or a
+            # window-exceeds-lifetime misconfig) can't make every in-window
+            # request a blocking POST. Checked before the lock to avoid even
+            # contending for it.
+            last = self._last_attempt.get(cred_file)
+            if last is not None and time.monotonic() - last < REFRESH_COOLDOWN_SEC:
+                return
+
+            lf = self._lock_file(cred_file)
+            if lf is None:
+                return
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                # Re-read under the lock: the host CLI or a sibling instance may
+                # have refreshed while we waited. If it's fresh now, we're done.
+                data = self._read_uncached(cred_file)
+                if data is None:
+                    return
+                exp = self._expires_sec(data, rc.get("expires_at_path"), unit)
+                if exp is not None and exp - time.time() >= REFRESH_WINDOW_SEC:
+                    return
+                # Sweep any token-bearing temp a previously-crashed refresh left
+                # in the cred dir (safe under the lock -- no concurrent cogbox
+                # writer). The launcher's mirror-scrub is the guest-facing
+                # backstop; this keeps the real dir tidy and the window minimal.
+                cred_dir = os.path.dirname(cred_file) or "."
+                for stale in glob.glob(os.path.join(cred_dir, CRED_TMP_PREFIX + "*.tmp")):
+                    try:
+                        os.unlink(stale)
+                    except OSError:
+                        pass
+                # Snapshot mtime for the post-POST clobber guard (the host CLI,
+                # which doesn't take our lock, may rotate during the POST).
+                try:
+                    mtime0 = os.stat(cred_file).st_mtime
+                except OSError:
+                    return
+                refresh_token = json_path_raw(data, rc.get("refresh_token_path"))
+                if not isinstance(refresh_token, str) or not refresh_token:
+                    _cred_log("refresh skipped for %s: no refresh token on disk"
+                              % spec.get("host"))
+                    return
+                self._last_attempt[cred_file] = time.monotonic()
+                try:
+                    resp = _http_post_json(
+                        rc["token_url"],
+                        {"grant_type": "refresh_token",
+                         "refresh_token": refresh_token,
+                         "client_id": rc["client_id"]},
+                        REFRESH_HTTP_TIMEOUT,
+                        rc.get("user_agent") or DEFAULT_REFRESH_UA,
+                    )
+                except Exception as e:  # network / HTTP / parse
+                    _cred_log("refresh POST failed for %s: %s"
+                              % (spec.get("host"), type(e).__name__))
+                    return
+                new_access = resp.get("access_token") if isinstance(resp, dict) else None
+                expires_in = resp.get("expires_in") if isinstance(resp, dict) else None
+                if not isinstance(new_access, str) or not new_access \
+                        or not isinstance(expires_in, (int, float)) \
+                        or isinstance(expires_in, bool):
+                    _cred_log("refresh response missing fields for %s"
+                              % spec.get("host"))
+                    return
+                # Rotation: providers may return a new refresh token; if absent,
+                # keep the current one.
+                new_refresh = resp.get("refresh_token") or refresh_token
+                new_exp = time.time() + expires_in
+                stored_exp = int(new_exp * 1000) if unit == "ms" else int(new_exp)
+                placed = (
+                    json_path_set(data, spec.get("token_path"), new_access)
+                    and json_path_set(data, rc.get("refresh_token_path"), new_refresh)
+                    and json_path_set(data, rc.get("expires_at_path"), stored_exp)
+                )
+                if not placed:
+                    _cred_log("refresh: could not place fields for %s (unexpected cred shape)"
+                              % spec.get("host"))
+                    return
+                # Don't clobber a rotation that landed during our POST: if the
+                # file changed, the on-disk token is newer than ours -- drop
+                # ours (single-use grants mean theirs is the valid one) and let
+                # the next request re-evaluate. Avoids forking the lineage /
+                # locking out the host CLI.
+                try:
+                    if os.stat(cred_file).st_mtime != mtime0:
+                        _cred_log("refresh: %s rotated concurrently during POST; not clobbering"
+                                  % spec.get("host"))
+                        return
+                except OSError:
+                    return
+                try:
+                    self._atomic_write(cred_file, data)
+                except OSError as e:
+                    _cred_log("refresh write failed for %s: %s"
+                              % (spec.get("host"), type(e).__name__))
+                    return
+                # Drop the cache so the imminent value_for() reads the new token.
+                self._file_cache.pop(cred_file, None)
+                _cred_log("refreshed %s token host-side (expires in ~%ds)"
+                          % (spec.get("host"), int(expires_in)))
+            finally:
+                try:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                lf.close()
+        except Exception as e:  # absolute backstop: refresh must never break inject
+            _cred_log("refresh unexpected error for %s: %s"
+                      % (spec.get("host"), type(e).__name__))
+
 
 CREDS = CredStore(INJECT_CONF_PATH)
 
@@ -315,6 +673,10 @@ def request(flow):
     # so a denied/fronted request never gets a real token stamped on it.
     spec = CREDS.spec_for(host)
     if spec is not None:
+        # Refresh the host token first if it's near expiry (no-op unless the
+        # spec opts in). Keeps a long-running guest -- which can't refresh, by
+        # design -- from being handed a lapsed token.
+        CREDS.ensure_fresh(spec)
         token = CREDS.value_for(spec, "token_path")
         if not token:
             # Injection is configured for this host but the host-side token is

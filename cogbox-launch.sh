@@ -154,16 +154,22 @@ harness_summary() {
 
 # -- Host-side credential injection (keep tokens out of the sandbox) ---
 # Credential-injection specs per harness, one per line:
-#   provider_host|style|cred_file|token_path|account_id_path
+#   provider_host|style|cred_file|token_path|account_id_path|refresh_token_path|expires_at_path|token_url|client_id
 # The terminate-tier mitmproxy addon reads token_path out of cred_file
 # (host-side) and rewrites the request's auth header for provider_host, so the
 # guest only ever carries a stub. cred_file is resolved from the same H_HOST
-# paths used everywhere else. See docs/network-filtering.md.
+# paths used everywhere else. The trailing 4 fields are OPTIONAL and opt the
+# host into host-side token refresh (the addon does the OAuth refresh-token
+# grant when the access token nears expiry and writes the rotated tokens back
+# to cred_file): needed for harnesses whose token is EVICTED from the guest
+# (claude-code), since the guest then cannot refresh on its own. Harnesses that
+# still carry their token in-guest refresh there and leave these blank. See
+# docs/network-filtering.md.
 harness_inject_specs() {
 	case "$1" in
 		claude-code)
 			printf '%s\n' \
-				"api.anthropic.com|anthropic-oauth|${H_HOST[claude-code:config]}/.credentials.json|claudeAiOauth.accessToken|"
+				"api.anthropic.com|anthropic-oauth|${H_HOST[claude-code:config]}/.credentials.json|claudeAiOauth.accessToken||claudeAiOauth.refreshToken|claudeAiOauth.expiresAt|https://platform.claude.com/v1/oauth/token|9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 			;;
 		codex)
 			printf '%s\n' \
@@ -188,10 +194,10 @@ harness_inject_specs() {
 # Deduped; first such harness wins a shared host (claude-code precedes opencode
 # for api.anthropic.com in HARNESSES order).
 active_inject_hosts() {
-	local h host style cred token acct
+	local h host style cred token acct rtok exp turl cid
 	declare -A seen
 	for h in "${ACTIVE_HARNESSES[@]}"; do
-		while IFS='|' read -r host style cred token acct; do
+		while IFS='|' read -r host style cred token acct rtok exp turl cid; do
 			[ -z "$host" ] && continue
 			[ -n "${seen[$host]:-}" ] && continue
 			[ -f "$cred" ] || continue
@@ -206,22 +212,29 @@ active_inject_hosts() {
 # harness whose token file is present wins a shared host. `[]` if none -- the
 # caller then writes no conf and the addon leaves auth untouched.
 gen_inject_conf() {
-	local h host style cred token acct
+	local h host style cred token acct rtok exp turl cid
 	declare -A seen
 	{
 		for h in "${ACTIVE_HARNESSES[@]}"; do
-			while IFS='|' read -r host style cred token acct; do
+			while IFS='|' read -r host style cred token acct rtok exp turl cid; do
 				[ -z "$host" ] && continue
 				[ -n "${seen[$host]:-}" ] && continue
 				[ -f "$cred" ] || continue
 				seen[$host]=1
-				printf '%s\t%s\t%s\t%s\t%s\n' "$host" "$style" "$cred" "$token" "$acct"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$host" "$style" "$cred" "$token" "$acct" "$rtok" "$exp" "$turl" "$cid"
 			done < <(harness_inject_specs "$h")
 		done
 	} | jq -R -s '
 		[ split("\n")[] | select(length > 0) | split("\t")
 		  | { host: .[0], style: .[1], cred_file: .[2], token_path: .[3] }
-		  + (if (.[4] // "") != "" then { account_id_path: .[4] } else {} end) ]
+		  + (if (.[4] // "") != "" then { account_id_path: .[4] } else {} end)
+		  + (if (.[5] // "") != "" and (.[6] // "") != ""
+		         and (.[7] // "") != "" and (.[8] // "") != ""
+		       then { refresh: { refresh_token_path: .[5], expires_at_path: .[6],
+		                         token_url: .[7], client_id: .[8],
+		                         expires_at_unit: "ms" } }
+		       else {} end) ]
 	'
 }
 
@@ -259,6 +272,13 @@ stage_overlay_source() {
 	rm -rf "$mirror"; mkdir -p "$mirror"
 	if cp -al "$host/." "$mirror/" 2>/dev/null || cp -a "$host/." "$mirror/" 2>/dev/null; then
 		rm -f "$mirror/$sfile"
+		# Strip any token-bearing refresh write-temp the host-side refresh may
+		# have left in the cred dir (crash residue, or a temp created during
+		# this cp): it is a COMPLETE rotated credential (access + refresh token)
+		# and must never reach the guest. Pattern matches CRED_TMP_PREFIX in
+		# l7-mitm-addon.py. (The addon prefers a host-only temp dir off the
+		# mirrored tree; this is the backstop for the same-fs fallback path.)
+		rm -f "$mirror"/.cogbox-refresh-*.tmp 2>/dev/null || true
 		printf '%s' "$mirror"
 	else
 		# Mirror failed: fail CLOSED -- never fall back to sharing the real dir
