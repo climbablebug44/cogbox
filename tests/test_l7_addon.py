@@ -164,6 +164,26 @@ h = CIDict({})
 m.apply_injection(h, "weird-unknown", "T")
 check(h["authorization"] == "Bearer T", "unknown style falls back to bearer")
 
+# should_inject: with a stub_token, inject ONLY over that stub (or an absent
+# credential); pass a secondary credential the guest legitimately holds straight
+# through (e.g. claude-code Remote Control's per-session worker_jwt on
+# /v1/code/sessions/<id>/worker -- clobbering it yields 401/worker_register_failed).
+STUB = "sk-ant-oat01-cogbox-host-injected-placeholder"
+check(m.should_inject(CIDict({"Authorization": "Bearer " + STUB}), "anthropic-oauth", STUB),
+      "should_inject: inject over the stub bearer")
+check(not m.should_inject(CIDict({"Authorization": "Bearer eyJ.worker.jwt"}), "anthropic-oauth", STUB),
+      "should_inject: pass through a non-stub bearer (RC worker_jwt)")
+check(m.should_inject(CIDict({}), "anthropic-oauth", STUB),
+      "should_inject: inject when no credential present")
+check(m.should_inject(CIDict({"Authorization": "Bearer " + STUB}), "anthropic-oauth", None),
+      "should_inject: no stub_token -> legacy always-inject")
+check(m.should_inject(CIDict({"Authorization": "Bearer whatever"}), "anthropic-oauth", None),
+      "should_inject: no stub_token -> inject even a non-stub cred")
+check(m.should_inject(CIDict({"X-Api-Key": STUB}), "anthropic-apikey", STUB),
+      "should_inject: apikey inject over stub key")
+check(not m.should_inject(CIDict({"X-Api-Key": "real-secondary"}), "anthropic-apikey", STUB),
+      "should_inject: apikey pass through non-stub key")
+
 # CredStore: conf + cred file, host normalization, mtime hot-reload, fail-closed
 import json as _json
 import tempfile

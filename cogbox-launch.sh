@@ -221,8 +221,9 @@ gen_inject_conf() {
 				[ -n "${seen[$host]:-}" ] && continue
 				[ -f "$cred" ] || continue
 				seen[$host]=1
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$host" "$style" "$cred" "$token" "$acct" "$rtok" "$exp" "$turl" "$cid"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$host" "$style" "$cred" "$token" "$acct" "$rtok" "$exp" "$turl" "$cid" \
+					"$(harness_stub_token "$h")"
 			done < <(harness_inject_specs "$h")
 		done
 	} | jq -R -s '
@@ -234,26 +235,72 @@ gen_inject_conf() {
 		       then { refresh: { refresh_token_path: .[5], expires_at_path: .[6],
 		                         token_url: .[7], client_id: .[8],
 		                         expires_at_unit: "ms" } }
-		       else {} end) ]
+		       else {} end)
+		  + (if (.[9] // "") != "" then { stub_token: .[9] } else {} end) ]
 	'
 }
 
-# The secret file to EVICT from the guest when injection is active, as
-# "<overlay-pathkey> <basename>". The token then never enters the sandbox: the
-# addon injects it host-side and the launcher presents a placeholder identity
-# (see flake.nix stubWhenMissing). Only claude-code is evicted for now; codex
+# The secret file to scrub from the guest when injection is active, as
+# "<overlay-pathkey> <basename>". When the harness defines a redactor (below) the
+# file is REWRITTEN with its tokens replaced by placeholders but its non-secret
+# fields kept; otherwise it is dropped wholesale. Either way the real
+# access/refresh tokens never enter the sandbox -- the addon injects the real
+# token host-side on the wire. Only claude-code is handled for now; codex
 # (account id lives in the same file) and opencode (multi-provider, non-injected
-# API-key providers) keep the mounted-token path until their stubs are built.
+# API-key providers) keep the mounted-token path until their redactors are built.
 harness_secret_file() {
 	case "$1" in
 		claude-code) echo "config .credentials.json" ;;
 	esac
 }
 
+# The placeholder access token harness_secret_redact_jq writes in place of the
+# real one -- a recognizable SENTINEL. The inject addon stamps the real token
+# ONLY over this exact stub (or an absent credential), so a SECONDARY credential
+# the guest legitimately obtains through an injected call -- e.g. claude-code
+# Remote Control's per-session "bridge credentials" used on
+# /v1/code/sessions/<id>/worker + the SSE transport -- reaches the upstream
+# UNTOUCHED instead of being clobbered with the OAuth token (which yields 401 /
+# worker_register_failed -> "Transport closed (code 403)"). Emitted into the
+# inject-conf as `stub_token` (gen_inject_conf). Empty => harness not redacted.
+harness_stub_token() {
+	case "$1" in
+		claude-code) echo "sk-ant-oat01-cogbox-host-injected-placeholder" ;;
+	esac
+}
+
+# jq program to REDACT (rather than drop) the secret file for a harness, or empty
+# to fall back to full eviction. Keeping the non-secret fields -- the OAuth
+# `scopes` and subscriptionType -- lets the harness still present a logged-in
+# identity inside the guest (claude-code's `/remote-control`, for one, gates on a
+# local full-scope credential), while the token fields become inert placeholders:
+# the host proxy overwrites the access token on the wire (ONLY over the stub --
+# see harness_stub_token), and a far-future expiry stops the guest from ever
+# trying (and failing) to refresh the placeholder locally. The accessToken stub
+# MUST equal harness_stub_token so the addon recognizes it. Fail-safe: if jq
+# errors on an unexpected cred shape, staging drops the file entirely rather than
+# risk writing a real token (see stage_overlay_source).
+harness_secret_redact_jq() {
+	local stub; stub="$(harness_stub_token "$1")"
+	[ -z "$stub" ] && return
+	case "$1" in
+		claude-code) cat <<-JQ
+		if (.claudeAiOauth | type) != "object" then error("unexpected cred shape")
+		else .claudeAiOauth.accessToken = "$stub"
+		   | .claudeAiOauth.refreshToken = "cogbox-evicted-no-refresh-token-in-guest"
+		   | .claudeAiOauth.expiresAt = 9999999999000
+		end
+		JQ
+		;;
+	esac
+}
+
 # Stage the 9p source for an active harness overlay path: normally the real host
 # dir, but when injection is active AND this path holds the harness's secret
-# file, a per-instance hardlink-mirror that OMITS that file (no data copy -- the
-# dir can be large). The mirror lives host-only under the cogbox data root
+# file, a per-instance hardlink-mirror in which that file is REDACTED -- tokens
+# replaced by placeholders, non-secret fields kept (or omitted entirely if it
+# can't be safely redacted; no bulk data copy -- the dir can be large). The
+# mirror lives host-only under the cogbox data root
 # ($BASE_DATA/mirrors/<instance>/); it must NOT go under REAL_DATA, which is
 # shared RW into the guest -- the hardlinks alias the real host dir, so a guest
 # write would corrupt it. Hardlinks need same-fs as the source (true when both
@@ -268,10 +315,29 @@ stage_overlay_source() {
 		printf '%s' "$host"
 		return
 	fi
+	local redact; redact="$(harness_secret_redact_jq "$h")"
 	local mirror; mirror="$BASE_DATA/mirrors/${EFFECTIVE_NAME}/${h}-${k}"
 	rm -rf "$mirror"; mkdir -p "$mirror"
 	if cp -al "$host/." "$mirror/" 2>/dev/null || cp -a "$host/." "$mirror/" 2>/dev/null; then
+		# Break the hardlink to the real cred file before touching it: the mirror
+		# entry aliases the host's inode, so writing through it would corrupt the
+		# user's real credential. rm drops only the mirror's link.
 		rm -f "$mirror/$sfile"
+		# Redact-in-place when the harness defines a redactor: rewrite the cred
+		# file with its tokens replaced by placeholders but its non-secret fields
+		# (OAuth scopes, ...) kept, so the harness still sees a logged-in identity
+		# while the real tokens stay host-side. No redactor -- or a jq error on an
+		# unexpected cred shape -- leaves the file GONE (full eviction), never the
+		# real tokens. Direct-to-target then rm-on-failure is safe: the mirror is
+		# host-only and not yet shared into any guest at staging time.
+		if [ -n "$redact" ]; then
+			if jq "$redact" "$host/$sfile" > "$mirror/$sfile" 2>/dev/null; then
+				chmod 600 "$mirror/$sfile"
+			else
+				rm -f "$mirror/$sfile"
+				echo "cogbox-launch: warning: could not redact $h/$k secret; evicting it entirely (token withheld)." >&2
+			fi
+		fi
 		# Strip any token-bearing refresh write-temp the host-side refresh may
 		# have left in the cred dir (crash residue, or a temp created during
 		# this cp): it is a COMPLETE rotated credential (access + refresh token)

@@ -252,6 +252,28 @@ def apply_injection(headers, style, token, account_id=None):
         headers["authorization"] = "Bearer " + token
 
 
+def should_inject(headers, style, stub_token):
+    """Whether to overwrite this request's credential with the injected token.
+
+    When the spec carries a `stub_token` (the recognizable placeholder the
+    launcher redacted into the guest's cred file), inject ONLY when the request
+    presents that stub -- or no credential at all -- i.e. the guest is using its
+    stubbed PRIMARY identity. A request bearing any OTHER credential is using a
+    SECONDARY token it legitimately obtained through an already-injected call
+    (e.g. claude-code Remote Control's per-session "bridge credentials" on
+    /v1/code/sessions/<id>/worker + the SSE event stream); clobbering that with
+    the OAuth token breaks it (401 -> worker_register_failed -> "Transport closed
+    (code 403)"). With no stub_token (harnesses that still mount their real token
+    in-guest), keep the legacy always-inject behavior."""
+    if not stub_token:
+        return True
+    if style == "anthropic-apikey":
+        cur = headers.get("x-api-key", "")
+        return cur == "" or cur == stub_token
+    cur = headers.get("authorization", "")
+    return cur == "" or cur == "Bearer " + stub_token
+
+
 # --- Host-side token refresh -----------------------------------------------
 # After credential eviction the guest carries only a placeholder env token and
 # can NEVER refresh (claude-code does not refresh an env token, and the refresh
@@ -673,22 +695,58 @@ def request(flow):
     # so a denied/fronted request never gets a real token stamped on it.
     spec = CREDS.spec_for(host)
     if spec is not None:
-        # Refresh the host token first if it's near expiry (no-op unless the
-        # spec opts in). Keeps a long-running guest -- which can't refresh, by
-        # design -- from being handed a lapsed token.
-        CREDS.ensure_fresh(spec)
-        token = CREDS.value_for(spec, "token_path")
-        if not token:
-            # Injection is configured for this host but the host-side token is
-            # unreadable: fail closed rather than forward the guest's stub as
-            # if it were real auth. (Atomic-rename writeback means this is not
-            # a transient race -- the file is always whole.)
-            _deny(flow, "credential unavailable")
-            return
-        account_id = CREDS.value_for(spec, "account_id_path")
-        apply_injection(
-            flow.request.headers, spec.get("style", "bearer"), token, account_id
-        )
+        style = spec.get("style", "bearer")
+        do_inject = should_inject(flow.request.headers, style, spec.get("stub_token"))
+        if os.environ.get("COGBOX_L7_DEBUG_INJECT"):
+            # Safe to log: host + path + decision only, never any token material.
+            has_auth = bool(flow.request.headers.get("authorization")
+                            or flow.request.headers.get("x-api-key"))
+            _cred_log("inject host=%s path=%s inject=%s had_auth=%s"
+                      % (host, path, do_inject, has_auth))
+        if do_inject:
+            # Refresh the host token first if it's near expiry (no-op unless the
+            # spec opts in). Keeps a long-running guest -- which can't refresh, by
+            # design -- from being handed a lapsed token.
+            CREDS.ensure_fresh(spec)
+            token = CREDS.value_for(spec, "token_path")
+            if not token:
+                # Injection is configured for this host but the host-side token is
+                # unreadable: fail closed rather than forward the guest's stub as
+                # if it were real auth. (Atomic-rename writeback means this is not
+                # a transient race -- the file is always whole.)
+                _deny(flow, "credential unavailable")
+                return
+            account_id = CREDS.value_for(spec, "account_id_path")
+            apply_injection(flow.request.headers, style, token, account_id)
+        # else: the guest is presenting a SECONDARY credential it legitimately
+        # obtained through an injected call (e.g. Remote Control per-session
+        # bridge creds) -- forward it to the upstream untouched.
+
+
+def responseheaders(flow):
+    """Stream (don't buffer) Server-Sent-Events responses so the guest receives
+    them incrementally.
+
+    mitmproxy buffers the ENTIRE response body before forwarding it to the client
+    by default. For an open-ended SSE stream that body never ends, so the bytes
+    pile up in the proxy and never reach the guest. Remote Control's INBOUND
+    channel is exactly such a stream -- SSE `GET /v1/code/sessions/<id>/worker/
+    events/stream` -- so without streaming the guest gets nothing from the
+    controller: the session looks "connected" and OUTBOUND POSTs work, but
+    phone/web -> guest is dead (a one-way channel). Setting `flow.response.stream`
+    in `responseheaders` (before the body is read) passes the body through
+    chunk-by-chunk. It also makes ordinary streaming inference (also
+    text/event-stream) truly stream instead of arriving all at once on close.
+    We never read or rewrite response bodies, so streaming them is free."""
+    if flow.response is None:
+        return
+    resp_ct = flow.response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    req_accept = flow.request.headers.get("accept", "").lower()
+    # Stream when the response IS an event stream, or the client ASKED for one
+    # (covers a content-type the server labels differently). Streaming a non-SSE
+    # body that slips through is harmless -- we never read response bodies.
+    if resp_ct == "text/event-stream" or "text/event-stream" in req_accept:
+        flow.response.stream = True
 
 
 def tls_start_server(data):
