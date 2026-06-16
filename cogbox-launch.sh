@@ -88,11 +88,21 @@ die() {
 }
 
 # -- Resolve real user for sudo context ----------------------------
-if [ -n "${SUDO_USER:-}" ]; then
+# Trust SUDO_USER ONLY when we are actually running as root: that is the genuine
+# `sudo cogbox` case, where we act on behalf of the invoking user and chown the
+# files back to them. `sudo` exports SUDO_USER for EVERY invocation (even
+# `sudo -u other`), and a non-login `su other` preserves it -- so without the
+# euid==0 guard, running as one user with another's stale SUDO_USER in the env
+# would resolve to the wrong home/uid (writing into a dir we can't touch). When
+# not root, our own identity (id/$HOME) is authoritative. SUDO_INVOCATION is the
+# single source of truth downstream (runtime dir, chown-back).
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+	SUDO_INVOCATION=1
 	REAL_USER="$SUDO_USER"
 	REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 	REAL_UID=$(getent passwd "$SUDO_USER" | cut -d: -f3)
 else
+	SUDO_INVOCATION=0
 	REAL_USER="$(id -un)"
 	REAL_HOME="$HOME"
 	REAL_UID="$(id -u)"
@@ -101,6 +111,14 @@ fi
 # -- Paths (XDG basedir spec) --------------------------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cogbox"
 BASE_DATA="${COGBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cogbox}"
+
+# Fail fast on an identity/permission mismatch instead of cascading mkdir/write
+# failures into a corrupt half-init (and a misleading "invalid JSON" at start).
+# The classic trigger is `sudo su <user>` WITHOUT `-`: that keeps the invoker's
+# HOME/SUDO_USER, so the resolved home isn't writable by the user we now are.
+if [ ! -d "$REAL_HOME" ] || [ ! -w "$REAL_HOME" ]; then
+	die "resolved home '$REAL_HOME' (user '$REAL_USER') is not writable by uid $(id -u). If you switched users, use a login shell -- 'sudo su - $REAL_USER' (or 'sudo -u $REAL_USER env -u SUDO_USER HOME=$REAL_HOME ...') -- not 'sudo su $REAL_USER'." 78
+fi
 
 # -- Harness shape -------------------------------------------------
 # Mirror of the harness attrset in flake.nix. Both sides must agree on
@@ -360,7 +378,7 @@ RUNTIME_TEMPLATE="@runtimeDir@"
 # /run/user/$UID instead. If that doesn't exist (no active logind session),
 # fall back to /tmp/cogbox-runtime-$UID per the spec's "replacement
 # directory with similar capabilities" guidance.
-if [ -n "${SUDO_USER:-}" ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+if [ "$SUDO_INVOCATION" = 1 ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then
 	XDG_RUNTIME_BASE="/run/user/$REAL_UID"
 else
 	XDG_RUNTIME_BASE="$XDG_RUNTIME_DIR"
@@ -754,7 +772,7 @@ mkdir -p "$REAL_DATA/.config"
 printf '%s\n' "${ACTIVE_HARNESSES[@]}" > "$ACTIVE_HARNESSES_FILE"
 
 # -- Fix file ownership after init under sudo ----------------------
-if [ -n "${SUDO_USER:-}" ]; then
+if [ "$SUDO_INVOCATION" = 1 ]; then
 	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA"
 	for h in "${ACTIVE_HARNESSES[@]}"; do
 		while IFS= read -r k; do
