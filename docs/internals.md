@@ -94,7 +94,7 @@ Override where data lives on the host with environment variables:
 |---|---|---|
 | `COGBOX_DATA` | `$XDG_DATA_HOME/cogbox` (i.e. `~/.local/share/cogbox`) | Persistent data root. Each instance lives at `$COGBOX_DATA/instances/<name>/`. |
 | `COGBOX_CLAUDE_CONFIG` | `$HOME/.claude` | Host claude-code config (overlay lower in VM) |
-| `COGBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code auth token for the VM |
+| `COGBOX_CLAUDE_AUTH` | `$HOME/.claude.json` | claude-code account/telemetry config (incl. the org UUID `/rc` needs), copied in via `fw_cfg`. Holds **no** secret token -- the OAuth tokens live in `COGBOX_CLAUDE_CONFIG`'s `.credentials.json` (overlay, redacted under injection) |
 | `COGBOX_OPENCODE_CONFIG` | `$XDG_CONFIG_HOME/opencode` | Host opencode config (overlay lower in VM) |
 | `COGBOX_OPENCODE_DATA` | `$XDG_DATA_HOME/opencode` | Host opencode data (auth lives here as `auth.json`) |
 | `COGBOX_CODEX_HOME` | `$HOME/.codex` | Host codex home (config, auth, sessions; overlay lower in VM) |
@@ -102,3 +102,11 @@ Override where data lives on the host with environment variables:
 ```sh
 COGBOX_DATA=/mnt/fast/cogbox nix run .
 ```
+
+## Running as another user (sudo context)
+
+cogbox resolves the *real* (non-root) user -- whose `$HOME` holds the config, data, and harness credential files -- from `SUDO_USER`, but **only when actually running as root** (euid 0). That is the genuine `sudo cogbox` case, where cogbox acts on the invoking user's behalf and `chown`s the files it creates back to them. When not root, cogbox uses its own identity (`id` / `$HOME`).
+
+This guard matters because `sudo` exports `SUDO_USER` for *every* invocation (including `sudo -u other`), and a non-login `su other` preserves it. So `sudo su <user>` **without** `-` leaves the invoker's `SUDO_USER`/`HOME` in the environment; without the euid guard cogbox would resolve paths to the *invoker*, not the user it now runs as, and write into a directory it can't touch. A fail-fast preflight catches this -- if the resolved home isn't writable by the current uid, cogbox aborts with actionable guidance instead of cascading permission errors.
+
+**To run cogbox as a different user, use a login shell** -- `sudo su - <user>` (or `sudo -u <user> env -u SUDO_USER HOME=/home/<user> cogbox`) -- not `sudo su <user>`. This is the invocation a multi-user control plane must use to launch cogbox per-user.
