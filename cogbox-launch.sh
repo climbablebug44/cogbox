@@ -181,8 +181,11 @@ harness_summary() {
 # grant when the access token nears expiry and writes the rotated tokens back
 # to cred_file): needed for harnesses whose token is EVICTED from the guest
 # (claude-code), since the guest then cannot refresh on its own. Harnesses that
-# still carry their token in-guest refresh there and leave these blank. See
-# docs/network-filtering.md.
+# still carry their token in-guest refresh there and leave these blank. The
+# OAuth login/refresh host (platform.claude.com) is deliberately NOT listed: the
+# guest reaches it via the default L4 splice (passthrough), so an in-guest
+# `/login` works AND the guest can refresh its OWN token there -- we never MITM
+# or capture the login. See docs/network-filtering.md.
 harness_inject_specs() {
 	case "$1" in
 		claude-code)
@@ -308,6 +311,31 @@ harness_secret_redact_jq() {
 	esac
 }
 
+# Write a minimal redacted-scoped PLACEHOLDER credential for a harness to $2.
+# The staging-failure fallback: the guest must ALWAYS have a present, scoped,
+# logged-in identity -- the addon injects the real token over the stub, and BOTH
+# /remote-control (gates on a local full-scope cred file) and an in-guest /login
+# need a present scoped file on disk. The accessToken is single-sourced from
+# harness_stub_token (the SAME string the redactor writes and the addon matches),
+# so it can never drift. Returns non-zero if the harness has no stub identity or
+# the write fails; the caller then evicts the file (legacy behavior).
+write_stub_cred() {
+	local h=$1 dest=$2 stub
+	stub="$(harness_stub_token "$h")"
+	[ -z "$stub" ] && return 1
+	case "$h" in
+		claude-code)
+			jq -n --arg t "$stub" '{claudeAiOauth: {accessToken: $t,
+				refreshToken: "cogbox-evicted-no-refresh-token-in-guest",
+				expiresAt: 9999999999000,
+				scopes: ["user:inference", "user:profile"]}}' > "$dest" 2>/dev/null \
+				|| return 1
+			chmod 600 "$dest" 2>/dev/null || return 1
+			;;
+		*) return 1 ;;
+	esac
+}
+
 # Stage the 9p source for an active harness overlay path: normally the real host
 # dir, but when injection is active AND this path holds the harness's secret
 # file, a per-instance hardlink-mirror in which that file is REDACTED -- tokens
@@ -347,8 +375,19 @@ stage_overlay_source() {
 			if jq "$redact" "$host/$sfile" > "$mirror/$sfile" 2>/dev/null; then
 				chmod 600 "$mirror/$sfile"
 			else
+				# Unexpected cred shape: stage a minimal scoped PLACEHOLDER rather
+				# than evict -- a present scoped file keeps the inherit-default path
+				# and /rc working (the addon injects the real token over the stub),
+				# and lets the guest log in to its OWN account on top. Only if even
+				# the placeholder can't be written do we evict (fail-safe: never the
+				# real token).
 				rm -f "$mirror/$sfile"
-				echo "cogbox-launch: warning: could not redact $h/$k secret; evicting it entirely (token withheld)." >&2
+				if write_stub_cred "$h" "$mirror/$sfile"; then
+					echo "cogbox-launch: warning: could not redact $h/$k secret; staged a placeholder identity instead (real token withheld)." >&2
+				else
+					rm -f "$mirror/$sfile"
+					echo "cogbox-launch: warning: could not redact or stub $h/$k secret; evicting it entirely (token withheld)." >&2
+				fi
 			fi
 		fi
 		# Strip any token-bearing refresh write-temp the host-side refresh may
@@ -361,10 +400,16 @@ stage_overlay_source() {
 		printf '%s' "$mirror"
 	else
 		# Mirror failed: fail CLOSED -- never fall back to sharing the real dir
-		# (that would leak the token). Share an empty dir; the launcher's
-		# placeholder identity + host-side injection keep the harness working.
+		# (that would leak the token). Stage a minimal scoped PLACEHOLDER cred so
+		# the guest still has a present logged-in identity (host-side injection
+		# fills in the real token over the stub); a harness with no stub identity
+		# gets an empty dir.
 		rm -rf "$mirror"; mkdir -p "$mirror"
-		echo "cogbox-launch: warning: could not stage sanitized $h/$k mirror; sharing empty dir (token withheld)." >&2
+		if [ -n "$redact" ] && write_stub_cred "$h" "$mirror/$sfile"; then
+			echo "cogbox-launch: warning: could not mirror $h/$k dir; staged a placeholder identity only (real token withheld)." >&2
+		else
+			echo "cogbox-launch: warning: could not stage sanitized $h/$k mirror; sharing empty dir (token withheld)." >&2
+		fi
 		printf '%s' "$mirror"
 	fi
 }

@@ -1265,7 +1265,7 @@ with subtest("Phase R: L7 host-side credential injection keeps the token out of 
     stop_instance("cc-work", name="work")
     machine.succeed("systemctl stop l7-origin")
 
-with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token eviction)"):
+with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token redaction)"):
     # A new rules-mode instance with an active harness seeds .network.l7 with a
     # terminate rule for the harness's provider host AND inject:true, and the
     # launcher auto-generates the inject-conf from the host cred file -- no env
@@ -1279,7 +1279,7 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
     machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
 
     # Make claude-code an ACTIVE harness for testuser, with a fake on-disk token
-    # plus a NON-secret marker file (settings.json) to prove eviction is surgical.
+    # plus a NON-secret marker file (settings.json) to prove redaction is surgical.
     fake_tok = "FAKE-CRED-TOKEN-s9k2"
     machine.succeed(as_user("mkdir -p /home/testuser/.claude"))
     machine.succeed(as_user(
@@ -1320,24 +1320,37 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
         f"| select(.cred_file==\"/home/testuser/.claude/.credentials.json\")' {irt}/l7-inject-conf.json"
     )
 
-    # v1b -- token EVICTION: with inject active, the harness's secret file is
-    # dropped from the guest overlay (the hardlink-mirror omits it), while the
-    # rest of ~/.claude is preserved. The cred file is therefore ABSENT in the
-    # guest and the `c` launcher presents a placeholder identity because of it.
+    # token REDACTION: with inject active, the harness's secret file is PRESENT
+    # in the guest but rewritten -- the real token replaced by the recognizable
+    # stub, non-secret fields kept -- so the guest holds a logged-in placeholder
+    # identity (the addon injects the real token over the stub on the wire) while
+    # the real token NEVER enters the VM. A present, scoped file is what lets
+    # /remote-control work and lets an in-guest /login write its OWN token on top.
+    stub = "sk-ant-oat01-cogbox-host-injected-placeholder"
     machine.succeed(as_user(
-        "cogbox ssh --name injauto 'test ! -e /root/.claude/.credentials.json'"))
+        "cogbox ssh --name injauto 'test -e /root/.claude/.credentials.json'"))
+    machine.succeed(as_user("cogbox ssh --name injauto " + shlex.quote(
+        f"jq -e '.claudeAiOauth.accessToken==\"{stub}\"' /root/.claude/.credentials.json")))
+    # The real token must NOT be anywhere in the guest cred dir.
+    machine.fail(as_user("cogbox ssh --name injauto " + shlex.quote(
+        f"grep -rq {fake_tok} /root/.claude/")))
     machine.succeed(as_user(
         "cogbox ssh --name injauto 'test -e /root/.claude/settings.json'"))
-    machine.succeed(as_user("cogbox ssh --name injauto " + shlex.quote(
-        'grep -q ANTHROPIC_AUTH_TOKEN "$(command -v c)" && [ ! -e /root/.claude/.credentials.json ]')))
+    # No ANTHROPIC_AUTH_TOKEN env stub: it would shadow the on-disk file (break
+    # /rc and in-guest login). The guest relies on the present redacted file.
+    machine.fail(as_user("cogbox ssh --name injauto " + shlex.quote(
+        'grep -q ANTHROPIC_AUTH_TOKEN "$(command -v c)"')))
     # The host-side mirror exists under the cogbox data root (host-only, NOT in
-    # the guest-shared instances/<name>/ dir) and does NOT contain the secret.
+    # the guest-shared instances/<name>/ dir) and holds the REDACTED file (stub,
+    # not the real token); the non-secret marker is preserved.
     mirror = "/home/testuser/.local/share/cogbox/mirrors/injauto/claude-code-config"
-    machine.succeed(as_user(f"test ! -e {mirror}/.credentials.json"))
+    machine.succeed(as_user(
+        f"jq -e '.claudeAiOauth.accessToken==\"{stub}\"' {mirror}/.credentials.json"))
+    machine.fail(as_user(f"grep -q {fake_tok} {mirror}/.credentials.json"))
     machine.succeed(as_user(f"test -e {mirror}/settings.json"))
 
-    # Config-driven injection end-to-end, WITH the token now evicted from the
-    # guest: guest sends a garbage Bearer; the addon overwrites it with the real
+    # Config-driven injection end-to-end, with the token now redacted in the
+    # guest: guest sends the stub Bearer; the addon overwrites it with the real
     # host-side token (anthropic-oauth). Origin echoes the Authorization.
     machine.wait_until_succeeds(
         as_user("cogbox ssh --name injauto " + shlex.quote(

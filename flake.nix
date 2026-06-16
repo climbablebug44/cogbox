@@ -84,21 +84,14 @@
 					name = "c";
 					flags = [ "--dangerously-skip-permissions" ];
 					env = { IS_SANDBOX = "1"; };
-					# Host-side credential injection keeps the OAuth token out of
-					# the guest: the launcher rewrites .credentials.json in the
-					# overlay with placeholder tokens (real scopes kept), and the
-					# host proxy overwrites the Authorization on the wire with the
-					# real, host-side token. Because the redacted file is PRESENT,
-					# this stub normally does not fire -- it is the fallback for when
-					# the sanitized file can't be staged (mirror failure leaves the
-					# file absent, see stage_overlay_source) so claude-code still
-					# starts. ANTHROPIC_AUTH_TOKEN is sent verbatim as a Bearer and
-					# never refreshed by the CLI; the proxy overwrites it too. A
-					# non-inject instance mounts the real file, so the stub stays off.
-					stubWhenMissing = {
-						file = "/root/.claude/.credentials.json";
-						env = { ANTHROPIC_AUTH_TOKEN = "cogbox-host-injected-placeholder"; };
-					};
+					# No injected auth-token env var: the guest ALWAYS gets a present,
+					# redacted-scoped .credentials.json (stage_overlay_source stages a
+					# placeholder identity even on a staging failure), so claude-code
+					# reads the file -- the host proxy injects the real token over the
+					# stub, /remote-control's local-cred gate is satisfied, and an
+					# in-guest /login can write its OWN token over the placeholder
+					# (which then persists per-instance and stops host inheritance).
+					# An auth-token env var would shadow the file, breaking all three.
 				};
 				paths = {
 					config = {
@@ -299,21 +292,7 @@
 						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") (l7CaEnv // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
-						# Optional cred-inject fallback: export placeholder auth env
-						# only when the harness's token file is absent from the guest.
-						# Under injection the file is normally REDACTED in place (so
-						# present); this fires only if staging the sanitized file
-						# failed. See stubWhenMissing / stage_overlay_source.
-						stub = h.launcher.stubWhenMissing or null;
-						stubBlock = lib.optionalString (stub != null) (
-							"if [ ! -e ${lib.escapeShellArg stub.file} ]; then\n"
-							+ lib.concatMapStrings
-								(kv: "  export ${kv}\n")
-								(lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") stub.env)
-							+ "fi\n"
-						);
 					in "#!${pkgs.runtimeShell}\n"
-						+ stubBlock
 						+ ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
 						+ "\n"
 				);

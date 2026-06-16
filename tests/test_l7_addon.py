@@ -184,6 +184,22 @@ check(m.should_inject(CIDict({"X-Api-Key": STUB}), "anthropic-apikey", STUB),
 check(not m.should_inject(CIDict({"X-Api-Key": "real-secondary"}), "anthropic-apikey", STUB),
       "should_inject: apikey pass through non-stub key")
 
+# Single-source the stub token. The placeholder the redactor writes, the
+# fallback write_stub_cred, and the inject-conf stub_token MUST all derive from
+# harness_stub_token -- a drift (as the old ANTHROPIC_AUTH_TOKEN env stub had,
+# missing the sk-ant-oat01- prefix) makes should_inject fail to recognize the
+# guest's placeholder, breaking the inherit-only-over-placeholder invariant. The
+# literal must appear exactly once in the launcher (harness_stub_token's def);
+# everything else references the function. And it must not survive in flake.nix.
+with open(os.path.join(HERE, "..", "cogbox-launch.sh")) as _f:
+    _launch = _f.read()
+check(_launch.count("sk-ant-oat01-cogbox-host-injected-placeholder") == 1,
+      "stub token literal is single-sourced in harness_stub_token (no drift)")
+with open(os.path.join(HERE, "..", "flake.nix")) as _f:
+    _flake = _f.read()
+check("ANTHROPIC_AUTH_TOKEN" not in _flake,
+      "no ANTHROPIC_AUTH_TOKEN env stub in the launcher (would shadow the cred file)")
+
 # CredStore: conf + cred file, host normalization, mtime hot-reload, fail-closed
 import json as _json
 import tempfile
