@@ -394,10 +394,17 @@
 					lib.nameValuePair "${p.harness}-${p.pathkey}" {
 						description = "Copy ${p.harness}/${p.pathkey} from fw_cfg";
 						wantedBy = [ "multi-user.target" ];
-						before = [ "multi-user.target" ];
+						# Order BEFORE sshd: otherwise a client that connects the moment
+						# sshd is up (ttyd -> cogbox ssh ... c) can read this file while
+						# the cp below is still writing it, which surfaces as
+						# "<file> contains invalid JSON" on the first harness launch
+						# (later launches see the finished file). Mirrors cogbox-l7-trust.
+						before = [ "multi-user.target" "sshd.service" ];
 						serviceConfig = {
 							Type = "oneshot";
-							ExecStart = "/bin/sh -c 'cp /sys/firmware/qemu_fw_cfg/by_name/opt/${tag p.harness p.pathkey}/raw ${p.guest} && chmod ${p.mode} ${p.guest}'";
+							# Write to a temp then rename so the target appears atomically
+							# (whole file or nothing), never a half-written partial.
+							ExecStart = "/bin/sh -c 'cp /sys/firmware/qemu_fw_cfg/by_name/opt/${tag p.harness p.pathkey}/raw ${p.guest}.tmp && chmod ${p.mode} ${p.guest}.tmp && mv ${p.guest}.tmp ${p.guest}'";
 							RemainAfterExit = true;
 						};
 					}
