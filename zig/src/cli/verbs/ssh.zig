@@ -122,31 +122,78 @@ pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []co
 /// user's agent and default keys -- so a user who authorized their own key keeps
 /// working even if the cogbox key is absent from authorized_keys.
 ///
+/// A `-t` is inserted before the target for a fully interactive remote command
+/// (a command is present and both local stdin and stdout are ttys) so remote
+/// TUIs get a PTY; see `wantPty` for the gating rationale.
+///
 /// ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-///     -o LogLevel=ERROR [-i <identity>] -p <port> root@<host> [extra...]
+///     -o LogLevel=ERROR [-i <identity>] -p <port> [-t] root@<host> [extra...]
 pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, identity: ?[]const u8, extra: []const []const u8) !void {
-	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{endpoint.host});
-	defer allocator.free(target);
+	// The two isatty() calls are this function's only impurity; evaluate them
+	// here and delegate the decision to the pure, unit-tested `wantPty`.
+	const force_pty = wantPty(
+		extra,
+		std.c.isatty(std.posix.STDIN_FILENO) != 0,
+		std.c.isatty(std.posix.STDOUT_FILENO) != 0,
+	);
 
 	var ssh_argv: std.ArrayList([]const u8) = .empty;
 	defer ssh_argv.deinit(allocator);
-	try ssh_argv.append(allocator, "ssh");
-	try ssh_argv.append(allocator, "-o");
-	try ssh_argv.append(allocator, "StrictHostKeyChecking=no");
-	try ssh_argv.append(allocator, "-o");
-	try ssh_argv.append(allocator, "UserKnownHostsFile=/dev/null");
-	try ssh_argv.append(allocator, "-o");
-	try ssh_argv.append(allocator, "LogLevel=ERROR");
-	if (identity) |id| {
-		try ssh_argv.append(allocator, "-i");
-		try ssh_argv.append(allocator, id);
-	}
-	try ssh_argv.append(allocator, "-p");
-	try ssh_argv.append(allocator, endpoint.port);
-	try ssh_argv.append(allocator, target);
-	for (extra) |t| try ssh_argv.append(allocator, t);
+	try buildArgv(allocator, &ssh_argv, endpoint, identity, extra, force_pty);
 
 	try execvpAlloc(allocator, ssh_argv.items);
+}
+
+/// Whether to request a remote PTY (a single `ssh -t`) for this invocation.
+/// True only for a *fully interactive* remote command: a command is present
+/// (`extra.len > 0`) AND both local stdin and stdout are terminals.
+///
+/// Without `-t`, `ssh host cmd` runs cmd over pipes (no tty) and screen apps
+/// like htop / claude-code refuse to start. The command gate keeps the
+/// no-command interactive login -- which ssh already gives a PTY -- on its
+/// existing path (so `cogbox start` auto-ssh, which passes empty `extra`, is
+/// untouched). Requiring BOTH ends be ttys is what protects
+/// `cogbox ssh host cat f | downstream` and `... > file`: a shell pipeline
+/// redirects only stdout while stdin stays a tty, so gating on stdin alone
+/// would still force a PTY and let its line discipline mangle the bytes
+/// (LF->CRLF, control cooking). A single `-t` (never `-tt`) is deliberate --
+/// `-tt` would force a PTY even with no local tty at all.
+fn wantPty(extra: []const []const u8, stdin_is_tty: bool, stdout_is_tty: bool) bool {
+	return extra.len > 0 and stdin_is_tty and stdout_is_tty;
+}
+
+/// Append the full `ssh ...` argv for `endpoint` into `argv`. When `force_pty`
+/// is set a single `-t` is inserted just before the `root@host` target (an ssh
+/// option must precede the host) so ssh allocates a remote PTY; see `wantPty`
+/// for when `force_pty` is set. The target string and the list's backing are
+/// owned by `allocator`; on the normal path `exec` hands `argv` straight to
+/// execvp, so they live until this process is replaced. Split out from `exec`
+/// so the `-t` placement is unit-testable without a real exec or a local tty.
+fn buildArgv(
+	allocator: std.mem.Allocator,
+	argv: *std.ArrayList([]const u8),
+	endpoint: Endpoint,
+	identity: ?[]const u8,
+	extra: []const []const u8,
+	force_pty: bool,
+) !void {
+	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{endpoint.host});
+	try argv.append(allocator, "ssh");
+	try argv.append(allocator, "-o");
+	try argv.append(allocator, "StrictHostKeyChecking=no");
+	try argv.append(allocator, "-o");
+	try argv.append(allocator, "UserKnownHostsFile=/dev/null");
+	try argv.append(allocator, "-o");
+	try argv.append(allocator, "LogLevel=ERROR");
+	if (identity) |id| {
+		try argv.append(allocator, "-i");
+		try argv.append(allocator, id);
+	}
+	try argv.append(allocator, "-p");
+	try argv.append(allocator, endpoint.port);
+	if (force_pty) try argv.append(allocator, "-t");
+	try argv.append(allocator, target);
+	for (extra) |t| try argv.append(allocator, t);
 }
 
 /// Path to cogbox's managed SSH identity (`<data>/cogbox_ed25519`), or null if
@@ -220,4 +267,94 @@ pub fn execvpAlloc(allocator: std.mem.Allocator, argv: []const []const u8) !void
 	_ = execvp(prog.ptr, argv_ptr);
 	// If execvp returns, it failed.
 	return error.ExecvpFailed;
+}
+
+const testing = std.testing;
+
+fn argvCount(argv: []const []const u8, needle: []const u8) usize {
+	var n: usize = 0;
+	for (argv) |a| {
+		if (std.mem.eql(u8, a, needle)) n += 1;
+	}
+	return n;
+}
+
+fn argvIndex(argv: []const []const u8, needle: []const u8) ?usize {
+	for (argv, 0..) |a, i| {
+		if (std.mem.eql(u8, a, needle)) return i;
+	}
+	return null;
+}
+
+test "buildArgv adds a single -t before the target only when force_pty" {
+	var arena = std.heap.ArenaAllocator.init(testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const ep: Endpoint = .{ .port = "2222", .host = "10.0.2.15" };
+
+	// Interactive remote command -> exactly one `-t`, placed before root@host,
+	// with the remote command still trailing the target.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{"tty"}, true);
+		try testing.expectEqual(@as(usize, 1), argvCount(argv.items, "-t"));
+		const t_i = argvIndex(argv.items, "-t").?;
+		const host_i = argvIndex(argv.items, "root@10.0.2.15").?;
+		try testing.expect(t_i < host_i);
+		try testing.expect(argvIndex(argv.items, "tty").? > host_i);
+	}
+
+	// Piped / non-interactive (force_pty=false) -> no `-t`, command still sent.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{"tty"}, false);
+		try testing.expectEqual(@as(usize, 0), argvCount(argv.items, "-t"));
+		try testing.expect(argvIndex(argv.items, "tty") != null);
+	}
+
+	// Interactive login (no remote command) -> caller passes empty extra and
+	// force_pty=false; no `-t` (ssh allocates the login PTY itself) and the
+	// target is the last argv element.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{}, false);
+		try testing.expectEqual(@as(usize, 0), argvCount(argv.items, "-t"));
+		try testing.expectEqualStrings("root@10.0.2.15", argv.items[argv.items.len - 1]);
+	}
+
+	// Identity is forwarded as `-i <path>`.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, "/data/cogbox_ed25519", &.{}, false);
+		const i_i = argvIndex(argv.items, "-i").?;
+		try testing.expectEqualStrings("/data/cogbox_ed25519", argv.items[i_i + 1]);
+	}
+
+	// A multi-element command is appended in order as the argv tail, immediately
+	// after the target (and after `-t` when a PTY is forced).
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		const cmd = [_][]const u8{ "uname", "-a" };
+		try buildArgv(a, &argv, ep, null, &cmd, true);
+		const host_i = argvIndex(argv.items, "root@10.0.2.15").?;
+		try testing.expectEqual(cmd.len, argv.items.len - (host_i + 1));
+		for (cmd, 0..) |want, j| {
+			try testing.expectEqualStrings(want, argv.items[host_i + 1 + j]);
+		}
+	}
+}
+
+test "wantPty: only a remote command with both stdin+stdout ttys forces a PTY" {
+	// No remote command -> never (even with both ttys); ssh gives the
+	// no-command login its own PTY, and `cogbox start` auto-ssh passes empty.
+	try testing.expect(!wantPty(&.{}, true, true));
+	// Fully interactive remote command (terminal on both ends) -> yes.
+	try testing.expect(wantPty(&.{"htop"}, true, true));
+	// Output piped/redirected (`cmd | downstream`, `cmd > file`) -> no, so the
+	// remote PTY's line discipline cannot mangle the bytes.
+	try testing.expect(!wantPty(&.{"cat"}, true, false));
+	// Input piped (`printf '' | cogbox ssh host cmd`) -> no.
+	try testing.expect(!wantPty(&.{"cat"}, false, true));
+	// Fully non-interactive (scripted) -> no.
+	try testing.expect(!wantPty(&.{"cat"}, false, false));
 }

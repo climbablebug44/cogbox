@@ -184,6 +184,20 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_cli_tests = b.addRunArtifact(cli_tests);
 
+	// Verb tests. Rooted at src/cli/tests.zig (the cli module root) so verb
+	// files that import ../util.zig etc. resolve; links libc for the libc
+	// externs (execvp, isatty) the ssh verb uses.
+	const cli_verbs_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/cli/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+		.link_libc = true,
+	});
+	const cli_verbs_tests = b.addTest(.{
+		.root_module = cli_verbs_test_mod,
+	});
+	const run_cli_verbs_tests = b.addRunArtifact(cli_verbs_tests);
+
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_filter_tests.step);
 	test_step.dependOn(&run_socks5_tests.step);
@@ -193,4 +207,5 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_l7_tests.step);
 	test_step.dependOn(&run_plugin_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
+	test_step.dependOn(&run_cli_verbs_tests.step);
 }

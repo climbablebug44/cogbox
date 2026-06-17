@@ -286,6 +286,11 @@ pub const SSH =
 	\\authorized in the guest automatically, so it works out of the box. This is
 	\\additive: your agent and ~/.ssh keys are still offered too.
 	\\
+	\\A remote command run from an interactive terminal (stdin and stdout both a
+	\\tty) gets a PTY (ssh -t), so TUIs like htop or claude-code render and accept
+	\\input. When output is piped or redirected, no PTY is forced and bytes stream
+	\\through untouched (e.g. `cogbox ssh -- cat f | sha256sum`).
+	\\
 	\\Examples:
 	\\  cogbox ssh                          Open an interactive shell
 	\\  cogbox ssh -- htop                  Run htop on the default instance

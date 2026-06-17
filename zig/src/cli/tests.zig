@@ -1,0 +1,9 @@
+//! Test aggregator for cogbox CLI verbs.
+//!
+//! Rooted at src/cli/ (not inside verbs/) so that verb files which reach up to
+//! ../util.zig, ../parse.zig, etc. resolve within the module root. Each
+//! `_ = @import(...)` pulls that file's `test` blocks into the test binary.
+
+test {
+	_ = @import("verbs/ssh.zig");
+}
