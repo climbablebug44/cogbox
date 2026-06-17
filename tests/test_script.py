@@ -94,6 +94,21 @@ with subtest("Phase A: CLI / state without booting"):
     machine.succeed("test -f /home/testuser/.config/cogbox/instances/default/config.json")
     machine.succeed("test -f /home/testuser/.config/cogbox/authorized_keys")
     machine.succeed("test -d /home/testuser/.local/share/cogbox/instances/default")
+    # cogbox generates its own SSH identity (the default key for `cogbox ssh`),
+    # owned by the user with 0600 perms, in the data-dir root (never mounted
+    # into a VM). The ownership/mode checks must observe the file as the user,
+    # not as root: `test -O` compares against the *effective* uid, so a bare
+    # machine.succeed (root) would never confirm testuser ownership.
+    machine.succeed("test -f /home/testuser/.local/share/cogbox/cogbox_ed25519")
+    machine.succeed("test -f /home/testuser/.local/share/cogbox/cogbox_ed25519.pub")
+    owner = machine.succeed(
+        "stat -c %U /home/testuser/.local/share/cogbox/cogbox_ed25519"
+    ).strip()
+    assert owner == "testuser", f"cogbox key owned by {owner!r}, expected testuser"
+    mode = machine.succeed(
+        "stat -c %a /home/testuser/.local/share/cogbox/cogbox_ed25519"
+    ).strip()
+    assert mode == "600", f"cogbox key mode {mode!r}, expected 600"
     machine.succeed("test -f /home/testuser/.claude.json")
     machine.succeed("test -d /home/testuser/.claude")
     machine.succeed("test -d /home/testuser/.config/opencode")
@@ -168,6 +183,15 @@ with subtest("Phase B: --network none blocks all outbound"):
     assert "(running)" in out, out
     hostname = machine.succeed(as_user("cogbox ssh hostname")).strip()
     assert hostname == "cogbox-default", f"unexpected inner hostname {hostname!r}"
+    # The cogbox key alone must authenticate: this proves its pubkey was unioned
+    # into the guest authorized_keys (and that `cogbox ssh` would use it as the
+    # default identity). IdentitiesOnly=yes offers ONLY the cogbox key, so this
+    # does not piggyback on the testuser key copied in above.
+    machine.succeed(as_user(
+        f"ssh {SSH_OPTS} -o IdentitiesOnly=yes "
+        "-i /home/testuser/.local/share/cogbox/cogbox_ed25519 "
+        "-p 2222 root@127.0.0.1 true"
+    ))
     machine.fail(probe(None, "10.99.0.1"))
     machine.fail(probe(None, "10.99.0.2"))
     stop_instance("cc-default")

@@ -311,6 +311,14 @@
 				environment.variables = l7CaEnv;
 
 				services.openssh.enable = true;
+				# `cogbox ssh` offers its own on-disk key additively, after the
+				# user's agent and ~/.ssh identities (an on-disk -i key is tried
+				# after agent keys). On a busy agent the default 6 attempts can be
+				# exhausted before the cogbox key is reached, so the out-of-the-box
+				# default would spuriously fail. This guest is a local, ephemeral,
+				# single-user sandbox (sshd bound to 127.0.0.1), so a generous cap
+				# is safe.
+				services.openssh.settings.MaxAuthTries = 50;
 
 				environment.systemPackages = with pkgs; [
 					git

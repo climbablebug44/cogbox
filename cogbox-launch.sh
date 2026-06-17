@@ -18,7 +18,8 @@
 #   --mem N               Memory MB override.
 #   --network MODE        full|none|rules. If absent, fall back to config.json.
 #   --init-only           Run init steps but do not start the VM.
-#   --no-auto-keys        On first init, leave authorized_keys empty.
+#   --no-auto-keys        On first init, leave authorized_keys empty and skip
+#                         generating cogbox's own SSH identity.
 #   --yes                 Skip the interactive harness-selection prompt.
 INIT_ONLY=0
 FLAG_VCPU=""
@@ -87,6 +88,19 @@ die() {
 	exit "${2:-70}"
 }
 
+# Generate cogbox's own SSH keypair ($COGBOX_SSH_KEY{,.pub}) once, host-side, so
+# `cogbox ssh` has a default identity that works out of the box without relying
+# on the user's personal keys or agent. Idempotent: a no-op if the key already
+# exists. Tolerant of a missing ssh-keygen (just contributes nothing). The
+# pubkey is unioned into each VM's authorized_keys at launch time; the private
+# key stays on the host (the data-dir root is never mounted into a VM).
+ensure_cogbox_key() {
+	[ -f "$COGBOX_SSH_KEY" ] && return 0
+	command -v ssh-keygen >/dev/null 2>&1 || return 0
+	mkdir -p "$BASE_DATA"
+	ssh-keygen -t ed25519 -N '' -C "cogbox" -f "$COGBOX_SSH_KEY" >/dev/null 2>&1 || true
+}
+
 # -- Resolve real user for sudo context ----------------------------
 # Trust SUDO_USER ONLY when we are actually running as root: that is the genuine
 # `sudo cogbox` case, where we act on behalf of the invoking user and chown the
@@ -111,6 +125,16 @@ fi
 # -- Paths (XDG basedir spec) --------------------------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/cogbox"
 BASE_DATA="${COGBOX_DATA:-${XDG_DATA_HOME:-$REAL_HOME/.local/share}/cogbox}"
+# cogbox's own SSH identity, used as the default key for `cogbox ssh`. It lives
+# in the data-dir root -- a sibling of instances/, which is the only subtree
+# mounted into a VM -- so the private key never enters the sandbox. The Zig
+# `ssh`/`start` verbs derive the same path; keep the basename in sync.
+COGBOX_SSH_KEY="$BASE_DATA/cogbox_ed25519"
+# Marker written when --no-auto-keys is chosen at first init. It makes that
+# opt-out durable: without it a later plain `cogbox start` (AUTO_KEYS defaults
+# to 1) would silently generate and authorize the key, re-enabling SSH the user
+# opted out of. To opt in later, remove this file; to rotate, remove the key.
+COGBOX_KEY_OPTOUT="$CONFIG_DIR/no-cogbox-key"
 
 # Fail fast on an identity/permission mismatch instead of cascading mkdir/write
 # failures into a corrupt half-init (and a misleading "invalid JSON" at start).
@@ -598,6 +622,9 @@ if [ ! -f "$CONFIG_DIR/authorized_keys" ]; then
 		ITEMS+=("$CONFIG_DIR/authorized_keys  (SSH public keys, empty)")
 	fi
 fi
+if [ "$AUTO_KEYS" -eq 1 ] && [ ! -f "$COGBOX_SSH_KEY" ] && command -v ssh-keygen >/dev/null 2>&1; then
+	ITEMS+=("$COGBOX_SSH_KEY  (cogbox's own SSH key, the default identity for \`cogbox ssh\`)")
+fi
 if [ ! -d "$REAL_DATA" ]; then
 	ITEMS+=("$REAL_DATA/  (VM data${INSTANCE_NAME:+ for \"$INSTANCE_NAME\"})")
 fi
@@ -797,6 +824,9 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 			} | grep -v '^[[:space:]]*\(#\|$\)' | sort -u > "$CONFIG_DIR/authorized_keys"
 		else
 			touch "$CONFIG_DIR/authorized_keys"
+			# Record the opt-out so subsequent plain launches don't generate the
+			# cogbox key and re-authorize SSH access against the user's intent.
+			touch "$COGBOX_KEY_OPTOUT"
 		fi
 	fi
 	# Seed default content for fw_cfg paths (e.g. ~/.claude.json = '{}').
@@ -816,9 +846,20 @@ fi
 mkdir -p "$REAL_DATA/.config"
 printf '%s\n' "${ACTIVE_HARNESSES[@]}" > "$ACTIVE_HARNESSES_FILE"
 
+# Generate cogbox's own SSH key (idempotent). Runs every launch, not just first
+# init, so instances created before this feature gain it on the next start and a
+# deleted key is regenerated (rotation). Skipped under --no-auto-keys for this
+# launch, and permanently for a setup that opted out at init (the marker).
+if [ "$AUTO_KEYS" -eq 1 ] && [ ! -f "$COGBOX_KEY_OPTOUT" ]; then
+	ensure_cogbox_key
+fi
+
 # -- Fix file ownership after init under sudo ----------------------
 if [ "$SUDO_INVOCATION" = 1 ]; then
 	chown -R "$REAL_USER" "$CONFIG_DIR" "$REAL_DATA"
+	# The key lives in the data-dir root, outside the chown -R above; without
+	# this it would stay root-owned and ssh would refuse it as the real user.
+	[ -f "$COGBOX_SSH_KEY" ] && chown "$REAL_USER" "$COGBOX_SSH_KEY" "$COGBOX_SSH_KEY.pub"
 	for h in "${ACTIVE_HARNESSES[@]}"; do
 		while IFS= read -r k; do
 			[ -z "$k" ] && continue
@@ -928,11 +969,25 @@ fi
 mkdir -p "$REAL_DATA/.config"
 echo "$OVERLAY_SIZE" > "$REAL_DATA/.config/overlay-size"
 echo "$STORE_OVERLAY_SIZE" > "$REAL_DATA/.config/store-overlay-size"
+# The VM's authorized_keys is the user-managed file (per-instance override, else
+# the shared one) unioned with cogbox's own pubkey, so `cogbox ssh` works out of
+# the box. The union is keyed on the key file's existence, not the AUTO_KEYS
+# flag: once generated the key is always honored, and a --no-auto-keys-only
+# setup (no key file) gets exactly its user-provided keys.
 if [ -n "$INSTANCE_NAME" ] && [ -f "$INSTANCE_CONFIG_DIR/authorized_keys" ]; then
-	cp "$INSTANCE_CONFIG_DIR/authorized_keys" "$REAL_DATA/.config/authorized_keys"
+	AUTHKEYS_SRC="$INSTANCE_CONFIG_DIR/authorized_keys"
 else
-	cp "$CONFIG_DIR/authorized_keys" "$REAL_DATA/.config/authorized_keys"
+	AUTHKEYS_SRC="$CONFIG_DIR/authorized_keys"
 fi
+# The `echo` between the two sources forces a record boundary: a user-managed
+# authorized_keys with no trailing newline would otherwise splice its last key
+# onto the cogbox pubkey, corrupting both. The grep then drops the resulting
+# blank line(s) (and any comment/blank lines); sort -u dedupes.
+{
+	[ -f "$AUTHKEYS_SRC" ] && cat "$AUTHKEYS_SRC"
+	echo
+	[ -f "$COGBOX_SSH_KEY.pub" ] && cat "$COGBOX_SSH_KEY.pub"
+} | grep -v '^[[:space:]]*\(#\|$\)' | sort -u > "$REAL_DATA/.config/authorized_keys"
 
 # -- Set up runtime symlink directory for QEMU ---------------------
 # Single-starter guard. The lock lives beside (not inside) $RUNTIME so the

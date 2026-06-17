@@ -73,7 +73,10 @@ pub fn run(
 	for (parsed.trailing.items) |t| try extra.append(allocator, t);
 	for (parsed.positional.items) |t| try extra.append(allocator, t);
 
-	try exec(allocator, endpoint, extra.items);
+	const identity = defaultIdentity(allocator, io, p);
+	defer if (identity) |id| allocator.free(id);
+
+	try exec(allocator, endpoint, identity, extra.items);
 }
 
 /// SSH host:port for a running instance, read from <runtime>/ssh-endpoint.
@@ -114,9 +117,14 @@ pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []co
 /// key checking is disabled because the guest's root disk is ephemeral and its
 /// host keys regenerate on every boot.
 ///
+/// When `identity` is non-null it is passed as `-i <identity>`: cogbox's own
+/// managed key (see `defaultIdentity`). This is additive -- ssh still offers the
+/// user's agent and default keys -- so a user who authorized their own key keeps
+/// working even if the cogbox key is absent from authorized_keys.
+///
 /// ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-///     -o LogLevel=ERROR -p <port> root@<host> [extra...]
-pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, extra: []const []const u8) !void {
+///     -o LogLevel=ERROR [-i <identity>] -p <port> root@<host> [extra...]
+pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, identity: ?[]const u8, extra: []const []const u8) !void {
 	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{endpoint.host});
 	defer allocator.free(target);
 
@@ -129,12 +137,32 @@ pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, extra: []const []c
 	try ssh_argv.append(allocator, "UserKnownHostsFile=/dev/null");
 	try ssh_argv.append(allocator, "-o");
 	try ssh_argv.append(allocator, "LogLevel=ERROR");
+	if (identity) |id| {
+		try ssh_argv.append(allocator, "-i");
+		try ssh_argv.append(allocator, id);
+	}
 	try ssh_argv.append(allocator, "-p");
 	try ssh_argv.append(allocator, endpoint.port);
 	try ssh_argv.append(allocator, target);
 	for (extra) |t| try ssh_argv.append(allocator, t);
 
 	try execvpAlloc(allocator, ssh_argv.items);
+}
+
+/// Path to cogbox's managed SSH identity (`<data>/cogbox_ed25519`), or null if
+/// it does not exist. The launch script generates it host-side and unions its
+/// pubkey into each VM's authorized_keys, so passing it as the default `-i`
+/// makes `cogbox ssh` work without the user's personal keys. Best-effort: any
+/// error (alloc, missing file) yields null so ssh falls back to its defaults.
+/// The returned slice is owned by the caller.
+pub fn defaultIdentity(allocator: std.mem.Allocator, io: std.Io, p: *const paths.Paths) ?[]const u8 {
+	const key_path = std.fs.path.join(allocator, &.{ p.base_data, "cogbox_ed25519" }) catch return null;
+	const cwd = std.Io.Dir.cwd();
+	cwd.access(io, key_path, .{}) catch {
+		allocator.free(key_path);
+		return null;
+	};
+	return key_path;
 }
 
 fn nameFlag(parsed: *const parse.Parsed, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {

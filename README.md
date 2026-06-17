@@ -39,6 +39,7 @@ Choice [1-4, comma-separated for multiple]:
 The following paths will be created:
   ~/.config/cogbox/instances/default/config.json  (default settings)
   ~/.config/cogbox/authorized_keys  (SSH public keys; seeded from ~/.ssh/*.pub + ssh-add -L)
+  ~/.local/share/cogbox/cogbox_ed25519  (cogbox's own SSH key, the default identity for `cogbox ssh`)
   ~/.local/share/cogbox/instances/default/  (VM data)
   ...
 
@@ -140,7 +141,7 @@ Run `cogbox VERB --help` for verb-specific options.
 | `--vcpu N` | `start`, `init` | vCPU count (default: config.json or 16) |
 | `--mem N` | `start`, `init` | RAM in MB (default: config.json or 32768) |
 | `--network MODE` | `start`, `init` | `full`, `none`, or `rules` (default: rules) |
-| `--no-auto-keys` | `start`, `init` | Leave `authorized_keys` empty instead of seeding |
+| `--no-auto-keys` | `start`, `init` | Leave `authorized_keys` empty instead of seeding, and skip generating cogbox's own SSH key |
 | `--force` | `stop` | Send SIGKILL after 10s if SIGTERM doesn't exit the process |
 | `--json` | `list` | Emit one JSON object per instance |
 
@@ -245,6 +246,22 @@ any keys in the running ssh-agent; pass `--no-auto-keys` to keep it
 empty. A per-instance `instances/<name>/authorized_keys` overrides the
 shared file. Without SSH keys, the VM console is accessible directly
 (root autologin is enabled).
+
+In addition, cogbox manages its own keypair at
+`~/.local/share/cogbox/cogbox_ed25519` and unions its public key into
+every guest's `authorized_keys` at launch, so `cogbox ssh` connects out
+of the box without relying on your personal keys. It passes this key as
+its default `-i` identity, offered *in addition to* your agent and
+`~/.ssh` keys, not instead of them. The private key stays on the host --
+it lives beside, not inside, the per-instance data mounted into a VM, and
+is reused across all instances.
+
+`--no-auto-keys` at first init skips generating this key and records the
+opt-out (at `~/.config/cogbox/no-cogbox-key`), so a later plain `cogbox
+start` won't silently re-create it -- the guest stays reachable only via
+the console. To opt back in, remove that marker. To rotate the key,
+delete `~/.local/share/cogbox/cogbox_ed25519*`; the next launch (without
+`--no-auto-keys`) regenerates it.
 
 ### Extending the guest
 

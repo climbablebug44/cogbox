@@ -24,12 +24,14 @@ Each instance has its own config dir under `~/.config/cogbox/instances/<name>/`.
       authorized_keys          # optional per-instance SSH keys
 ```
 
-SSH keys fall back to the shared top-level `authorized_keys` unless a per-instance file exists.
+SSH keys fall back to the shared top-level `authorized_keys` unless a per-instance file exists. At launch, cogbox's own public key (`~/.local/share/cogbox/cogbox_ed25519.pub`, see below) is unioned into whichever file is used, so `cogbox ssh` always has an authorized identity.
 
 Data (VM state, overlays) is stored per-instance under `~/.local/share/cogbox/instances/<name>/`. All instances are siblings, so a default-instance boot does not 9p-share named-instance state into the default guest:
 
 ```
 ~/.local/share/cogbox/
+  cogbox_ed25519             # cogbox's own SSH key; default identity for `cogbox ssh`
+  cogbox_ed25519.pub         # its pubkey, unioned into each guest's authorized_keys
   instances/
     default/
       harness-overlay.img      # shared ext4 overlay for all harnesses
@@ -37,6 +39,8 @@ Data (VM state, overlays) is stored per-instance under `~/.local/share/cogbox/in
     work/
       harness-overlay.img
 ```
+
+The keypair sits in the data-dir root, a sibling of `instances/`. Only `instances/<name>/` is 9p-mounted into a guest, so the private key never enters the sandbox. It is generated automatically and reused across all instances; generation is idempotent and re-runs on every launch, so an existing setup gains the key on upgrade and a deleted key is regenerated. `--no-auto-keys` at first init skips generation and writes a durable opt-out marker (`~/.config/cogbox/no-cogbox-key`) so a later plain launch does not re-create the key. The Zig `ssh` and `start` verbs pass it as `ssh -i <data>/cogbox_ed25519`, additively -- the user's agent and `~/.ssh` keys are still offered.
 
 ## Runtime directory and 9p shares
 

@@ -205,7 +205,8 @@ pub fn run(
 			util.die(allocator, io, "start", exit_codes.software, "SSH did not become available within {d}s (the VM is still running; check {s}, then 'cogbox ssh').", .{ @divTrunc(ssh_wait_ms, 1000), log_path });
 		}
 
-		ssh.exec(allocator, endpoint, &.{}) catch |err| {
+		const identity = ssh.defaultIdentity(allocator, io, p);
+		ssh.exec(allocator, endpoint, identity, &.{}) catch |err| {
 			util.die(allocator, io, "start", exit_codes.software, "could not exec ssh: {s} (VM is running; try 'cogbox ssh')", .{@errorName(err)});
 		};
 		return;

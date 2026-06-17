@@ -93,7 +93,8 @@ pub const START =
 	\\  --mem N               RAM in megabytes (default: 32768; or from config.json)
 	\\  --network MODE        Network mode: full, none, or rules (default: rules)
 	\\  --no-auto-keys        On first init, leave authorized_keys empty instead of
-	\\                        seeding from ~/.ssh/*.pub and ssh-add -L
+	\\                        seeding from ~/.ssh/*.pub and ssh-add -L, and skip
+	\\                        generating cogbox's own SSH key
 	\\  -y, --yes             Skip the harness-selection prompt on first init
 	\\  -h, --help            Show this help and exit
 	\\
@@ -280,6 +281,10 @@ pub const SSH =
 	\\Reads the live SSH host:port from <runtime>/ssh-endpoint, so it works
 	\\even with auto-assigned ports. Disables host-key checking since the
 	\\guest's root disk is ephemeral and host keys regenerate every boot.
+	\\
+	\\Connects with cogbox's own key (<data>/cogbox_ed25519), generated and
+	\\authorized in the guest automatically, so it works out of the box. This is
+	\\additive: your agent and ~/.ssh keys are still offered too.
 	\\
 	\\Examples:
 	\\  cogbox ssh                          Open an interactive shell
