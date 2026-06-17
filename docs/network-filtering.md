@@ -214,7 +214,7 @@ Terminate caveats:
 
 ### Per-instance ports
 
-The proxy and its mitmproxy terminate backend bind **per-instance** loopback ports (a contiguous triple from each instance's `l7PortBase` in config.json, default 18443: TLS funnel / HTTP funnel / terminate hop), so several L7-enabled instances run on one host without one instance's guest traffic funnelling into another's proxy. Named instances auto-assign disjoint triples at init. If the proxy can't bind its ports (a stale proxy or another process holding them), `cogbox start` **aborts** rather than booting a VM whose funnel can't reach its proxy.
+The proxy and its mitmproxy terminate backend bind **per-instance** loopback ports (a contiguous triple from each instance's `l7PortBase` in config.json, default 18443: TLS funnel / HTTP funnel / terminate hop), so several L7-enabled instances run on one host without one instance's guest traffic funnelling into another's proxy. Named instances auto-assign disjoint triples at init -- but only disjoint among *one user's* instances. Because the triple binds the host's shared loopback, a different user's instance (or any process) can hold it on a multi-user host, so at launch `cogbox start` probes the triple and, if it is taken, slides to the next free triple and persists it back to config.json (`cogbox-launch: L7 port base ... in use; using ... instead.` in the log). Only if the proxy still can't bind -- e.g. a port grabbed in the race between probe and bind -- does `cogbox start` **abort** rather than boot a VM whose funnel can't reach its proxy.
 
 ### L7 verb reference
 

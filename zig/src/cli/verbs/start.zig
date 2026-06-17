@@ -160,7 +160,7 @@ pub fn run(
 
 	const cwd = std.Io.Dir.cwd();
 	if (!waitForFileOrDeath(io, pid, cwd, qemu_pid_path, 60_000)) {
-		util.die(allocator, io, "start", exit_codes.software, "VM did not come up. See {s} for details.", .{log_path});
+		dieVmFailure(allocator, io, log_path, "VM did not come up.");
 	}
 
 	if (opts.foreground) {
@@ -200,7 +200,7 @@ pub fn run(
 		if (!waitForSshOrDeath(io, pid, endpoint.host, endpoint.port, ssh_wait_ms)) {
 			var dead: c_int = 0;
 			if (waitpid(pid, &dead, WNOHANG) == pid) {
-				util.die(allocator, io, "start", exit_codes.software, "VM exited during boot. See {s} for details.", .{log_path});
+				dieVmFailure(allocator, io, log_path, "VM exited during boot.");
 			}
 			util.die(allocator, io, "start", exit_codes.software, "SSH did not become available within {d}s (the VM is still running; check {s}, then 'cogbox ssh').", .{ @divTrunc(ssh_wait_ms, 1000), log_path });
 		}
@@ -315,6 +315,48 @@ fn probeSsh(sin: *const posix.sockaddr.in) bool {
 	var buf: [16]u8 = undefined;
 	const n = posix.read(fd, &buf) catch return false;
 	return n >= 4 and std.mem.startsWith(u8, buf[0..n], "SSH-");
+}
+
+/// Report a boot failure, inlining the tail of the daemon log so the real
+/// cause (e.g. "L7 proxy failed to bind 127.0.0.1:18443") is visible in the
+/// terminal -- not just pointed at via a path. The launcher now preserves
+/// cogbox.log on a failed start, so the tail is reliably present. `reason` is
+/// a comptime literal so it can be concatenated into the format string.
+fn dieVmFailure(allocator: std.mem.Allocator, io: std.Io, log_path: []const u8, comptime reason: []const u8) noreturn {
+	const tail = logTail(allocator, io, log_path);
+	if (tail.len > 0) {
+		util.die(allocator, io, "start", exit_codes.software, reason ++ " Last lines of {s}:\n{s}", .{ log_path, tail });
+	}
+	util.die(allocator, io, "start", exit_codes.software, reason ++ " See {s} for details.", .{log_path});
+}
+
+/// Read up to the last ~15 lines of `path`. Returns an owned slice, or "" when
+/// the file is missing/unreadable (caller treats "" as "no detail available").
+/// We seek to a fixed-size tail window first so a large log still yields its
+/// last lines -- allocRemaining errors out (returning nothing) once a limit is
+/// exceeded, so reading the whole file would silently drop the tail on big logs.
+fn logTail(allocator: std.mem.Allocator, io: std.Io, path: []const u8) []const u8 {
+	const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return "";
+	defer file.close(io);
+	const window: u64 = 16 * 1024;
+	var buf: [16 * 1024]u8 = undefined;
+	var reader = file.reader(io, &buf);
+	const size = reader.getSize() catch return "";
+	if (size > window) reader.seekTo(size - window) catch return "";
+	// Reading from the (possibly seeked) position to EOF spans at most `window`
+	// bytes, so the limit is never hit and allocRemaining returns the data.
+	const data = reader.interface.allocRemaining(allocator, .limited(window + 1)) catch return "";
+	const trimmed = std.mem.trim(u8, data, " \t\r\n");
+	const max_lines: usize = 15;
+	var seen: usize = 0;
+	var idx: usize = trimmed.len;
+	while (idx > 0) : (idx -= 1) {
+		if (trimmed[idx - 1] == '\n') {
+			seen += 1;
+			if (seen >= max_lines) break;
+		}
+	}
+	return trimmed[idx..];
 }
 
 fn isRunning(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) bool {

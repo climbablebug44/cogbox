@@ -92,7 +92,11 @@ nix run github:illustris/cogbox -- list
 Ports are auto-assigned when an instance is first created (default starts
 at SSH 2222 / HTTP 8080; each new instance increments by one), including a
 per-instance L7 port triple (`l7PortBase`). Override by editing the
-instance config.
+instance config. Those values are only kept disjoint among *your own*
+instances; on a shared multi-user host another user's instance may already
+hold them (passt and the L7 proxy bind the host's shared loopback). When that
+happens, `cogbox start` slides each conflicting port/triple to the next free
+one at launch and persists the new value back to the instance config.
 
 Harness authentication and base config are shared across all instances;
 each instance overlays its own changes on top, so per-instance harness
