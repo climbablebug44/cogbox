@@ -276,11 +276,19 @@ pub const SSH =
 	\\
 	\\Options:
 	\\  -n, --name NAME       Instance name (default: "default")
+	\\      --wait-for-ssh    Wait for the guest's sshd to accept connections
+	\\                        before connecting (no-op once it is up)
+	\\      --wait-timeout N  Seconds to wait with --wait-for-ssh (default: 180)
 	\\  -h, --help            Show this help and exit
 	\\
 	\\Reads the live SSH host:port from <runtime>/ssh-endpoint, so it works
 	\\even with auto-assigned ports. Disables host-key checking since the
 	\\guest's root disk is ephemeral and host keys regenerate every boot.
+	\\
+	\\--wait-for-ssh polls the guest's sshd until it is ready (or the VM dies, or
+	\\the timeout elapses) before connecting, closing the cold-boot race in
+	\\`cogbox start --no-ssh ... && cogbox ssh --wait-for-ssh ... cmd`. Put it
+	\\before any remote command (it is a flag, not part of the command).
 	\\
 	\\Connects with cogbox's own key (<data>/cogbox_ed25519), generated and
 	\\authorized in the guest automatically, so it works out of the box. This is
@@ -295,6 +303,7 @@ pub const SSH =
 	\\  cogbox ssh                          Open an interactive shell
 	\\  cogbox ssh -- htop                  Run htop on the default instance
 	\\  cogbox ssh --name work -- uname -a  Run on the "work" instance
+	\\  cogbox ssh --wait-for-ssh -- c      Wait for sshd, then run c (cold boot)
 	\\
 ;
 

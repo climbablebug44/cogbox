@@ -20,6 +20,8 @@ pub fn run(
 ) !void {
 	const flags = [_]parse.Flag{
 		.{ .long = "name", .short = 'n', .kind = .value },
+		.{ .long = "wait-for-ssh", .kind = .bool },
+		.{ .long = "wait-timeout", .kind = .value },
 		.{ .long = "help", .short = 'h', .kind = .bool },
 	};
 	var parsed = parse.parse(allocator, io, .{
@@ -33,6 +35,12 @@ pub fn run(
 	if (parsed.isSet("help")) {
 		try help.print(io, help.SSH);
 		return;
+	}
+
+	// --wait-timeout only means anything alongside --wait-for-ssh; reject it on
+	// its own rather than silently ignoring a misremembered/typo'd value.
+	if (parsed.isSet("wait-timeout") and !parsed.isSet("wait-for-ssh")) {
+		util.die(allocator, io, "ssh", exit_codes.usage, "--wait-timeout requires --wait-for-ssh.", .{});
 	}
 
 	const name = nameFlag(&parsed, allocator, io);
@@ -64,6 +72,29 @@ pub fn run(
 		error.OutOfMemory => return error.OutOfMemory,
 	};
 	defer endpoint.deinit(allocator);
+
+	// --wait-for-ssh: poll the guest's sshd until it answers (or the VM dies, or
+	// the timeout elapses) before exec'ing ssh. Closes the cold-boot race in
+	// `cogbox start --no-ssh ... && cogbox ssh --wait-for-ssh ... cmd`; a no-op
+	// once sshd is up (the first probe connects and we proceed immediately).
+	if (parsed.isSet("wait-for-ssh")) {
+		const wait_ms: i64 = if (parsed.get("wait-timeout")) |s|
+			@as(i64, parse.parseIntRange(s, 1, 86_400) catch
+				util.die(allocator, io, "ssh", exit_codes.dataerr, "--wait-timeout must be an integer number of seconds (1-86400)", .{})) * 1000
+		else
+			180_000;
+
+		// isRunning above already confirmed the pid file; re-read it for the wait.
+		const pid = readPid(allocator, io, pid_path) orelse
+			util.die(allocator, io, "ssh", exit_codes.software, "could not read instance pid from {s}.", .{pid_path});
+
+		if (!waitForSshOrDeath(io, pid, endpoint.host, endpoint.port, wait_ms)) {
+			if (pidAlive(pid)) {
+				util.die(allocator, io, "ssh", exit_codes.tempfail, "sshd did not become ready within {d}s; the VM may still be booting (check 'cogbox logs' / 'cogbox console').", .{@divTrunc(wait_ms, 1000)});
+			}
+			util.die(allocator, io, "ssh", exit_codes.software, "the VM exited while waiting for sshd (check 'cogbox logs').", .{});
+		}
+	}
 
 	// Forward everything after the verb (and any `--`) to the remote as the
 	// command/args. With terminate_on_positional both land in `trailing`, but
@@ -234,19 +265,109 @@ fn readSmall(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 	return try reader.interface.allocRemaining(allocator, .limited(4096));
 }
 
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) bool {
+/// Parse <runtime>/pid into a pid. Null if the file is absent/unreadable/empty
+/// or doesn't hold an integer. Does NOT check liveness -- see `pidAlive`.
+fn readPid(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) ?c_int {
 	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(io, pid_path, .{}) catch return false;
+	const file = cwd.openFile(io, pid_path, .{}) catch return null;
 	defer file.close(io);
 	var buf: [64]u8 = undefined;
 	var reader = file.reader(io, &buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(64)) catch return false;
+	const data = reader.interface.allocRemaining(allocator, .limited(64)) catch return null;
 	defer allocator.free(data);
 	const trimmed = std.mem.trim(u8, data, " \t\r\n");
-	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return false;
+	return std.fmt.parseInt(c_int, trimmed, 10) catch null;
+}
+
+/// Whether `pid` names a live process, via a signal-0 probe.
+fn pidAlive(pid: c_int) bool {
 	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
+	std.posix.kill(@intCast(pid), sig_zero) catch return false;
 	return true;
+}
+
+fn isRunning(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) bool {
+	const pid = readPid(allocator, io, pid_path) orelse return false;
+	return pidAlive(pid);
+}
+
+// --- sshd readiness probe -------------------------------------------------
+// Shared by `cogbox start` (default path) and `cogbox ssh --wait-for-ssh`.
+// Socket calls aren't in std.posix on this Zig; use libc (we link it).
+extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
+extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
+extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
+const WNOHANG: c_int = 1;
+
+/// Poll the guest's sshd until it answers with an SSH identification banner,
+/// returning true when ready. Returns false if the VM daemon `pid` exits first
+/// or the timeout elapses. `host`/`port` come from <runtime>/ssh-endpoint.
+///
+/// Used by `cogbox start` (default path, where `pid` is its own forked daemon)
+/// and `cogbox ssh --wait-for-ssh` (where `pid` is a daemon from an earlier
+/// process); `daemonExited` copes with both.
+pub fn waitForSshOrDeath(io: std.Io, pid: c_int, host: []const u8, port: []const u8, max_wait_ms: i64) bool {
+	const port_num = std.fmt.parseInt(u16, std.mem.trim(u8, port, " \t\r\n"), 10) catch return false;
+
+	// Build the target sockaddr once. The host is an IP literal; if it somehow
+	// isn't parseable as IPv4 we can't probe, so report ready and let ssh do its
+	// own resolution + connect rather than blocking until the timeout.
+	var sin: std.posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port_num), .addr = 0 };
+	var host_z: [64]u8 = undefined;
+	if (host.len >= host_z.len) return true;
+	@memcpy(host_z[0..host.len], host);
+	host_z[host.len] = 0;
+	if (inet_pton(std.posix.AF.INET, @ptrCast(&host_z), @ptrCast(&sin.addr)) != 1) return true;
+
+	// Probe before sleeping so an sshd that is already up returns on the first
+	// pass with no delay -- the common warm-VM case for `--wait-for-ssh`, which
+	// callers are told is a cheap no-op once sshd is listening.
+	const step_ms: i64 = 250;
+	var waited: i64 = 0;
+	while (true) {
+		if (daemonExited(pid)) return false;
+		if (probeSsh(&sin)) return true;
+		if (waited >= max_wait_ms) return false;
+		_ = std.Io.sleep(io, std.Io.Duration.fromMilliseconds(step_ms), .awake) catch {};
+		waited += step_ms;
+	}
+}
+
+/// Whether the VM daemon `pid` has exited -- works whether or not it is our
+/// child. `waitpid(WNOHANG)` is authoritative for a child: it returns the pid
+/// (exited, and reaps it so it can't linger as a zombie that kill(pid,0) would
+/// misreport as alive), 0 (still running), or <0 with ECHILD when `pid` is not
+/// our child (the `cogbox ssh` case). In that last case fall back to a signal-0
+/// liveness probe -- the daemon's real parent reaps it, so no zombie confuses us.
+fn daemonExited(pid: c_int) bool {
+	var status: c_int = 0;
+	const r = waitpid(pid, &status, WNOHANG);
+	if (r == pid) return true; // our child, exited (now reaped)
+	if (r == 0) return false; // our child, still running
+	return !pidAlive(pid); // not our child (ECHILD) -- probe with kill(pid, 0)
+}
+
+/// One readiness probe: open a TCP connection to the forwarded SSH port and
+/// wait briefly for sshd's "SSH-..." banner. A bare connect() is not proof of
+/// readiness -- passt/SLIRP accept the host side before the guest is listening,
+/// then reset -- so the banner is the authoritative signal.
+fn probeSsh(sin: *const std.posix.sockaddr.in) bool {
+	const fd = socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+	if (fd < 0) return false;
+	defer _ = close(fd);
+
+	if (connect(fd, @ptrCast(sin), @intCast(@sizeOf(std.posix.sockaddr.in))) != 0) return false;
+
+	var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+	const r = std.posix.poll(&pfd, 1500) catch return false;
+	if (r == 0) return false; // no banner within the read window
+	if (pfd[0].revents & std.posix.POLL.IN == 0) return false;
+
+	var buf: [16]u8 = undefined;
+	const n = std.posix.read(fd, &buf) catch return false;
+	return n >= 4 and std.mem.startsWith(u8, buf[0..n], "SSH-");
 }
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;

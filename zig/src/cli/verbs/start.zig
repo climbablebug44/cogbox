@@ -21,7 +21,6 @@
 //      print how to connect and return (--no-ssh).
 
 const std = @import("std");
-const posix = std.posix;
 const util = @import("../util.zig");
 const parse = @import("../parse.zig");
 const help = @import("../help.zig");
@@ -40,11 +39,6 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern "c" fn _exit(code: c_int) noreturn;
-// Socket calls aren't in std.posix on this Zig; use libc (we link it). The
-// sshd-readiness probe below opens a TCP connection to the forwarded SSH port.
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
-extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
-extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
@@ -197,7 +191,7 @@ pub fn run(
 		try util.writeStderr(io, status_msg);
 
 		const ssh_wait_ms: i64 = 180_000;
-		if (!waitForSshOrDeath(io, pid, endpoint.host, endpoint.port, ssh_wait_ms)) {
+		if (!ssh.waitForSshOrDeath(io, pid, endpoint.host, endpoint.port, ssh_wait_ms)) {
 			var dead: c_int = 0;
 			if (waitpid(pid, &dead, WNOHANG) == pid) {
 				dieVmFailure(allocator, io, log_path, "VM exited during boot.");
@@ -266,55 +260,6 @@ fn waitForFileOrDeath(io: std.Io, pid: c_int, cwd: std.Io.Dir, path: []const u8,
 		return true;
 	}
 	return false;
-}
-
-/// Poll the guest's sshd until it answers with an SSH identification banner,
-/// returning true when ready. Returns false if the daemon `pid` exits first
-/// (reaped via WNOHANG so it can't linger as a zombie) or the timeout elapses.
-/// `host`/`port` come from <runtime>/ssh-endpoint.
-fn waitForSshOrDeath(io: std.Io, pid: c_int, host: []const u8, port: []const u8, max_wait_ms: i64) bool {
-	const port_num = std.fmt.parseInt(u16, std.mem.trim(u8, port, " \t\r\n"), 10) catch return false;
-
-	// Build the target sockaddr once. BIND_ADDR is an IP literal; if it somehow
-	// isn't parseable as IPv4 we can't probe, so report ready and let ssh do its
-	// own resolution + connect rather than blocking until the timeout.
-	var sin: posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port_num), .addr = 0 };
-	var host_z: [64]u8 = undefined;
-	if (host.len >= host_z.len) return true;
-	@memcpy(host_z[0..host.len], host);
-	host_z[host.len] = 0;
-	if (inet_pton(posix.AF.INET, @ptrCast(&host_z), @ptrCast(&sin.addr)) != 1) return true;
-
-	const step_ms: i64 = 250;
-	var waited: i64 = 0;
-	while (waited < max_wait_ms) : (waited += step_ms) {
-		_ = std.Io.sleep(io, std.Io.Duration.fromMilliseconds(step_ms), .awake) catch {};
-		var status: c_int = 0;
-		if (waitpid(pid, &status, WNOHANG) == pid) return false; // daemon exited
-		if (probeSsh(&sin)) return true;
-	}
-	return false;
-}
-
-/// One readiness probe: open a TCP connection to the forwarded SSH port and
-/// wait briefly for sshd's "SSH-..." banner. A bare connect() is not proof of
-/// readiness -- passt/SLIRP accept the host side before the guest is listening,
-/// then reset -- so the banner is the authoritative signal.
-fn probeSsh(sin: *const posix.sockaddr.in) bool {
-	const fd = socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-	if (fd < 0) return false;
-	defer _ = close(fd);
-
-	if (connect(fd, @ptrCast(sin), @intCast(@sizeOf(posix.sockaddr.in))) != 0) return false;
-
-	var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-	const r = posix.poll(&pfd, 1500) catch return false;
-	if (r == 0) return false; // no banner within the read window
-	if (pfd[0].revents & posix.POLL.IN == 0) return false;
-
-	var buf: [16]u8 = undefined;
-	const n = posix.read(fd, &buf) catch return false;
-	return n >= 4 and std.mem.startsWith(u8, buf[0..n], "SSH-");
 }
 
 /// Report a boot failure, inlining the tail of the daemon log so the real
