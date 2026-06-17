@@ -58,7 +58,7 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
   netfilter-rules        # rendered L4 + remap runtime rules
   l7-rules               # rendered L7 runtime rules
   console.log            # captured guest serial output
-  cogbox.log             # daemon stdout/stderr (passt, QEMU warnings)
+  cogbox.log             # daemon stdout/stderr (passt, QEMU warnings); kept on a failed start for post-mortem
 ```
 
 If `$XDG_RUNTIME_DIR` is unset and `/run/user/$UID` doesn't exist (no active logind session), the wrapper falls back to `/tmp/cogbox-runtime-$UID/` per the XDG spec.

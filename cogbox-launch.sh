@@ -972,6 +972,78 @@ if [ ! -t 1 ]; then
 fi
 
 echo "$$" > "$RUNTIME/pid"
+
+# -- Ensure the host ports we are about to bind are actually free ----
+# next_available_ports keeps ports disjoint among THIS user's instances, but
+# passt forwards SSH/HTTP and the L7 proxy + mitmproxy bind on the host's
+# SHARED loopback -- so on a multi-user host a DIFFERENT user's instance (or
+# any unrelated process) may already hold them. The bind would then fail and
+# the start abort (fail-closed). Probe what we are about to bind and, if taken,
+# slide to the next free port/triple, then persist so __render-rules (which
+# reads l7PortBase back from config.json) and future launches agree.
+# The probe is a loopback connect, so it catches the common conflict (another
+# instance's passt/proxy listening on 0.0.0.0 or 127.0.0.1). A listener bound to
+# ONLY a specific non-loopback host IP isn't seen here; passt's own bind would
+# still surface that as a (now diagnosable) failure rather than a silent boot.
+port_taken() {
+	# 0 (true) when a TCP listener answers at $1:$2 within ~1s -- i.e. we could
+	# not bind it. bash's /dev/tcp connect succeeds iff something is listening;
+	# a refused connect (free port) returns immediately. The 1s timeout bounds
+	# the case where bindAddr is a non-loopback host IP and a DROP (not REJECT)
+	# firewall rule silently swallows the SYN -- an un-timed connect would then
+	# block for the full kernel retry window (~2 min) per port, stalling the
+	# (flock-holding) daemon. An indeterminate probe is treated as free; a real
+	# late conflict is still caught by the bind itself, which now fails loud.
+	timeout 1 bash -c '(exec 3<>"/dev/tcp/$1/$2")' _ "$1" "$2" 2>/dev/null
+}
+next_free_port() {
+	# First free port >= $1 on address $2, scanning upward.
+	local p=$1 addr=$2
+	while [ "$p" -le 65500 ] && port_taken "$addr" "$p"; do p=$((p + 1)); done
+	echo "$p"
+}
+next_free_l7_base() {
+	# First base >= $1 (stepping by 3 so triples stay disjoint, mirroring
+	# next_available_ports) whose whole loopback triple base/+1/+2 is free.
+	local b=$1
+	while [ "$b" -le 65000 ] && { port_taken 127.0.0.1 "$b" || port_taken 127.0.0.1 $((b + 1)) || port_taken 127.0.0.1 $((b + 2)); }; do
+		b=$((b + 3))
+	done
+	echo "$b"
+}
+PORTS_CHANGED=0
+_new=$(next_free_port "$SSH_PORT" "$BIND_ADDR")
+if [ "$_new" != "$SSH_PORT" ]; then
+	echo "cogbox-launch: SSH port $SSH_PORT ($BIND_ADDR) in use; using $_new instead." >&2
+	SSH_PORT=$_new; PORTS_CHANGED=1
+fi
+_new=$(next_free_port "$HTTP_PORT" "$BIND_ADDR")
+if [ "$_new" != "$HTTP_PORT" ]; then
+	echo "cogbox-launch: HTTP port $HTTP_PORT ($BIND_ADDR) in use; using $_new instead." >&2
+	HTTP_PORT=$_new; PORTS_CHANGED=1
+fi
+if [ "$NETWORK_MODE" = "rules" ]; then
+	_new=$(next_free_l7_base "$L7_BASE")
+	if [ "$_new" != "$L7_BASE" ]; then
+		echo "cogbox-launch: L7 port base $L7_BASE in use; using $_new instead." >&2
+		L7_BASE=$_new; L7_MITM_PORT=$((L7_BASE + 2)); PORTS_CHANGED=1
+	fi
+fi
+if [ "$PORTS_CHANGED" -eq 1 ]; then
+	# Persist atomically. __render-rules below reads l7PortBase from config, so
+	# config MUST reflect the new base before it runs -- otherwise the netfilter
+	# funnel and the proxy would point at different ports.
+	_cfg_tmp=$(mktemp "${ACTIVE_CONFIG}.XXXXXX") || die "cannot create temp file to persist reallocated ports"
+	if jq --tab --argjson ssh "$SSH_PORT" --argjson http "$HTTP_PORT" --argjson l7 "$L7_BASE" \
+		'.sshPort = $ssh | .httpPort = $http | .l7PortBase = $l7' "$ACTIVE_CONFIG" > "$_cfg_tmp"; then
+		mv "$_cfg_tmp" "$ACTIVE_CONFIG"
+		[ "$SUDO_INVOCATION" = 1 ] && chown "$REAL_USER" "$ACTIVE_CONFIG"
+	else
+		rm -f "$_cfg_tmp"
+		die "failed to persist reallocated ports to $ACTIVE_CONFIG"
+	fi
+fi
+
 # Snapshot the active SSH endpoint for the `ssh` subcommand to read.
 # Bound to runtime, not config, so post-boot edits to config.json don't
 # misdirect connections to a port the VM isn't listening on.
@@ -989,6 +1061,9 @@ CLEANED=0
 # then remove the runtime dir -- so we never rm the overlay/sockets out from
 # under a still-running QEMU.
 cogbox_cleanup() {
+	# Capture the status that triggered the EXIT trap BEFORE any command below
+	# overwrites $? -- it tells us whether the start succeeded.
+	local rc=$?
 	[ "$CLEANED" -eq 1 ] && return
 	CLEANED=1
 	if [ -n "$QEMU_PID" ]; then
@@ -1008,7 +1083,26 @@ cogbox_cleanup() {
 	# tidy it rather than leave it under the data root until the next boot.
 	rm -rf "$BASE_DATA/mirrors/${EFFECTIVE_NAME}"
 	rmdir "$BASE_DATA/mirrors" 2>/dev/null
-	rm -rf "$RUNTIME"
+	# Remove the transient runtime dir only on a CLEAN exit: a deliberate stop
+	# (143, from the TERM/INT trap below) or a clean QEMU shutdown (0). On any
+	# other status the start FAILED -- a die() before the VM came up, or QEMU
+	# dying during boot -- so keep $RUNTIME (and its cogbox.log) intact: that is
+	# the very file `cogbox start` tells the user to read ("VM did not come up.
+	# See .../cogbox.log"), and blowing it away here left them with a dangling
+	# pointer. A stale dir is harmless -- the next start removes it (its pid is
+	# dead) before recreating, so failed-start logs never accumulate.
+	if [ "$rc" -eq 0 ] || [ "$rc" -eq 143 ]; then
+		rm -rf "$RUNTIME"
+	elif [ -n "$QEMU_PID" ]; then
+		# QEMU had launched, so the start itself succeeded -- this is the VM
+		# dying later (a crash, an external SIGKILL, a guest fault). Keep the
+		# dir: cogbox.log/console.log are the post-mortem for that exit.
+		echo "cogbox-launch: VM terminated unexpectedly (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+	else
+		# Failed before QEMU ever launched (passt/L7/persist) -- the "VM did not
+		# come up" case; keep the log the start error points the user at.
+		echo "cogbox-launch: start failed (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+	fi
 	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
 	# fd is released when this process exits (kernel-managed); unlinking it
 	# here would only risk a new starter racing on a fresh inode. The empty
