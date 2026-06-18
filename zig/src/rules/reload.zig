@@ -29,13 +29,19 @@ pub fn l7Active(network: std.json.Value) bool {
 }
 
 /// `.network.l7.inject.specs` array (by value; shares the items pointer), or
-/// null when absent / not an array / inject is the legacy bool form.
+/// null when absent / not an array / inject is the legacy bool form / the
+/// master `enabled` toggle is explicitly false. Gating here means all three
+/// consumers (l7Active, renderL7's terminate-allow union, renderL7Inject)
+/// honor `enabled:false` consistently -- no funnel, no terminate, no inject.
 fn injectSpecs(network: std.json.Value) ?std.json.Array {
 	if (network != .object) return null;
 	const l7 = network.object.getPtr("l7") orelse return null;
 	if (l7.* != .object) return null;
 	const inj = l7.object.getPtr("inject") orelse return null;
-	if (inj.* != .object) return null;
+	if (inj.* != .object) return null; // legacy bool form carries no plugin specs
+	if (inj.object.getPtr("enabled")) |en| {
+		if (en.* == .bool and !en.bool) return null;
+	}
 	const specs = inj.object.getPtr("specs") orelse return null;
 	if (specs.* != .array) return null;
 	return specs.array;
@@ -410,6 +416,18 @@ test "l7Active counts inject specs (inject-only instance still funnels)" {
 		defer parsed.deinit();
 		try std.testing.expect(!l7Active(parsed.value));
 	}
+}
+
+test "injectSpecs honors the enabled:false master toggle" {
+	const gpa = std.testing.allocator;
+	const src = "{\"l7\":{\"rules\":[],\"inject\":{\"enabled\":false,\"specs\":[{\"host\":\"a.test\",\"secret\":\"s\"}]}}}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	try std.testing.expect(!l7Active(parsed.value)); // disabled -> no funnel
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out); // and no terminate-allow union
+	try std.testing.expect(std.mem.indexOf(u8, out.items, "a.test") == null);
 }
 
 test "renderL7 unions inject hosts as terminate-allows, deduped against existing rules" {

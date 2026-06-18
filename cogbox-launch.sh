@@ -1181,8 +1181,13 @@ mkdir -p "$HARNESS_STUBS"
 # Is host-side credential injection active for this instance? If so, secret
 # files are evicted from the guest overlays below (stage_overlay_source).
 INJECT_ACTIVE=0
+# Accept both the legacy bool (.network.l7.inject == true) and the object form
+# (.network.l7.inject.enabled == true). The object form is written by the Zig
+# verbs (e.g. `cogbox plugin add` merging inject specs); the bool form keeps
+# working for instances inited before it. Gates harness cred eviction +
+# harness inject-conf generation; plugin/operator specs render independently.
 if [ "$NETWORK_MODE" = "rules" ] \
-	&& jq -e '.network.l7.inject == true' "$ACTIVE_CONFIG" >/dev/null 2>&1; then
+	&& jq -e '(.network.l7.inject == true) or (.network.l7.inject.enabled == true)' "$ACTIVE_CONFIG" >/dev/null 2>&1; then
 	INJECT_ACTIVE=1
 fi
 is_active() {
@@ -1231,15 +1236,28 @@ done
 : > "$RUNTIME/system-l7ca"
 if [ "$NETWORK_MODE" = "rules" ]; then
 	@cogbox@ __render-rules "$ACTIVE_CONFIG" "$RUNTIME"
-	# Host-side credential injection: when the instance opts in
-	# (.network.l7.inject), generate the inject-conf for the active harnesses
-	# into the runtime default that start_l7mitm reads. Only specs whose
-	# host-side cred file exists are emitted; an empty result writes no conf
-	# (legacy guest-carries-token). An explicit COGBOX_L7_INJECT_CONF overrides.
-	if [ -z "${COGBOX_L7_INJECT_CONF:-}" ] && [ "$INJECT_ACTIVE" = 1 ]; then
-		_inject_conf=$(gen_inject_conf)
-		if [ -n "$_inject_conf" ] && [ "$_inject_conf" != "[]" ]; then
-			printf '%s' "$_inject_conf" > "$RUNTIME/l7-inject-conf.json"
+	# Host-side credential injection. __render-rules already wrote the
+	# PLUGIN/OPERATOR inject specs (resolved from the secret store, audience-
+	# gated) to l7-inject-conf.json. Merge the HARNESS specs (cred-file +
+	# OAuth-refresh, gated on the harness opt-in INJECT_ACTIVE) on top into the
+	# single conf start_l7mitm reads -- harness specs win a host collision.
+	# Plugin specs render independently of INJECT_ACTIVE (their own bound state
+	# gates them). An explicit COGBOX_L7_INJECT_CONF overrides the whole thing.
+	if [ -z "${COGBOX_L7_INJECT_CONF:-}" ]; then
+		_plugin_conf=$(cat "$RUNTIME/l7-inject-conf.json" 2>/dev/null)
+		[ -z "$_plugin_conf" ] && _plugin_conf='[]'
+		_harness_conf='[]'
+		if [ "$INJECT_ACTIVE" = 1 ]; then
+			_harness_conf=$(gen_inject_conf)
+			[ -z "$_harness_conf" ] && _harness_conf='[]'
+		fi
+		# jq -s slurps both arrays; `add` concatenates (plugin first, harness
+		# last -> harness wins the addon's last-write-by-host).
+		if printf '%s\n%s' "$_plugin_conf" "$_harness_conf" \
+			| jq -s 'add' > "$RUNTIME/l7-inject-conf.json.tmp" 2>/dev/null; then
+			mv "$RUNTIME/l7-inject-conf.json.tmp" "$RUNTIME/l7-inject-conf.json"
+		else
+			rm -f "$RUNTIME/l7-inject-conf.json.tmp"
 		fi
 	fi
 fi
