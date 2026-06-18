@@ -71,8 +71,9 @@ pub const TOP_LEVEL =
 	\\  3   status: instance is stopped
 	\\  64  bad CLI args, unknown verb or flag (EX_USAGE)
 	\\  65  bad data: invalid CIDR, integer, name (EX_DATAERR)
-	\\  66  missing config: instance never inited (EX_NOINPUT)
+	\\  66  missing/unreadable input: instance never inited, or --from-file unreadable (EX_NOINPUT)
 	\\  70  internal/system error (EX_SOFTWARE)
+	\\  73  cannot write file: secret store write failed (EX_CANTCREAT)
 	\\  75  already running, port collision (EX_TEMPFAIL)
 	\\
 ;
@@ -413,8 +414,12 @@ pub const L7 =
 	\\long-lived token never enters the sandbox. Opt a host out with
 	\\--passthrough (token end-to-end, cert pinning preserved). A harness with
 	\\no host-side token, or any such host with no explicit rule, stays
-	\\auto-passthrough. See docs/network-filtering.md (host-side credential
-	\\injection).
+	\\auto-passthrough. Beyond the harnesses, a plugin can REQUEST injection for
+	\\a host (cogboxPlugin.<attr>.inject) and you bind the credential host-side
+	\\with `cogbox secret add` (see `cogbox secret --help`); those specs live
+	\\under .network.l7.inject.specs[] -- the `inject` field is an object
+	\\{enabled, specs}, though the legacy bool is still accepted. See
+	\\docs/network-filtering.md (host-side credential injection).
 	\\
 	\\QUIC/UDP-443 and all guest IPv6 are denied while L7 is active (clients
 	\\fall back to inspectable IPv4 TCP).
@@ -508,9 +513,10 @@ pub const SECRET =
 	\\A plugin REQUESTS a credential by symbolic name (cogboxPlugin.<attr>.inject =
 	\\[{ host, style, secret }]); it can never name a file path or a value. You
 	\\bind the real value here, host-side, and it stays out of the guest -- the
-	\\guest only ever carries a stub the addon overwrites with the real secret on
-	\\the L7 terminate tier. Values are read from a file or stdin, never from argv
-	\\(which would leak into the process table and shell history).
+	\\guest carries only a stub (or no real credential) and the addon overwrites
+	\\it with the real secret on the L7 terminate tier. Values are read from a
+	\\file or stdin, never from argv (which would leak into the process table and
+	\\shell history).
 	\\
 	\\The store lives at <config>/secrets/ (value 0600 + a <name>.meta sidecar with
 	\\audience/kind/tier). `cogbox plugin add` prints a checklist of the secrets a

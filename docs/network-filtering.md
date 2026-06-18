@@ -251,12 +251,12 @@ Host-side credential injection removes the secret from the sandbox. Because the 
 
 When an **inject-conf** is present (path in `COGBOX_L7_INJECT_CONF`, passed to the mitmproxy backend by `cogbox-launch.sh`), the terminate-tier addon (`l7-mitm-addon.py`), on every decrypted request whose host matches a configured spec, **after** the allow + `Host == SNI` checks pass, replaces the auth header from a host-side credential file:
 
-- the conf is a JSON list of specs `{host, style, cred_file, token_path, account_id_path?, refresh?, stub_token?}`;
+- the conf is a JSON list of specs `{host, style, cred_file, token_path?, cred_format?, cookie_name?, account_id_path?, refresh?, stub_token?}`;
 - the addon reads `token_path` (a dotted path, e.g. `claudeAiOauth.accessToken`) out of `cred_file` and hot-reloads it on mtime change, so a rotated access token is picked up on the next request with no restart;
 - injection is **scoped to the stub identity**: when the spec carries a `stub_token` (the placeholder redacted into the guest's cred file), the addon replaces the credential **only** when the request presents that exact stub -- or no credential at all. The guest's stub is thus overwritten with the real token, but a **secondary credential the guest legitimately obtained through an already-injected call** -- e.g. claude-code Remote Control's per-session `worker_jwt` -- is forwarded **untouched** instead of being clobbered (which would 401). A spec with no `stub_token` (harnesses that still mount their real token in-guest) always replaces, as before;
 - if injection should fire for this request but the host-side token can't be read, the request **fails closed** (`403`) rather than forwarding the stub.
 
-`style` shapes the wire format per harness: `bearer` (`Authorization: Bearer <token>`), `anthropic-oauth` (Bearer + `anthropic-beta: …,oauth-2025-04-20`, drops `x-api-key`), `anthropic-apikey` (`x-api-key`, drops `Authorization`), `openai-chatgpt` (Bearer + `ChatGPT-Account-Id`). The conf and the credential files live **host-side only** -- they are never on a 9p share or fw_cfg slot, and `mitmdump` reads them as the launching user. For this to apply, the harness host must be on the **terminate** tier (so the addon sees the decrypted request); an explicit `cogbox l7 add allow <host> --passthrough` opts a host out of both terminate and injection (the legacy "guest carries its own token end-to-end" behavior).
+`style` shapes the wire format: `bearer` (`Authorization: Bearer <token>`), `anthropic-oauth` (Bearer + `anthropic-beta: …,oauth-2025-04-20`, drops `x-api-key`), `anthropic-apikey` (`x-api-key`, drops `Authorization`), `openai-chatgpt` (Bearer + `ChatGPT-Account-Id`), and `cookie` (replaces **only** the named cookie -- the spec's `cookie_name` -- in the request `Cookie` header, leaving every other cookie verbatim). The conf and the credential files live **host-side only** -- they are never on a 9p share or fw_cfg slot, and `mitmdump` reads them as the launching user. For this to apply, the harness host must be on the **terminate** tier (so the addon sees the decrypted request); an explicit `cogbox l7 add allow <host> --passthrough` opts a host out of both terminate and injection (the legacy "guest carries its own token end-to-end" behavior).
 
 ### Default-on for new instances
 
@@ -285,6 +285,44 @@ A user can run `/login` **inside** a guest; it works, **persists per-instance**,
 The boundary holds in the only direction that matters: a guest login is confined to that instance's own ext4 upperdir (the 9p lower is read-only, so overlay copy-up cannot write through to the host source), and the sole host-side write -- the addon's host-token refresh -- runs only while injecting (i.e. while the guest is still on the stub) and writes only the launching user's own canonical file, on a path the guest cannot influence. **No guest action mutates the host credential or any other instance.** (The host user can of course offline-read their own instance's image -- host-reads-own-guest, the safe direction.)
 
 This per-instance login model currently applies to **claude-code** (the only harness with a redactor + stub identity). `codex`/`opencode` stay on the guest-carries-token path until they get redactors.
+
+### Plugin-declared and operator-bound injection
+
+The same terminate-tier mechanism is not limited to the built-in harnesses: a **plugin** can request injection for any host its agent talks to, and an **operator** binds the actual credential host-side. This generalizes the harness path to arbitrary bearer tokens and session cookies while preserving the credless boundary.
+
+A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer` or `cookie`; the `cookie` style also needs a `cookieName`), the secret `name`, and an optional `stub` sentinel. The named specs merge into `.network.l7.inject.specs[]`:
+
+```json
+"network": { "l7": {
+    "inject": { "enabled": true, "specs": [
+        { "host": "api.example.com", "style": "bearer", "secret": "api-bearer", "plugin": "myplugin" },
+        { "host": "app.example.com", "style": "cookie", "secret": "app-session",
+          "cookieName": "app.sid", "stub": "cogbox-app-stub", "plugin": "myplugin" }
+    ] },
+    "rules": [ ... ]
+} }
+```
+
+(`.network.l7.inject` is an object `{enabled, specs}`; the legacy bool `inject: true` -- harness injection on -- still works and is coerced to the object form the first time a verb writes inject specs.)
+
+#### The secret store
+
+Operators bind the real credential with `cogbox secret`, host-side, never on the command line:
+
+```sh
+cogbox secret add api-bearer --from-file ~/.secrets/api.token --audience api.example.com
+cogbox secret ls
+cogbox secret rm api-bearer
+```
+
+The value is read from a file or stdin (never argv, which leaks to the process table) and stored at `~/.config/cogbox/secrets/<name>` (mode `0600`) alongside a `<name>.meta` sidecar recording `audience`, `kind`, `tier`, and `bound_at`. The stored value is a single line -- a bare bearer token or a cookie value. Sidecar-produced per-instance secrets use the same layout under `instances/<name>/secrets/` and shadow a global secret of the same name. Names are restricted to `[A-Za-z0-9_-]` so neither `<name>` nor `<name>.meta` can traverse out of the store.
+
+At boot (and on the hot-reload path), the renderer resolves each spec's named secret to the store's value path and emits it with `cred_format: "raw"` -- the addon reads that file's **first non-empty line** as the credential (no dotted `token_path`, unlike the JSON-cred harness specs). It writes the inject-conf with **two fail-closed gates**:
+
+- **unbound** -- no value bound for the named secret ⇒ no conf element. Injection stays inert (the request's stub goes upstream and fails auth) until you bind it; nothing is ever forwarded *as if* it were real auth.
+- **audience mismatch** -- a spec is emitted only when the bound secret's `audience` equals the spec host. This is the gate that stops a hostile plugin from later requesting that your bound `api-bearer` be injected to `attacker.example`: you bound it for `api.example.com`, so it is injectable **only** there. A secret with no audience set is treated as not-injectable.
+
+Inject hosts are automatically unioned into the **terminate-allow** set (a header or cookie can only be added on a MITM-terminated flow), so an inject-only plugin still activates the funnel and terminates its host -- whether injection actually fires is decided separately by the bound/audience gates above. The plugin/operator specs and the harness specs are merged into the single conf the addon reads (harness specs win a host collision). The trust an operator grants by binding a secret is surfaced at `cogbox plugin add` (the injection requests render in their own section, and a bind-checklist prints the exact `cogbox secret add` commands); the secret value itself, like the harness credentials, is host-only and never crosses into the guest.
 
 ### What it does and does not protect
 

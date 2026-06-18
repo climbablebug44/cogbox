@@ -16,6 +16,7 @@ A plugin is a NixOS module exposed by a flake. One flake can carry any number of
 - `nixosModules.<attr>` -- the plugin module, selected by the URL fragment (`URL#attr`); a bare URL means `nixosModules.default`. Folded into the guest like the per-instance flake's module. `pkgs` resolves to cogbox's nixpkgs (the same caveat as the [extension scaffold](extensions.md#which-nixpkgs-pkgs-is): declare a differently-named input to use your own).
 - `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects in `config.json`'s `.network.rules` schema for that module (L4 CIDR allows/denies). For the default module the flat form `cogboxPlugin.networkRules` also works.
 - `cogboxPlugin.<attr>.l7Rules` (optional) -- a list of [L7 vhost rules](network-filtering.md#l7-host-filtering) in the `.network.l7.rules` schema: `allow`/`deny` keyed to a host pattern, plus the optional tier fields `terminate`, `passthrough`, `path`, `insecure_upstream` (same constraints as `cogbox l7 add`). Flat form `cogboxPlugin.l7Rules` for the default module. Prefer these over IP allows when the plugin's backend sits behind a shared LB or reverse proxy: an L7 allow reaches exactly that vhost, not its siblings on the same IP.
+- `cogboxPlugin.<attr>.inject` (optional) -- a list of credential-injection requests for hosts the plugin's agent talks to. Each entry **names** a secret and the exact host it targets; it can never carry a value or a host-side path. You bind the real secret host-side with `cogbox secret add`, so it stays out of the guest. Flat form `cogboxPlugin.inject` for the default module. See [Credential injection](#credential-injection) below and the [host-side injection design](network-filtering.md#plugin-declared-and-operator-bound-injection).
 
 A minimal multi-plugin flake:
 
@@ -72,6 +73,46 @@ If the plugin declares network rules (L4 and/or L7) and the instance is in `rule
 Each merged rule carries a `"plugin": "<name>"` field, which is how `del` and `update` remove or replace exactly the rules that plugin brought in (your own edits to the same CIDRs or hosts are untouched). Rule changes hot-reload into a running instance through the same path as `cogbox rules`/`l7` edits; module changes need a `cogbox restart`. Note that merging a plugin's first `l7Rules` into an instance activates [L7 filtering](network-filtering.md#l7-host-filtering) for it, with everything that implies (80/443 funneled through the host-side proxy, QUIC/IPv6 denied).
 
 Instances not in `rules` mode still get the module; the suggested rules are skipped with a warning.
+
+## Credential injection
+
+A plugin whose agent talks to an authenticated service can request **host-side credential injection** so the agent reaches that service already-authenticated without the credential ever entering the guest. The plugin declares `cogboxPlugin.<attr>.inject`; you bind the actual secret host-side.
+
+```nix
+cogboxPlugin.inject = [
+    # a static API bearer for an HTTPS host
+    { host = "api.example.com"; style = "bearer"; secret = "api-bearer"; }
+    # a session cookie for an HTTP host (e.g. minted by a sidecar)
+    { host = "app.example.com"; style = "cookie"; cookieName = "app.sid";
+      secret = "app-session"; stub = "cogbox-app-stub"; }
+];
+```
+
+Each spec:
+
+- `host` -- the **exact** host the credential may be injected to (no wildcard).
+- `style` -- `bearer` (`Authorization: Bearer <value>`) or `cookie` (replaces only `cookieName` in the request `Cookie` header).
+- `secret` -- the **symbolic name** of a secret you bind with `cogbox secret`. A plugin can never name a value or a file path; the manifest is rejected at `add` time if it tries to (`path`, `cred_file`, `token`, `refresh`, ...).
+- `cookieName` -- required for the cookie style.
+- `stub` (optional) -- a sentinel the guest carries; injection then replaces the credential **only** over that stub (or an absent one), leaving any other credential the guest legitimately holds untouched.
+
+On `add`, injection requests are shown in their own confirmation section (granting a credential is different trust than a firewall rule), merged into `.network.l7.inject.specs[]` tagged with the plugin name, and a **bind-checklist** prints the exact commands to run:
+
+```
+$ cogbox plugin add path:/path/to/plugin
+Credential injection requests from 'myplugin' (host-side; the secret stays OUT of the guest):
+  + inject api.example.com bearer secret=api-bearer
+Bind these secrets host-side so injection takes effect (they stay OUT of the guest):
+  cogbox secret add api-bearer --from-file FILE --audience api.example.com --kind bearer
+```
+
+You then bind the secret:
+
+```sh
+cogbox secret add api-bearer --from-file ~/.secrets/api.token --audience api.example.com
+```
+
+The `--audience` you bind **must** match the spec host, or nothing is injected -- this is the gate that stops a hostile plugin from later requesting your bound secret be injected to an attacker host. An unbound secret renders nothing (fail closed); injection simply stays inert until you bind it. The host is automatically MITM-terminated for injection to work; see the [injection design](network-filtering.md#plugin-declared-and-operator-bound-injection) for the full security model and the [`cogbox secret`](network-filtering.md#the-secret-store) reference.
 
 ## The composition flake
 
