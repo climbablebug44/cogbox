@@ -28,6 +28,7 @@ pub const TOP_LEVEL =
 	\\  remap     Manage TCP destination-remap rules
 	\\  l7        Manage L7 (vhost) allow/deny rules for an instance
 	\\  plugin    Manage guest plugins (flakes folded into the VM)
+	\\  secret    Bind host-side credentials plugins/harnesses can inject
 	\\  help      Show help for a verb (cogbox help VERB)
 	\\
 	\\Common options:
@@ -484,6 +485,46 @@ pub const PLUGIN =
 	\\
 ;
 
+pub const SECRET =
+	\\cogbox secret - bind host-side credentials that plugins/harnesses inject
+	\\
+	\\Usage:
+	\\  cogbox secret add NAME --from-file F | --from-stdin
+	\\                        [--audience HOST] [--kind bearer|cookie]
+	\\  cogbox secret ls
+	\\  cogbox secret rm NAME
+	\\
+	\\Options:
+	\\  --from-file F     Read the secret value from file F (mode preserved 0600)
+	\\  --from-stdin      Read the secret value from stdin
+	\\  --audience HOST   The exact host this secret may be injected to. A secret
+	\\                    is NOT injectable until its audience is set; the
+	\\                    inject-conf renderer refuses to stamp a secret onto any
+	\\                    host other than its bound audience, so a plugin cannot
+	\\                    redirect a bound credential to an attacker host.
+	\\  --kind K          Injection style hint: bearer (default) or cookie
+	\\  -h, --help        Show this help and exit
+	\\
+	\\A plugin REQUESTS a credential by symbolic name (cogboxPlugin.<attr>.inject =
+	\\[{ host, style, secret }]); it can never name a file path or a value. You
+	\\bind the real value here, host-side, and it stays out of the guest -- the
+	\\guest only ever carries a stub the addon overwrites with the real secret on
+	\\the L7 terminate tier. Values are read from a file or stdin, never from argv
+	\\(which would leak into the process table and shell history).
+	\\
+	\\The store lives at <config>/secrets/ (value 0600 + a <name>.meta sidecar with
+	\\audience/kind/tier). `cogbox plugin add` prints a checklist of the secrets a
+	\\plugin needs so you know what to bind.
+	\\
+	\\Examples:
+	\\  cogbox secret add api-bearer --from-file ~/.secrets/api.token \
+	\\        --audience api.example.com
+	\\  printf '%s' "$TOKEN" | cogbox secret add api-token --from-stdin --audience api.internal
+	\\  cogbox secret ls
+	\\  cogbox secret rm api-bearer
+	\\
+;
+
 pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "start")) return START;
 	if (std.mem.eql(u8, verb, "console")) return CONSOLE;
@@ -499,6 +540,7 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
 	if (std.mem.eql(u8, verb, "remap")) return REMAP;
 	if (std.mem.eql(u8, verb, "l7")) return L7;
 	if (std.mem.eql(u8, verb, "plugin")) return PLUGIN;
+	if (std.mem.eql(u8, verb, "secret")) return SECRET;
 	return null;
 }
 

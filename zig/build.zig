@@ -73,6 +73,18 @@ pub fn build(b: *std.Build) void {
 	l7_mod.addImport("filter", filter_mod);
 	l7_mod.addImport("rules_module", rules_mod);
 
+	// Secret verb + store. Host-only named credential store the operator binds
+	// with `cogbox secret`; the rules renderer resolves a plugin's requested
+	// secret through it. Pure std (no libc, no other cogbox modules), so it can
+	// be imported by both the CLI and the rules module without a cycle.
+	const secret_mod = b.createModule(.{
+		.root_source_file = b.path("src/secret/main.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	// The rules renderer (renderL7Inject) resolves bound secrets host-side.
+	rules_mod.addImport("secret_module", secret_mod);
+
 	// Plugin verb. Shares config/save/reload with the rules module (plugin
 	// rule merges hot-reload like any other rules edit) and shells out to
 	// nix for flake resolution; links libc for the process plumbing.
@@ -96,6 +108,7 @@ pub fn build(b: *std.Build) void {
 	cli_mod.addImport("remap_module", remap_mod);
 	cli_mod.addImport("l7_module", l7_mod);
 	cli_mod.addImport("plugin_module", plugin_mod);
+	cli_mod.addImport("secret_module", secret_mod);
 	cli_mod.addImport("l7proxy_module", l7proxy_mod);
 	cli_mod.addImport("filter", filter_mod);
 
@@ -173,6 +186,16 @@ pub fn build(b: *std.Build) void {
 	});
 	const run_plugin_tests = b.addRunArtifact(plugin_tests);
 
+	const secret_test_mod = b.createModule(.{
+		.root_source_file = b.path("src/secret/tests.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+	const secret_tests = b.addTest(.{
+		.root_module = secret_test_mod,
+	});
+	const run_secret_tests = b.addRunArtifact(secret_tests);
+
 	const cli_test_mod = b.createModule(.{
 		.root_source_file = b.path("src/cli/parse.zig"),
 		.target = target,
@@ -206,6 +229,7 @@ pub fn build(b: *std.Build) void {
 	test_step.dependOn(&run_remap_tests.step);
 	test_step.dependOn(&run_l7_tests.step);
 	test_step.dependOn(&run_plugin_tests.step);
+	test_step.dependOn(&run_secret_tests.step);
 	test_step.dependOn(&run_cli_tests.step);
 	test_step.dependOn(&run_cli_verbs_tests.step);
 }

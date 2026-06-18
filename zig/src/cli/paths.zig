@@ -53,6 +53,23 @@ pub fn instancePluginsFlakeDir(allocator: std.mem.Allocator, paths: *const Paths
 	return try std.fs.path.join(allocator, &.{ paths.config_dir, "instances", eff, "plugins-flake" });
 }
 
+/// The global (operator-bound) secret store dir: `<config>/secrets`. Holds
+/// credentials a plugin requests by name and the operator binds with
+/// `cogbox secret add`. Shared across an account's instances (not per-instance),
+/// since these are operator secrets, not per-VM state.
+pub fn globalSecretsDir(allocator: std.mem.Allocator, paths: *const Paths) ![]const u8 {
+	return try std.fs.path.join(allocator, &.{ paths.config_dir, "secrets" });
+}
+
+/// Per-instance secret dir for sidecar-PRODUCED secrets (e.g. a minted session
+/// cookie): `<config>/instances/<name>/secrets`. The resolver checks this before
+/// the global store, so a produced session shadows a global secret of the same
+/// name (honoring per-instance isolation).
+pub fn instanceSecretsDir(allocator: std.mem.Allocator, paths: *const Paths, name: ?[]const u8) ![]const u8 {
+	const eff = name orelse "default";
+	return try std.fs.path.join(allocator, &.{ paths.config_dir, "instances", eff, "secrets" });
+}
+
 pub fn instanceDataDir(allocator: std.mem.Allocator, paths: *const Paths, name: ?[]const u8) ![]const u8 {
 	const eff = name orelse "default";
 	return try std.fs.path.join(allocator, &.{ paths.base_data, "instances", eff });
