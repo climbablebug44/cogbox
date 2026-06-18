@@ -10,6 +10,7 @@ const std = @import("std");
 const rules_module = @import("rules_module");
 const rule = rules_module.rule;
 const l7_rule = @import("l7_module").rule;
+const secret_store = @import("secret_module").store;
 
 pub const Entry = struct {
 	name: []const u8,
@@ -156,6 +157,79 @@ pub fn validatePluginL7Rule(v: std.json.Value) L7RuleError!void {
 	}
 	if (insecure) terminate = true;
 	if (passthrough and terminate) return error.ConflictingTier;
+}
+
+pub const InjectSpecError = error{
+	NotAnObject,
+	MissingHost,
+	InvalidHost,
+	WildcardHost,
+	BadStyle,
+	BadStub,
+	MissingSecret,
+	BadSecretName,
+	MissingCookieName,
+	BadCookieName,
+	InlineSecretForbidden,
+	OutOfMemory,
+};
+
+/// Validate one plugin-declared injection spec (cogboxPlugin.<attr>.inject[]).
+/// A plugin may only NAME a credential plus the exact host it targets; it can
+/// never express a value or a host-side path. Shape:
+///   { host = "api.x"; style = "bearer"|"cookie"; secret = "name";
+///     cookieName = "app.sid"  (required iff style == "cookie");
+///     stub = "..."  (optional) }
+/// SECURITY: any inline secret material / path-naming field
+/// ({path, cred_file, credFile, token, token_path, refresh, secretValue,
+/// value}) is rejected outright so a hostile/misformed manifest fails loud at
+/// `plugin add` rather than being silently ignored. The host must be EXACT (no
+/// wildcard): the addon keys injection by exact host, and an audience is bound
+/// per-host, so a wildcard would broaden where a credential can be stamped.
+pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
+	if (v != .object) return error.NotAnObject;
+
+	for ([_][]const u8{
+		"path", "cred_file", "credFile", "token", "token_path",
+		"refresh", "secretValue", "value",
+	}) |forbidden| {
+		if (v.object.get(forbidden) != null) return error.InlineSecretForbidden;
+	}
+
+	const host_v = v.object.get("host") orelse return error.MissingHost;
+	if (host_v != .string or host_v.string.len == 0) return error.MissingHost;
+	if (std.mem.indexOfScalar(u8, host_v.string, '*') != null) return error.WildcardHost;
+	if (!l7_rule.validateHost(host_v.string)) return error.InvalidHost;
+
+	var style: []const u8 = "bearer";
+	if (v.object.get("style")) |sv| {
+		if (sv != .string) return error.BadStyle;
+		style = sv.string;
+	}
+	if (!std.mem.eql(u8, style, "bearer") and !std.mem.eql(u8, style, "cookie")) return error.BadStyle;
+
+	const secret_v = v.object.get("secret") orelse return error.MissingSecret;
+	if (secret_v != .string) return error.MissingSecret;
+	if (!secret_store.validName(secret_v.string)) return error.BadSecretName;
+
+	if (std.mem.eql(u8, style, "cookie")) {
+		const cn = v.object.get("cookieName") orelse return error.MissingCookieName;
+		if (cn != .string or cn.string.len == 0) return error.MissingCookieName;
+		if (!validCookieName(cn.string)) return error.BadCookieName;
+	}
+
+	if (v.object.get("stub")) |st| {
+		if (st != .string) return error.BadStub;
+	}
+}
+
+fn validCookieName(name: []const u8) bool {
+	for (name) |c| switch (c) {
+		0...0x1f, 0x7f => return false, // control chars (incl tab/space-low)
+		'=', ';', ',', ' ', '"' => return false, // cookie separators
+		else => {},
+	};
+	return true;
 }
 
 /// Prepend `incoming` as a contiguous block at the head of the rules array

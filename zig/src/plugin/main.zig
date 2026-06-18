@@ -206,7 +206,10 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 	archiveFlake(ctx, meta.locked_url);
 
-	// Optional suggested firewall rules: L4 CIDR + L7 vhost, one confirmation.
+	// Optional plugin contributions: L4 CIDR + L7 vhost rules, plus credential
+	// injection requests -- one confirmation. Injection gets its own louder
+	// section: granting a host-side credential is a different kind of trust
+	// than a firewall rule.
 	var l4_parsed: ?std.json.Parsed(std.json.Value) = null;
 	defer if (l4_parsed) |*p| p.deinit();
 	const incoming_l4: []const std.json.Value = blk: {
@@ -221,15 +224,29 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		const p = l7_parsed orelse break :blk &.{};
 		break :blk p.value.array.items;
 	};
+	var inject_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (inject_parsed) |*p| p.deinit();
+	const incoming_inject: []const std.json.Value = blk: {
+		inject_parsed = evalInjectSpecs(ctx, meta.locked_url, attr);
+		const p = inject_parsed orelse break :blk &.{};
+		break :blk p.value.array.items;
+	};
 
 	var merged = false;
-	const total_rules = incoming_l4.len + incoming_l7.len;
-	if (total_rules > 0) {
+	var merged_inject = false;
+	const total = incoming_l4.len + incoming_l7.len + incoming_inject.len;
+	if (total > 0) {
 		if (rulesOrNull(loaded)) |rules_arr| {
-			try announce(ctx, "Suggested network rules from '{s}':", .{plugin_name});
-			for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
-			for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
-			const prompt = try std.fmt.allocPrint(allocator, "Merge these {d} rule(s) at the top of the rule lists?", .{total_rules});
+			if (incoming_l4.len + incoming_l7.len > 0) {
+				try announce(ctx, "Suggested network rules from '{s}':", .{plugin_name});
+				for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
+				for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
+			}
+			if (incoming_inject.len > 0) {
+				try announce(ctx, "Credential injection requests from '{s}' (host-side; the secret stays OUT of the guest):", .{plugin_name});
+				for (incoming_inject) |s| try printInjectLine(ctx, "+", s);
+			}
+			const prompt = try std.fmt.allocPrint(allocator, "Apply these {d} change(s) at the top of the lists?", .{total});
 			defer allocator.free(prompt);
 			if (!a.yes and !try confirm(ctx, prompt)) {
 				try announce(ctx, "Aborted.", .{});
@@ -242,9 +259,14 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 				const l7_arr = try ensureL7Rules(loaded);
 				try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, plugin_name, incoming_l7);
 			}
+			if (incoming_inject.len > 0) {
+				const inj_arr = try ensureInjectSpecs(loaded);
+				try mutate.prependTaggedRules(loaded.treeAllocator(), inj_arr, plugin_name, incoming_inject);
+				merged_inject = true;
+			}
 			merged = true;
 		} else {
-			try warn(ctx, "instance is not in rules mode; skipping {d} suggested rule(s)", .{total_rules});
+			try warn(ctx, "instance is not in rules mode; skipping {d} suggested change(s)", .{total});
 		}
 	}
 
@@ -262,6 +284,7 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	if (merged) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' added at {s}.", .{ plugin_name, pinLabel(&meta) });
+	if (merged_inject) try printBindChecklist(ctx, incoming_inject);
 	try printRestartHint(ctx, "to load its NixOS module");
 }
 
@@ -280,10 +303,12 @@ fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 
 	const rules_arr = rulesOrNull(loaded);
 	const l7_arr = l7RulesOrNull(loaded);
+	const inject_arr = injectSpecsOrNull(loaded);
 	const tagged = (if (rules_arr) |ra| mutate.countTaggedRules(ra, d.plugin) else 0) +
-		(if (l7_arr) |la| mutate.countTaggedRules(la, d.plugin) else 0);
+		(if (l7_arr) |la| mutate.countTaggedRules(la, d.plugin) else 0) +
+		(if (inject_arr) |ia| mutate.countTaggedRules(ia, d.plugin) else 0);
 
-	const prompt = try std.fmt.allocPrint(allocator, "Remove plugin '{s}' and its {d} network rule(s)?", .{ d.plugin, tagged });
+	const prompt = try std.fmt.allocPrint(allocator, "Remove plugin '{s}' and its {d} contributed rule(s)/inject spec(s)?", .{ d.plugin, tagged });
 	defer allocator.free(prompt);
 	if (!d.yes and !try confirm(ctx, prompt)) {
 		try announce(ctx, "Aborted.", .{});
@@ -293,12 +318,13 @@ fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	_ = plugins_arr.orderedRemove(idx);
 	var removed = if (rules_arr) |ra| mutate.removeTaggedRules(ra, d.plugin) else 0;
 	removed += if (l7_arr) |la| mutate.removeTaggedRules(la, d.plugin) else 0;
+	removed += if (inject_arr) |ia| mutate.removeTaggedRules(ia, d.plugin) else 0;
 
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
 	if (removed > 0) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
-	try announce(ctx, "Plugin '{s}' removed ({d} network rule(s) dropped).", .{ d.plugin, removed });
+	try announce(ctx, "Plugin '{s}' removed ({d} contributed entr(ies) dropped).", .{ d.plugin, removed });
 	try printRestartHint(ctx, "to unload its NixOS module");
 }
 
@@ -403,13 +429,22 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 			const p = l7_parsed orelse break :blk &.{};
 			break :blk p.value.array.items;
 		};
+		var inject_parsed: ?std.json.Parsed(std.json.Value) = null;
+		defer if (inject_parsed) |*p| p.deinit();
+		const incoming_inject: []const std.json.Value = blk: {
+			inject_parsed = evalInjectSpecs(ctx, meta.locked_url, attr);
+			const p = inject_parsed orelse break :blk &.{};
+			break :blk p.value.array.items;
+		};
 
 		if (rulesOrNull(loaded)) |rules_arr| {
 			const old_l7 = l7RulesOrNull(loaded);
+			const old_inject = injectSpecsOrNull(loaded);
 			const old_count = mutate.countTaggedRules(rules_arr, n) +
-				(if (old_l7) |la| mutate.countTaggedRules(la, n) else 0);
-			if (old_count > 0 or incoming_l4.len + incoming_l7.len > 0) {
-				try announce(ctx, "{s}: network rules", .{n});
+				(if (old_l7) |la| mutate.countTaggedRules(la, n) else 0) +
+				(if (old_inject) |ia| mutate.countTaggedRules(ia, n) else 0);
+			if (old_count > 0 or incoming_l4.len + incoming_l7.len + incoming_inject.len > 0) {
+				try announce(ctx, "{s}: contributed rules + inject specs", .{n});
 				for (rules_arr.items) |r| {
 					if (mutate.ruleTag(r)) |tag| {
 						if (std.mem.eql(u8, tag, n)) try printRuleLine(ctx, "-", r);
@@ -422,8 +457,16 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 						}
 					}
 				}
+				if (old_inject) |ia| {
+					for (ia.items) |r| {
+						if (mutate.ruleTag(r)) |tag| {
+							if (std.mem.eql(u8, tag, n)) try printInjectLine(ctx, "-", r);
+						}
+					}
+				}
 				for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
 				for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
+				for (incoming_inject) |s| try printInjectLine(ctx, "+", s);
 				_ = mutate.removeTaggedRules(rules_arr, n);
 				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, n, incoming_l4);
 				if (old_l7) |la| _ = mutate.removeTaggedRules(la, n);
@@ -431,10 +474,15 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 					const l7_arr = try ensureL7Rules(loaded);
 					try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, n, incoming_l7);
 				}
+				if (old_inject) |ia| _ = mutate.removeTaggedRules(ia, n);
+				if (incoming_inject.len > 0) {
+					const inj_arr = try ensureInjectSpecs(loaded);
+					try mutate.prependTaggedRules(loaded.treeAllocator(), inj_arr, n, incoming_inject);
+				}
 				rules_touched = true;
 			}
-		} else if (incoming_l4.len + incoming_l7.len > 0) {
-			try warn(ctx, "{s}: instance is not in rules mode; skipping {d} suggested rule(s)", .{ n, incoming_l4.len + incoming_l7.len });
+		} else if (incoming_l4.len + incoming_l7.len + incoming_inject.len > 0) {
+			try warn(ctx, "{s}: instance is not in rules mode; skipping {d} suggested change(s)", .{ n, incoming_l4.len + incoming_l7.len + incoming_inject.len });
 		}
 
 		try mutate.relockPlugin(loaded.treeAllocator(), item, .{
@@ -553,12 +601,84 @@ fn evalL7Rules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Pa
 	return parsed;
 }
 
+/// Credential injection specs (cogboxPlugin.<attr>.inject), validated:
+/// name-only, exact audience host, no inline secret material.
+fn evalInjectSpecs(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+	const parsed = evalRuleList(ctx, locked_url, attr, "inject") orelse return null;
+	for (parsed.value.array.items, 0..) |s, i| {
+		mutate.validatePluginInjectSpec(s) catch |err| {
+			const what: []const u8 = switch (err) {
+				error.NotAnObject => "not an object",
+				error.MissingHost => "missing/empty host",
+				error.InvalidHost => "invalid host pattern",
+				error.WildcardHost => "host must be exact (no wildcard)",
+				error.BadStyle => "style must be \"bearer\" or \"cookie\"",
+				error.BadStub => "stub must be a string",
+				error.MissingSecret => "missing secret name",
+				error.BadSecretName => "secret name must be [A-Za-z0-9_-] (max 64)",
+				error.MissingCookieName => "cookie style requires a non-empty cookieName",
+				error.BadCookieName => "invalid cookieName",
+				error.InlineSecretForbidden => "may not inline a value or a path (path/cred_file/token/refresh/...); name a secret instead",
+				error.OutOfMemory => "out of memory",
+			};
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.inject[{d}]: {s}", .{ i, what }, 65);
+		};
+	}
+	return parsed;
+}
+
 /// .network.l7.rules, created on demand (merge path; rules mode is already
 /// established by the caller).
 fn ensureL7Rules(loaded: *config.Loaded) !*std.json.Array {
 	const net = try loaded.network();
 	const l7 = try l7_module.ensureL7Object(net, loaded.treeAllocator());
 	return &l7.object.getPtr("rules").?.array;
+}
+
+/// .network.l7.inject.specs, created on demand (merge path). Coerces a legacy
+/// bool `.network.l7.inject` into the object form { enabled, specs } -- only
+/// ever reached on an explicit `plugin add` that brings inject specs, so the
+/// bool->object migration happens on a verb, never on a plain start/read.
+fn ensureInjectSpecs(loaded: *config.Loaded) !*std.json.Array {
+	const arena = loaded.treeAllocator();
+	const net = try loaded.network();
+	const l7 = try l7_module.ensureL7Object(net, arena);
+
+	if (l7.object.getPtr("inject")) |inj| {
+		if (inj.* == .bool) {
+			const enabled = inj.bool;
+			var obj: std.json.ObjectMap = .empty;
+			try obj.put(arena, try arena.dupe(u8, "enabled"), .{ .bool = enabled });
+			try obj.put(arena, try arena.dupe(u8, "specs"), .{ .array = std.json.Array.init(arena) });
+			try l7.object.put(arena, try arena.dupe(u8, "inject"), .{ .object = obj });
+		}
+	} else {
+		var obj: std.json.ObjectMap = .empty;
+		try obj.put(arena, try arena.dupe(u8, "enabled"), .{ .bool = true });
+		try obj.put(arena, try arena.dupe(u8, "specs"), .{ .array = std.json.Array.init(arena) });
+		try l7.object.put(arena, try arena.dupe(u8, "inject"), .{ .object = obj });
+	}
+
+	const inj = l7.object.getPtr("inject").?;
+	if (inj.* != .object) return error.InvalidJson;
+	if (inj.object.getPtr("specs") == null) {
+		try inj.object.put(arena, try arena.dupe(u8, "specs"), .{ .array = std.json.Array.init(arena) });
+	}
+	if (inj.object.getPtr("specs").?.* != .array) return error.InvalidJson;
+	return &inj.object.getPtr("specs").?.array;
+}
+
+/// .network.l7.inject.specs if it already exists (del/update/count path);
+/// null when inject is absent or still in the legacy bool form.
+fn injectSpecsOrNull(loaded: *config.Loaded) ?*std.json.Array {
+	const net = loaded.network() catch return null;
+	const l7 = net.object.getPtr("l7") orelse return null;
+	if (l7.* != .object) return null;
+	const inj = l7.object.getPtr("inject") orelse return null;
+	if (inj.* != .object) return null;
+	const specs = inj.object.getPtr("specs") orelse return null;
+	if (specs.* != .array) return null;
+	return &specs.array;
 }
 
 /// .network.l7.rules if it already exists; never creates it (del/list path).
@@ -670,6 +790,39 @@ fn printL7RuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
 		try announce(ctx, "  {s} l7 {s} {s}{s}  # {s}", .{ sign, action, p.host, suffix.items, c });
 	} else {
 		try announce(ctx, "  {s} l7 {s} {s}{s}", .{ sign, action, p.host, suffix.items });
+	}
+}
+
+fn printInjectLine(ctx: Ctx, sign: []const u8, s: std.json.Value) !void {
+	if (s != .object) return;
+	const host = blk: {
+		const h = s.object.get("host") orelse return;
+		if (h != .string) return;
+		break :blk h.string;
+	};
+	const style = if (s.object.get("style")) |sv| (if (sv == .string) sv.string else "bearer") else "bearer";
+	const secret = if (s.object.get("secret")) |sv| (if (sv == .string) sv.string else "?") else "?";
+	if (std.mem.eql(u8, style, "cookie")) {
+		const cn = if (s.object.get("cookieName")) |cv| (if (cv == .string) cv.string else "?") else "?";
+		try announce(ctx, "  {s} inject {s} cookie({s}) secret={s}", .{ sign, host, cn, secret });
+	} else {
+		try announce(ctx, "  {s} inject {s} {s} secret={s}", .{ sign, host, style, secret });
+	}
+}
+
+/// After merging inject specs, tell the operator exactly which secrets to bind
+/// host-side. We don't (yet) check bound state here -- the point is the
+/// command to run; an unbound secret simply renders no conf and injection
+/// stays inert (fail closed) until bound.
+fn printBindChecklist(ctx: Ctx, specs: []const std.json.Value) !void {
+	if (specs.len == 0) return;
+	try announce(ctx, "Bind these secrets host-side so injection takes effect (they stay OUT of the guest):", .{});
+	for (specs) |s| {
+		if (s != .object) continue;
+		const secret = if (s.object.get("secret")) |sv| (if (sv == .string) sv.string else continue) else continue;
+		const host = if (s.object.get("host")) |hv| (if (hv == .string) hv.string else "?") else "?";
+		const kind = if (s.object.get("style")) |sv| (if (sv == .string) sv.string else "bearer") else "bearer";
+		try announce(ctx, "  cogbox secret add {s} --from-file FILE --audience {s} --kind {s}", .{ secret, host, kind });
 	}
 }
 

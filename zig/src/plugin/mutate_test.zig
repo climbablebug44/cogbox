@@ -271,3 +271,41 @@ test "round-trip: tagged rules and plugins survive writeJqTab" {
 	try t.expect(std.mem.indexOf(u8, out.items, "\"narHash\": \"sha256-C\"") != null);
 	try t.expect(std.mem.indexOf(u8, out.items, "\"comment\": \"rfc1918\"") != null);
 }
+
+test "validatePluginInjectSpec" {
+	var ok = try parseDoc(
+		\\[{"host": "api.example.com", "style": "bearer", "secret": "api-bearer"},
+		\\ {"host": "api.internal", "secret": "api_token"},
+		\\ {"host": "app.example.com", "style": "cookie", "cookieName": "app.sid", "secret": "app-session", "stub": "cogbox-stub"}]
+	);
+	defer ok.deinit();
+	for (ok.value.array.items) |s| try mutate.validatePluginInjectSpec(s);
+
+	var bad = try parseDoc(
+		\\[{"style": "bearer", "secret": "x"},
+		\\ {"host": "not a host!", "secret": "x"},
+		\\ {"host": "*.example.com", "secret": "x"},
+		\\ {"host": "a.test", "style": "anthropic-oauth", "secret": "x"},
+		\\ {"host": "a.test"},
+		\\ {"host": "a.test", "secret": "bad/name"},
+		\\ {"host": "a.test", "style": "cookie", "secret": "x"},
+		\\ {"host": "a.test", "secret": "x", "secretValue": "leak"},
+		\\ {"host": "a.test", "secret": "x", "cred_file": "/etc/passwd"},
+		\\ {"host": "a.test", "secret": "x", "token": "abc"},
+		\\ {"host": "a.test", "secret": "x", "refresh": {"u": "v"}}]
+	);
+	defer bad.deinit();
+	const items = bad.value.array.items;
+	try t.expectError(error.MissingHost, mutate.validatePluginInjectSpec(items[0]));
+	try t.expectError(error.InvalidHost, mutate.validatePluginInjectSpec(items[1]));
+	try t.expectError(error.WildcardHost, mutate.validatePluginInjectSpec(items[2]));
+	try t.expectError(error.BadStyle, mutate.validatePluginInjectSpec(items[3]));
+	try t.expectError(error.MissingSecret, mutate.validatePluginInjectSpec(items[4]));
+	try t.expectError(error.BadSecretName, mutate.validatePluginInjectSpec(items[5]));
+	try t.expectError(error.MissingCookieName, mutate.validatePluginInjectSpec(items[6]));
+	// inline secret material / path naming is rejected outright (defense in depth)
+	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[7]));
+	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[8]));
+	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[9]));
+	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[10]));
+}

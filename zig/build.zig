@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) void {
 	});
 	plugin_mod.addImport("rules_module", rules_mod);
 	plugin_mod.addImport("l7_module", l7_mod);
+	plugin_mod.addImport("secret_module", secret_mod);
 
 	// Top-level cogbox CLI.
 	const cli_mod = b.createModule(.{
@@ -181,6 +182,7 @@ pub fn build(b: *std.Build) void {
 	});
 	plugin_test_mod.addImport("rules_module", rules_mod);
 	plugin_test_mod.addImport("l7_module", l7_mod);
+	plugin_test_mod.addImport("secret_module", secret_mod);
 	const plugin_tests = b.addTest(.{
 		.root_module = plugin_test_mod,
 	});
