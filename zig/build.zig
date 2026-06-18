@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
 		.optimize = optimize,
 	});
 	rules_test_mod.addImport("filter", filter_mod);
+	rules_test_mod.addImport("secret_module", secret_mod);
 	const rules_tests = b.addTest(.{
 		.root_module = rules_test_mod,
 	});

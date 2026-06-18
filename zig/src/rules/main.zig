@@ -98,14 +98,27 @@ pub fn renderFiles(allocator: std.mem.Allocator, io: std.Io, config_path: []cons
 	var loaded = try config.load(allocator, io, config_path);
 	defer loaded.deinit();
 	const base = l7Base(&loaded);
-	const net = loaded.network() catch {
-		// "full"/"none" mode carries no rules; emit empty files defensively.
-		try reload.writeRuntimeRules(allocator, io, runtime_path, .null, base);
-		try reload.writeL7Rules(allocator, io, runtime_path, .null);
-		return;
+
+	// The secret store dirs derive from config_path's fixed layout
+	// (<config>/instances/<name>/config.json): the per-instance store is a
+	// sibling `secrets/`, the global store is <config>/secrets.
+	const instance_dir = std.fs.path.dirname(config_path) orelse ".";
+	const instance_secrets = try std.fs.path.join(allocator, &.{ instance_dir, "secrets" });
+	defer allocator.free(instance_secrets);
+	const instances_dir = std.fs.path.dirname(instance_dir) orelse ".";
+	const config_dir = std.fs.path.dirname(instances_dir) orelse ".";
+	const global_secrets = try std.fs.path.join(allocator, &.{ config_dir, "secrets" });
+	defer allocator.free(global_secrets);
+
+	// "full"/"none" mode carries no .network object; render against null so the
+	// runtime files (incl. an empty inject conf) are emitted defensively.
+	const net_val: std.json.Value = blk: {
+		const net = loaded.network() catch break :blk .null;
+		break :blk net.*;
 	};
-	try reload.writeRuntimeRules(allocator, io, runtime_path, net.*, base);
-	try reload.writeL7Rules(allocator, io, runtime_path, net.*);
+	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, base);
+	try reload.writeL7Rules(allocator, io, runtime_path, net_val);
+	try reload.writeL7Inject(allocator, io, runtime_path, net_val, global_secrets, instance_secrets);
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, rules_arr: std.json.Array) !void {

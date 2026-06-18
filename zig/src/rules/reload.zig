@@ -6,18 +6,59 @@
 
 const std = @import("std");
 const rule = @import("rule.zig");
+const config = @import("config.zig");
 const filter = @import("filter");
+const secret_store = @import("secret_module").store;
 
-/// True when L7 vhost filtering is active for this instance: `.network.l7`
-/// is an object whose `rules` array has at least one entry. An empty L7 rule
-/// set must NOT activate the funnel (it would blackhole all web egress).
+/// True when L7 vhost filtering is active for this instance: `.network.l7` is
+/// an object with a non-empty `rules` array OR a non-empty
+/// `inject.specs` array. An inject spec implies a terminate-allow for its host
+/// (see renderL7), so an inject-only plugin still funnels web egress. An empty
+/// L7 config must NOT activate the funnel (it would blackhole all web egress).
 pub fn l7Active(network: std.json.Value) bool {
 	if (network != .object) return false;
 	const l7 = network.object.getPtr("l7") orelse return false;
 	if (l7.* != .object) return false;
-	const rules = l7.object.getPtr("rules") orelse return false;
-	if (rules.* != .array) return false;
-	return rules.array.items.len > 0;
+	if (l7.object.getPtr("rules")) |rules| {
+		if (rules.* == .array and rules.array.items.len > 0) return true;
+	}
+	if (injectSpecs(network)) |specs| {
+		if (specs.items.len > 0) return true;
+	}
+	return false;
+}
+
+/// `.network.l7.inject.specs` array (by value; shares the items pointer), or
+/// null when absent / not an array / inject is the legacy bool form.
+fn injectSpecs(network: std.json.Value) ?std.json.Array {
+	if (network != .object) return null;
+	const l7 = network.object.getPtr("l7") orelse return null;
+	if (l7.* != .object) return null;
+	const inj = l7.object.getPtr("inject") orelse return null;
+	if (inj.* != .object) return null;
+	const specs = inj.object.getPtr("specs") orelse return null;
+	if (specs.* != .array) return null;
+	return specs.array;
+}
+
+fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+	const v = obj.get(key) orelse return null;
+	if (v != .string) return null;
+	return v.string;
+}
+
+fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
+	const r = rules orelse return false;
+	for (r.items) |item| {
+		if (item != .object) continue;
+		if (strField(item.object, "allow")) |h| {
+			if (std.mem.eql(u8, h, host)) return true;
+		}
+		if (strField(item.object, "deny")) |h| {
+			if (std.mem.eql(u8, h, host)) return true;
+		}
+	}
+	return false;
 }
 
 /// Render `.network` to wire-format rule lines for the LD_PRELOAD shim. Pure
@@ -112,42 +153,131 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 	}
 	try out.appendSlice(allocator, if (mode_terminate) "mode terminate\n" else "mode passthrough\n");
 
-	const rules = l7.object.getPtr("rules") orelse return;
-	if (rules.* != .array) return;
-	for (rules.array.items) |r| {
-		if (r != .object) continue;
-		var action: []const u8 = undefined;
-		var host: []const u8 = undefined;
-		if (r.object.getPtr("allow")) |v| {
-			if (v.* != .string) continue;
-			action = "allow";
-			host = v.string;
-		} else if (r.object.getPtr("deny")) |v| {
-			if (v.* != .string) continue;
-			action = "deny";
-			host = v.string;
-		} else continue;
+	const rules: ?std.json.Array = blk: {
+		const r = l7.object.getPtr("rules") orelse break :blk null;
+		if (r.* != .array) break :blk null;
+		break :blk r.array;
+	};
+	if (rules) |rs| {
+		for (rs.items) |r| {
+			if (r != .object) continue;
+			var action: []const u8 = undefined;
+			var host: []const u8 = undefined;
+			if (r.object.getPtr("allow")) |v| {
+				if (v.* != .string) continue;
+				action = "allow";
+				host = v.string;
+			} else if (r.object.getPtr("deny")) |v| {
+				if (v.* != .string) continue;
+				action = "deny";
+				host = v.string;
+			} else continue;
 
-		try out.appendSlice(allocator, action);
-		try out.append(allocator, ' ');
-		try out.appendSlice(allocator, host);
-		if (r.object.getPtr("path")) |p| {
-			if (p.* == .string and p.string.len > 0) {
-				try out.append(allocator, ' ');
-				try out.appendSlice(allocator, p.string);
+			try out.appendSlice(allocator, action);
+			try out.append(allocator, ' ');
+			try out.appendSlice(allocator, host);
+			if (r.object.getPtr("path")) |p| {
+				if (p.* == .string and p.string.len > 0) {
+					try out.append(allocator, ' ');
+					try out.appendSlice(allocator, p.string);
+				}
 			}
+			if (r.object.getPtr("terminate")) |tv| {
+				if (tv.* == .bool and tv.bool) try out.appendSlice(allocator, " terminate");
+			}
+			if (r.object.getPtr("passthrough")) |pv| {
+				if (pv.* == .bool and pv.bool) try out.appendSlice(allocator, " passthrough");
+			}
+			if (r.object.getPtr("insecure_upstream")) |iv| {
+				if (iv.* == .bool and iv.bool) try out.appendSlice(allocator, " insecure");
+			}
+			try out.append(allocator, '\n');
 		}
-		if (r.object.getPtr("terminate")) |tv| {
-			if (tv.* == .bool and tv.bool) try out.appendSlice(allocator, " terminate");
-		}
-		if (r.object.getPtr("passthrough")) |pv| {
-			if (pv.* == .bool and pv.bool) try out.appendSlice(allocator, " passthrough");
-		}
-		if (r.object.getPtr("insecure_upstream")) |iv| {
-			if (iv.* == .bool and iv.bool) try out.appendSlice(allocator, " insecure");
-		}
-		try out.append(allocator, '\n');
 	}
+
+	// Union inject-spec hosts into the terminate-allow set: a host that gets a
+	// credential injected MUST be MITM-terminated (a header/cookie can't be
+	// added on a spliced TLS flow), and it need not be separately allow-listed.
+	// Emit `allow <host> terminate` for each inject host not already named by an
+	// l7 rule. Whether injection actually fires for that host is decided
+	// separately by renderL7Inject (only when the secret is bound + audience
+	// matches); an unbound host still terminates and simply isn't injected.
+	if (injectSpecs(network)) |specs| {
+		for (specs.items) |spec| {
+			if (spec != .object) continue;
+			const h = strField(spec.object, "host") orelse continue;
+			if (hostNamedInRules(rules, h)) continue;
+			try out.appendSlice(allocator, "allow ");
+			try out.appendSlice(allocator, h);
+			try out.appendSlice(allocator, " terminate\n");
+		}
+	}
+}
+
+/// Render the host-side credential-injection conf (the
+/// `COGBOX_L7_INJECT_CONF` the mitmproxy addon reads as a JSON list). For each
+/// `.network.l7.inject.specs[]` entry, resolve its NAMED secret host-side
+/// (instance store first, then global) and emit a conf element ONLY when the
+/// secret is bound AND its audience matches the spec host. Unbound or
+/// audience-mismatched specs render nothing -- fail closed: the addon then has
+/// no spec for that host and never stamps a stale/foreign credential. The
+/// cred_file is the store's value path; cred_format "raw" (the addon's
+/// token_for reads its first non-empty line). NOT pure -- reads the store.
+pub fn renderL7Inject(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	network: std.json.Value,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+	out: *std.ArrayList(u8),
+) !void {
+	var arena_inst = std.heap.ArenaAllocator.init(allocator);
+	defer arena_inst.deinit();
+	const arena = arena_inst.allocator();
+
+	var arr = std.json.Array.init(arena);
+	if (injectSpecs(network)) |specs| {
+		for (specs.items) |spec| {
+			if (spec != .object) continue;
+			const host = strField(spec.object, "host") orelse continue;
+			const secret_name = strField(spec.object, "secret") orelse continue;
+			const style = strField(spec.object, "style") orelse "bearer";
+
+			const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, secret_name)) orelse continue;
+			if (!resolved.bound) continue;
+			const audience = resolved.meta.audience orelse continue; // unset -> not injectable
+			if (!std.mem.eql(u8, audience, host)) continue; // exfiltration gate
+
+			var el: std.json.ObjectMap = .empty;
+			try el.put(arena, "host", .{ .string = host });
+			try el.put(arena, "style", .{ .string = style });
+			try el.put(arena, "cred_file", .{ .string = resolved.value_path });
+			try el.put(arena, "cred_format", .{ .string = "raw" });
+			if (strField(spec.object, "cookieName")) |cn| {
+				try el.put(arena, "cookie_name", .{ .string = cn });
+			}
+			if (strField(spec.object, "stub")) |st| {
+				try el.put(arena, "stub_token", .{ .string = st });
+			}
+			try arr.append(.{ .object = el });
+		}
+	}
+	try config.writeJqTab(allocator, out, .{ .array = arr });
+}
+
+/// Resolve a named secret: an instance-produced secret (e.g. a sidecar-minted
+/// session) shadows a global operator-bound one of the same name.
+fn resolveSecret(
+	arena: std.mem.Allocator,
+	io: std.Io,
+	instance_dir: []const u8,
+	global_dir: []const u8,
+	name: []const u8,
+) !?secret_store.Resolved {
+	if (try secret_store.lookup(arena, io, instance_dir, name)) |r| {
+		if (r.bound) return r;
+	}
+	return try secret_store.lookup(arena, io, global_dir, name);
 }
 
 pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value, l7_base: u16) !void {
@@ -163,6 +293,23 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 	defer out.deinit(allocator);
 	try renderL7(allocator, network, &out);
 	try writeRuntimeFile(allocator, io, runtime_dir, "l7-rules", out.items);
+}
+
+/// Write `<runtime>/l7-inject-conf.json` (the mitmproxy addon's
+/// COGBOX_L7_INJECT_CONF). Resolves each spec's named secret against the
+/// per-instance then global store.
+pub fn writeL7Inject(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	runtime_dir: []const u8,
+	network: std.json.Value,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+) !void {
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(allocator);
+	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out);
+	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-conf.json", out.items);
 }
 
 fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {
@@ -247,6 +394,42 @@ test "renderL7 wire format incl. insecure token" {
 	try std.testing.expect(has(s, "allow plain.test\n"));
 	try std.testing.expect(has(s, "allow api.test /v1/\n"));
 	try std.testing.expect(!has(s, "plain.test insecure"));
+}
+
+test "l7Active counts inject specs (inject-only instance still funnels)" {
+	const gpa = std.testing.allocator;
+	{
+		const src = "{\"l7\":{\"rules\":[],\"inject\":{\"enabled\":true,\"specs\":[{\"host\":\"a.test\",\"secret\":\"s\"}]}}}";
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		try std.testing.expect(l7Active(parsed.value));
+	}
+	{
+		const src = "{\"l7\":{\"rules\":[],\"inject\":{\"enabled\":true,\"specs\":[]}}}";
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+		defer parsed.deinit();
+		try std.testing.expect(!l7Active(parsed.value));
+	}
+}
+
+test "renderL7 unions inject hosts as terminate-allows, deduped against existing rules" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[{"allow":"already.test","terminate":true}],
+		\\ "inject":{"enabled":true,"specs":[
+		\\   {"host":"api.example.com","style":"bearer","secret":"s1"},
+		\\   {"host":"already.test","style":"bearer","secret":"s2"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	const s = out.items;
+	// an inject host not already named gets a terminate allow appended
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow api.example.com terminate\n") != null);
+	// a host already named by an l7 rule is NOT duplicated by the union
+	try std.testing.expect(std.mem.count(u8, s, "already.test") == 1);
 }
 
 test "renderRules funnel targets the per-instance base ports" {
