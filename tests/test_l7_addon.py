@@ -236,6 +236,79 @@ check(sp2 is not None, "credstore spec for a host whose cred file is missing")
 check(cs2.value_for(sp2, "token_path") is None, "credstore missing cred file -> None (fail closed)")
 
 
+# --- cookie style + raw cred file (plugin-driven injection primitives) ----
+
+# get_cookie / set_cookie: replace only the named cookie, preserve the rest
+hc = CIDict({"Cookie": "a=1; app.sid=STUB; b=2"})
+check(m.get_cookie(hc, "app.sid") == "STUB", "get_cookie reads named value")
+check(m.get_cookie(hc, "missing") is None, "get_cookie absent -> None")
+m.set_cookie(hc, "app.sid", "REAL")
+check(hc["cookie"] == "a=1; app.sid=REAL; b=2", "set_cookie replaces only named, preserves order")
+hc2 = CIDict({"Cookie": "a=1"})
+m.set_cookie(hc2, "app.sid", "REAL")
+check(hc2["cookie"] == "a=1; app.sid=REAL", "set_cookie appends when absent")
+hc3 = CIDict({})
+m.set_cookie(hc3, "app.sid", "REAL")
+check(hc3["cookie"] == "app.sid=REAL", "set_cookie creates header when none")
+hc4 = CIDict({"Cookie": "app.sid=OLD; x=9; app.sid=DUP"})
+m.set_cookie(hc4, "app.sid", "REAL")
+check(hc4["cookie"] == "app.sid=REAL; x=9", "set_cookie drops a duplicate of the named cookie")
+
+# apply_injection cookie style: SET only the named cookie; no-op without a name
+h = CIDict({"Cookie": "app.sid=STUB; keep=1"})
+m.apply_injection(h, "cookie", "REALSID", cookie_name="app.sid")
+check(h["cookie"] == "app.sid=REALSID; keep=1", "cookie style replaces session cookie, preserves others")
+h = CIDict({})
+m.apply_injection(h, "cookie", "REALSID", cookie_name="app.sid")
+check(h["cookie"] == "app.sid=REALSID", "cookie style injects when absent")
+h = CIDict({"Cookie": "keep=1"})
+m.apply_injection(h, "cookie", "REALSID")  # no cookie_name -> misconfig guard, no-op
+check(h.get("cookie") == "keep=1", "cookie style without cookie_name is a no-op")
+
+# should_inject cookie arm: inject over absent/stub; pass a real session cookie through
+CSTUB = "cogbox-app-stub"
+check(m.should_inject(CIDict({}), "cookie", CSTUB, cookie_name="app.sid"),
+      "should_inject cookie: inject when absent")
+check(m.should_inject(CIDict({"Cookie": "app.sid=" + CSTUB}), "cookie", CSTUB, cookie_name="app.sid"),
+      "should_inject cookie: inject over the stub")
+check(not m.should_inject(CIDict({"Cookie": "app.sid=realsession"}), "cookie", CSTUB, cookie_name="app.sid"),
+      "should_inject cookie: pass through a real (non-stub) session cookie")
+check(m.should_inject(CIDict({"Cookie": "app.sid=anything"}), "cookie", None, cookie_name="app.sid"),
+      "should_inject cookie: no stub_token -> legacy always-inject")
+
+
+def _write_raw(path, text, mtime):
+    with open(path, "w") as f:
+        f.write(text)
+    os.utime(path, (mtime, mtime))
+
+
+# CredStore raw read: a cookie spec is admitted with NO token_path; token_for
+# reads the first non-empty stripped line, hot-reloads, and fails closed.
+_raw = os.path.join(_d, "cookie.txt")
+_write_raw(_raw, "\n  SID-RAW-1  \nignored\n", 1000)  # leading blank + surrounding whitespace
+_write(_conf, [{"host": "app.example.com", "style": "cookie", "cookie_name": "app.sid",
+                "cred_file": _raw, "cred_format": "raw"}], 4000)
+csr = m.CredStore(_conf)
+spr = csr.spec_for("app.example.com")
+check(spr is not None, "credstore admits a cookie spec with no token_path")
+check(csr.token_for(spr) == "SID-RAW-1", "credstore token_for reads first non-empty raw line, stripped")
+_write_raw(_raw, "SID-RAW-2\n", 5000)  # rotate
+check(csr.token_for(spr) == "SID-RAW-2", "credstore raw read hot-reloads on mtime change")
+os.remove(_raw)
+check(csr.token_for(spr) is None, "credstore raw read fail-closed on missing file")
+
+# A raw bearer (cred_format=="raw") is admitted + read the same way (no token_path)
+_rawb = os.path.join(_d, "bearer.txt")
+_write_raw(_rawb, "tok-abc123\n", 1000)
+_write(_conf, [{"host": "api.example.com", "style": "bearer",
+                "cred_file": _rawb, "cred_format": "raw"}], 6000)
+csb = m.CredStore(_conf)
+spb = csb.spec_for("api.example.com")
+check(spb is not None, "credstore admits a raw bearer spec with no token_path")
+check(csb.token_for(spb) == "tok-abc123", "credstore token_for reads a raw bearer line")
+
+
 # --- json_path_raw / json_path_set (refresh write-back helpers) ----------
 check(m.json_path_raw({"a": {"b": 5}}, "a.b") == 5, "json_path_raw numeric leaf")
 check(m.json_path_raw({"a": {"b": "x"}}, "a.b") == "x", "json_path_raw string leaf")

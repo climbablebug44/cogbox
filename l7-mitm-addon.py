@@ -224,7 +224,48 @@ def merge_beta(existing, marker):
     return ",".join(toks)
 
 
-def apply_injection(headers, style, token, account_id=None):
+def _parse_cookies(raw):
+    """Split a Cookie request-header value into [(name, raw_pair)], preserving
+    order and the exact original pair text for cookies we pass through (so a
+    cookie we don't touch is never reflowed/normalized)."""
+    out = []
+    for part in (raw or "").split(";"):
+        s = part.strip()
+        if not s:
+            continue
+        out.append((s.split("=", 1)[0].strip(), s))
+    return out
+
+
+def get_cookie(headers, name):
+    """Value of the named cookie in the request `Cookie` header, or None if
+    absent (used for cookie-style stub-gating)."""
+    for n, pair in _parse_cookies(headers.get("cookie", "")):
+        if n == name:
+            return pair.split("=", 1)[1].strip() if "=" in pair else ""
+    return None
+
+
+def set_cookie(headers, name, value):
+    """Set the named cookie in the request `Cookie` header to `value`, REPLACING
+    only that cookie (and dropping any duplicate of it) while preserving every
+    other cookie the guest sent verbatim; appends if absent. SET semantics
+    mirror apply_injection -- a guest stub for this cookie is overwritten and
+    never reaches the upstream."""
+    pairs, replaced = [], False
+    for n, pair in _parse_cookies(headers.get("cookie", "")):
+        if n == name:
+            if not replaced:
+                pairs.append(name + "=" + value)
+                replaced = True
+        else:
+            pairs.append(pair)
+    if not replaced:
+        pairs.append(name + "=" + value)
+    headers["cookie"] = "; ".join(pairs)
+
+
+def apply_injection(headers, style, token, account_id=None, cookie_name=None):
     """Mutate `headers` in place to carry the real `token` per `style`. Always
     SET (never append) the credential header so a guest-supplied placeholder is
     overwritten and never reaches the upstream as-is. `headers` is a mitmproxy
@@ -244,11 +285,15 @@ def apply_injection(headers, style, token, account_id=None):
         headers["authorization"] = "Bearer " + token
         if account_id:
             headers["chatgpt-account-id"] = account_id
+    elif style == "cookie":
+        # `token` is the session-cookie VALUE; replace only the named cookie.
+        if cookie_name:
+            set_cookie(headers, cookie_name, token)
     else:  # "bearer" and any unknown style: plain Bearer
         headers["authorization"] = "Bearer " + token
 
 
-def should_inject(headers, style, stub_token):
+def should_inject(headers, style, stub_token, cookie_name=None):
     """Whether to overwrite this request's credential with the injected token.
 
     When the spec carries a `stub_token` (the recognizable placeholder the
@@ -263,6 +308,9 @@ def should_inject(headers, style, stub_token):
     in-guest), keep the legacy always-inject behavior."""
     if not stub_token:
         return True
+    if style == "cookie":
+        cur = get_cookie(headers, cookie_name)
+        return cur is None or cur == "" or cur == stub_token
     if style == "anthropic-apikey":
         cur = headers.get("x-api-key", "")
         return cur == "" or cur == stub_token
@@ -363,6 +411,7 @@ class CredStore:
         self.conf_mtime = None
         self.specs = {}  # host(lower) -> spec dict
         self._file_cache = {}  # cred_file -> (mtime, parsed_json | None)
+        self._raw_cache = {}  # cred_file -> (mtime, first-non-empty-line | None)
         self._last_attempt = {}  # cred_file -> monotonic ts of last refresh attempt
 
     def _load_conf(self):
@@ -383,7 +432,15 @@ class CredStore:
                 data = json.load(f)
             for spec in data:
                 host = (spec.get("host") or "").rstrip(".").lower()
-                if host and spec.get("cred_file") and spec.get("token_path"):
+                # Admit a spec that has a host + cred_file and a way to read the
+                # value: a JSON token_path (harness creds), a raw single-line file
+                # (cred_format=="raw": a plain bearer / session cookie), or a
+                # cookie style (whose file is always a raw cookie value).
+                if host and spec.get("cred_file") and (
+                    spec.get("token_path")
+                    or spec.get("cred_format") == "raw"
+                    or spec.get("style") == "cookie"
+                ):
                     specs[host] = spec
         except (OSError, ValueError):
             specs = {}
@@ -418,6 +475,42 @@ class CredStore:
         if data is None:
             return None
         return json_path_get(data, dotted)
+
+    def _read_raw(self, cred_file):
+        """First non-empty stripped line of a raw single-line cred file (a bare
+        bearer token or a session-cookie value), mtime-cached like _read_json.
+        Returns None (fail closed) if the file is missing/unreadable/blank."""
+        try:
+            mtime = os.stat(cred_file).st_mtime
+        except OSError:
+            self._raw_cache.pop(cred_file, None)
+            return None
+        cached = self._raw_cache.get(cred_file)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        val = None
+        try:
+            with open(cred_file) as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        val = s
+                        break
+        except OSError:
+            val = None
+        self._raw_cache[cred_file] = (mtime, val)
+        return val
+
+    def token_for(self, spec):
+        """The credential value for `spec`, independent of cred-file format: a
+        raw single-line file (cred_format=="raw", or a cookie style with no
+        token_path) or a JSON cred file read at token_path. Returns None (fail
+        closed) when unreadable."""
+        if spec.get("cred_format") == "raw" or (
+            spec.get("style") == "cookie" and not spec.get("token_path")
+        ):
+            return self._read_raw(spec.get("cred_file"))
+        return self.value_for(spec, "token_path")
 
     # -- host-side refresh --------------------------------------------------
 
@@ -692,7 +785,8 @@ def request(flow):
     spec = CREDS.spec_for(host)
     if spec is not None:
         style = spec.get("style", "bearer")
-        do_inject = should_inject(flow.request.headers, style, spec.get("stub_token"))
+        do_inject = should_inject(flow.request.headers, style,
+                                  spec.get("stub_token"), spec.get("cookie_name"))
         if os.environ.get("COGBOX_L7_DEBUG_INJECT"):
             # Safe to log: host + path + decision only, never any token material.
             has_auth = bool(flow.request.headers.get("authorization")
@@ -704,7 +798,7 @@ def request(flow):
             # spec opts in). Keeps a long-running guest -- which can't refresh, by
             # design -- from being handed a lapsed token.
             CREDS.ensure_fresh(spec)
-            token = CREDS.value_for(spec, "token_path")
+            token = CREDS.token_for(spec)
             if not token:
                 # Injection is configured for this host but the host-side token is
                 # unreadable: fail closed rather than forward the guest's stub as
@@ -713,7 +807,8 @@ def request(flow):
                 _deny(flow, "credential unavailable")
                 return
             account_id = CREDS.value_for(spec, "account_id_path")
-            apply_injection(flow.request.headers, style, token, account_id)
+            apply_injection(flow.request.headers, style, token, account_id,
+                            spec.get("cookie_name"))
         # else: the guest is presenting a SECONDARY credential it legitimately
         # obtained through an injected call (e.g. Remote Control per-session
         # bridge creds) -- forward it to the upstream untouched.
