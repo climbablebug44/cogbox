@@ -164,6 +164,15 @@ h = CIDict({})
 m.apply_injection(h, "weird-unknown", "T")
 check(h["authorization"] == "Bearer T", "unknown style falls back to bearer")
 
+# basic -> Authorization: Basic base64(user:password)
+import base64 as _b64
+h = CIDict({})
+m.apply_injection(h, "basic", "user:pass")
+check(h["authorization"] == "Basic " + _b64.b64encode(b"user:pass").decode(), "basic style sets Basic header")
+h = CIDict({"Authorization": "Basic old"})
+m.apply_injection(h, "basic", "user:pass")
+check(h["authorization"] == "Basic " + _b64.b64encode(b"user:pass").decode(), "basic style replaces existing Basic header")
+
 # should_inject: with a stub_token, inject ONLY over that stub (or an absent
 # credential); pass a secondary credential the guest legitimately holds straight
 # through (e.g. claude-code Remote Control's per-session worker_jwt on
@@ -183,6 +192,16 @@ check(m.should_inject(CIDict({"X-Api-Key": STUB}), "anthropic-apikey", STUB),
       "should_inject: apikey inject over stub key")
 check(not m.should_inject(CIDict({"X-Api-Key": "real-secondary"}), "anthropic-apikey", STUB),
       "should_inject: apikey pass through non-stub key")
+BSTUB = "cogbox-stub:cogbox-stub"
+_bstub_encoded = "Basic " + _b64.b64encode(BSTUB.encode()).decode()
+check(m.should_inject(CIDict({}), "basic", BSTUB),
+      "should_inject: basic inject when no credential present")
+check(m.should_inject(CIDict({"Authorization": _bstub_encoded}), "basic", BSTUB),
+      "should_inject: basic inject over the stub")
+check(not m.should_inject(CIDict({"Authorization": "Basic cmVhbDpjcmVk"}), "basic", BSTUB),
+      "should_inject: basic pass through non-stub credential")
+check(m.should_inject(CIDict({"Authorization": "Basic cmVhbDpjcmVk"}), "basic", None),
+      "should_inject: basic no stub_token -> legacy always-inject")
 
 # Single-source the stub token. The placeholder the redactor writes, the
 # fallback write_stub_cred, and the inject-conf stub_token MUST all derive from

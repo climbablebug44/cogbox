@@ -206,7 +206,7 @@ pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
 		if (sv != .string) return error.BadStyle;
 		style = sv.string;
 	}
-	if (!std.mem.eql(u8, style, "bearer") and !std.mem.eql(u8, style, "cookie")) return error.BadStyle;
+	if (!std.mem.eql(u8, style, "bearer") and !std.mem.eql(u8, style, "cookie") and !std.mem.eql(u8, style, "basic")) return error.BadStyle;
 
 	const secret_v = v.object.get("secret") orelse return error.MissingSecret;
 	if (secret_v != .string) return error.MissingSecret;
