@@ -148,17 +148,23 @@ pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []co
 /// key checking is disabled because the guest's root disk is ephemeral and its
 /// host keys regenerate on every boot.
 ///
-/// When `identity` is non-null it is passed as `-i <identity>`: cogbox's own
-/// managed key (see `defaultIdentity`). This is additive -- ssh still offers the
-/// user's agent and default keys -- so a user who authorized their own key keeps
-/// working even if the cogbox key is absent from authorized_keys.
+/// When `identity` is non-null (cogbox's own managed key; see `defaultIdentity`)
+/// ssh is pinned to *only* that key -- `-i <identity>` plus IdentitiesOnly=yes
+/// and IdentityAgent=none -- so it never offers the user's agent / ~/.ssh keys
+/// and never contacts an agent. That keeps a gpg-agent (ssh support) from
+/// prompting or stalling the connection, and is sufficient because the cogbox
+/// key is unioned into the guest's authorized_keys by default. When `identity`
+/// is null (the --no-auto-keys opt-out, where no cogbox key exists) none of this
+/// is added and ssh keeps its normal fallback to the user's agent and default
+/// keys, so a user who authorized only their own key still connects.
 ///
 /// A `-t` is inserted before the target for a fully interactive remote command
 /// (a command is present and both local stdin and stdout are ttys) so remote
 /// TUIs get a PTY; see `wantPty` for the gating rationale.
 ///
-/// ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-///     -o LogLevel=ERROR [-i <identity>] -p <port> [-t] root@<host> [extra...]
+/// ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+///     [-o IdentitiesOnly=yes -o IdentityAgent=none -i <identity>]
+///     -p <port> [-t] root@<host> [extra...]
 pub fn exec(allocator: std.mem.Allocator, endpoint: Endpoint, identity: ?[]const u8, extra: []const []const u8) !void {
 	// The two isatty() calls are this function's only impurity; evaluate them
 	// here and delegate the decision to the pure, unit-tested `wantPty`.
@@ -217,6 +223,18 @@ fn buildArgv(
 	try argv.append(allocator, "-o");
 	try argv.append(allocator, "LogLevel=ERROR");
 	if (identity) |id| {
+		// Pin ssh to *only* the cogbox key and never touch an authentication
+		// agent: IdentitiesOnly stops ssh offering the user's agent / ~/.ssh
+		// keys, and IdentityAgent=none keeps ssh from contacting any agent at
+		// all. The user's agent may be a gpg-agent (ssh support) that prompts
+		// or hangs; the cogbox key is unioned into the guest's authorized_keys
+		// by default, so offering it alone is sufficient and is a single,
+		// deterministic auth attempt. The opt-out path (no cogbox key ->
+		// identity null) skips this and keeps ssh's agent/default-key fallback.
+		try argv.append(allocator, "-o");
+		try argv.append(allocator, "IdentitiesOnly=yes");
+		try argv.append(allocator, "-o");
+		try argv.append(allocator, "IdentityAgent=none");
 		try argv.append(allocator, "-i");
 		try argv.append(allocator, id);
 	}
@@ -229,10 +247,11 @@ fn buildArgv(
 
 /// Path to cogbox's managed SSH identity (`<data>/cogbox_ed25519`), or null if
 /// it does not exist. The launch script generates it host-side and unions its
-/// pubkey into each VM's authorized_keys, so passing it as the default `-i`
-/// makes `cogbox ssh` work without the user's personal keys. Best-effort: any
-/// error (alloc, missing file) yields null so ssh falls back to its defaults.
-/// The returned slice is owned by the caller.
+/// pubkey into each VM's authorized_keys; `exec` then pins ssh to it exclusively
+/// (no agent), so `cogbox ssh` works without -- and without touching -- the
+/// user's personal keys or agent. Best-effort: any error (alloc, missing file)
+/// yields null, so ssh falls back to its defaults (the --no-auto-keys opt-out
+/// path). The returned slice is owned by the caller.
 pub fn defaultIdentity(allocator: std.mem.Allocator, io: std.Io, p: *const paths.Paths) ?[]const u8 {
 	const key_path = std.fs.path.join(allocator, &.{ p.base_data, "cogbox_ed25519" }) catch return null;
 	const cwd = std.Io.Dir.cwd();
@@ -462,6 +481,35 @@ test "buildArgv adds a single -t before the target only when force_pty" {
 		for (cmd, 0..) |want, j| {
 			try testing.expectEqualStrings(want, argv.items[host_i + 1 + j]);
 		}
+	}
+}
+
+test "buildArgv pins to the cogbox key and disables the agent only with an identity" {
+	var arena = std.heap.ArenaAllocator.init(testing.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+	const ep: Endpoint = .{ .port = "2222", .host = "10.0.2.15" };
+
+	// With an identity: ssh offers ONLY that key (IdentitiesOnly=yes) and never
+	// contacts an agent (IdentityAgent=none), so a gpg-agent can't be reached.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, "/data/cogbox_ed25519", &.{}, false);
+		try testing.expect(argvIndex(argv.items, "IdentitiesOnly=yes") != null);
+		try testing.expect(argvIndex(argv.items, "IdentityAgent=none") != null);
+		const i_i = argvIndex(argv.items, "-i").?;
+		try testing.expectEqualStrings("/data/cogbox_ed25519", argv.items[i_i + 1]);
+	}
+
+	// Without an identity (the --no-auto-keys opt-out, where no cogbox key
+	// exists): no pinning, so ssh keeps its default fallback to the user's agent
+	// and ~/.ssh keys -- a user who authorized only their own key still connects.
+	{
+		var argv: std.ArrayList([]const u8) = .empty;
+		try buildArgv(a, &argv, ep, null, &.{}, false);
+		try testing.expect(argvIndex(argv.items, "IdentitiesOnly=yes") == null);
+		try testing.expect(argvIndex(argv.items, "IdentityAgent=none") == null);
+		try testing.expect(argvIndex(argv.items, "-i") == null);
 	}
 }
 

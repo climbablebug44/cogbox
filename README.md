@@ -254,11 +254,14 @@ shared file. Without SSH keys, the VM console is accessible directly
 In addition, cogbox manages its own keypair at
 `~/.local/share/cogbox/cogbox_ed25519` and unions its public key into
 every guest's `authorized_keys` at launch, so `cogbox ssh` connects out
-of the box without relying on your personal keys. It passes this key as
-its default `-i` identity, offered *in addition to* your agent and
-`~/.ssh` keys, not instead of them. The private key stays on the host --
-it lives beside, not inside, the per-instance data mounted into a VM, and
-is reused across all instances.
+of the box without relying on your personal keys. It pins ssh to this key
+alone (`-i` plus `IdentitiesOnly=yes` and `IdentityAgent=none`), so your
+agent and `~/.ssh` keys are not offered and no agent is contacted -- a
+gpg-agent with ssh support can't stall or prompt on connect. The private
+key stays on the host -- it lives beside, not inside, the per-instance
+data mounted into a VM, and is reused across all instances. (Under
+`--no-auto-keys`, where no cogbox key exists, `cogbox ssh` instead falls
+back to your agent and `~/.ssh` keys.)
 
 `--no-auto-keys` at first init skips generating this key and records the
 opt-out (at `~/.config/cogbox/no-cogbox-key`), so a later plain `cogbox

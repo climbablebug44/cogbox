@@ -293,8 +293,11 @@ pub const SSH =
 	\\before any remote command (it is a flag, not part of the command).
 	\\
 	\\Connects with cogbox's own key (<data>/cogbox_ed25519), generated and
-	\\authorized in the guest automatically, so it works out of the box. This is
-	\\additive: your agent and ~/.ssh keys are still offered too.
+	\\authorized in the guest automatically, so it works out of the box. ssh is
+	\\pinned to that key alone (IdentitiesOnly + IdentityAgent=none): your agent
+	\\and ~/.ssh keys are not offered and no agent is contacted, so a gpg-agent
+	\\can't prompt or stall the connection. With --no-auto-keys (no cogbox key)
+	\\ssh instead falls back to your agent and ~/.ssh keys.
 	\\
 	\\A remote command run from an interactive terminal (stdin and stdout both a
 	\\tty) gets a PTY (ssh -t), so TUIs like htop or claude-code render and accept
