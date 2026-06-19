@@ -290,7 +290,7 @@ This per-instance login model currently applies to **claude-code** (the only har
 
 The same terminate-tier mechanism is not limited to the built-in harnesses: a **plugin** can request injection for any host its agent talks to, and an **operator** binds the actual credential host-side. This generalizes the harness path to arbitrary bearer tokens and session cookies while preserving the credless boundary.
 
-A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer` or `cookie`; the `cookie` style also needs a `cookieName`), the secret `name`, and an optional `stub` sentinel. The named specs merge into `.network.l7.inject.specs[]`:
+A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer`, `cookie`, or `basic`; the `cookie` style also needs a `cookieName`), the secret `name`, and an optional `stub` sentinel. The named specs merge into `.network.l7.inject.specs[]`:
 
 ```json
 "network": { "l7": {
@@ -315,7 +315,29 @@ cogbox secret ls
 cogbox secret rm api-bearer
 ```
 
-The value is read from a file or stdin (never argv, which leaks to the process table) and stored at `~/.config/cogbox/secrets/<name>` (mode `0600`) alongside a `<name>.meta` sidecar recording `audience`, `kind`, `tier`, and `bound_at`. The stored value is a single line -- a bare bearer token or a cookie value. Sidecar-produced per-instance secrets use the same layout under `instances/<name>/secrets/` and shadow a global secret of the same name. Names are restricted to `[A-Za-z0-9_-]` so neither `<name>` nor `<name>.meta` can traverse out of the store.
+The value is read from a file or stdin (never argv, which leaks to the process table) and stored at `~/.config/cogbox/secrets/<name>` (mode `0600`) alongside a `<name>.meta` sidecar recording `audience`, `kind`, `tier`, and `bound_at`. The stored value is a single line -- a bare bearer token, a `user:password` pair, or a cookie value -- interpreted according to `--kind`.
+
+**Supported `--kind` values and their wire format:**
+
+| Kind | `Authorization` header | Stored value |
+|---|---|---|
+| `bearer` (default) | `Authorization: Bearer <value>` | raw token |
+| `basic` | `Authorization: Basic base64(<value>)` | `user:password` |
+| `cookie` | replaces named cookie only | cookie value |
+
+**Example -- HTTP Basic auth for an internal Elasticsearch cluster:**
+
+```sh
+# Store the credential (the raw user:password; base64 encoding is done at injection time)
+echo -n "elastic:mypassword" | cogbox secret add es-creds \
+    --from-stdin --audience elastic.internal.example.com --kind basic
+
+# Allow the host through the L7 terminate tier (required for header rewriting)
+cogbox l7 add allow elastic.internal.example.com
+
+# The guest sends requests unauthenticated or with a placeholder;
+# the host proxy rewrites the Authorization header before the request leaves the host.
+``` Sidecar-produced per-instance secrets use the same layout under `instances/<name>/secrets/` and shadow a global secret of the same name. Names are restricted to `[A-Za-z0-9_-]` so neither `<name>` nor `<name>.meta` can traverse out of the store.
 
 At boot (and on the hot-reload path), the renderer resolves each spec's named secret to the store's value path and emits it with `cred_format: "raw"` -- the addon reads that file's **first non-empty line** as the credential (no dotted `token_path`, unlike the JSON-cred harness specs). It writes the inject-conf with **two fail-closed gates**:
 
