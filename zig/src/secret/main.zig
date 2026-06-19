@@ -60,8 +60,8 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 	if (!store.validName(nm)) {
 		return die(allocator, io, "invalid secret name '{s}' (use [A-Za-z0-9_-], max 64)", .{nm}, 65);
 	}
-	if (!eql(kind, "bearer") and !eql(kind, "cookie")) {
-		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie)", .{kind}, 65);
+	if (!eql(kind, "bearer") and !eql(kind, "cookie") and !eql(kind, "basic")) {
+		return die(allocator, io, "invalid --kind '{s}' (expected bearer|cookie|basic)", .{kind}, 65);
 	}
 	if (from_file != null and from_stdin) {
 		return die(allocator, io, "--from-file and --from-stdin are mutually exclusive", .{}, 64);

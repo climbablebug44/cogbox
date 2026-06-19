@@ -26,6 +26,7 @@ and hot-reloaded on mtime change, so `cogbox l7 add/del` takes effect without
 restarting mitmproxy.
 """
 
+import base64
 import fcntl
 import glob
 import hashlib
@@ -285,6 +286,8 @@ def apply_injection(headers, style, token, account_id=None, cookie_name=None):
         headers["authorization"] = "Bearer " + token
         if account_id:
             headers["chatgpt-account-id"] = account_id
+    elif style == "basic":
+        headers["authorization"] = "Basic " + base64.b64encode(token.encode()).decode()
     elif style == "cookie":
         # `token` is the session-cookie VALUE; replace only the named cookie.
         if cookie_name:
@@ -314,6 +317,10 @@ def should_inject(headers, style, stub_token, cookie_name=None):
     if style == "anthropic-apikey":
         cur = headers.get("x-api-key", "")
         return cur == "" or cur == stub_token
+    if style == "basic":
+        cur = headers.get("authorization", "")
+        encoded_stub = "Basic " + base64.b64encode(stub_token.encode()).decode()
+        return cur == "" or cur == encoded_stub
     cur = headers.get("authorization", "")
     return cur == "" or cur == "Bearer " + stub_token
 
