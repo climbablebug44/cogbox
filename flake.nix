@@ -671,6 +671,32 @@
 			});
 			cogbox = mkCogbox runner;
 			default = cogbox;
+
+			# Container image for a single cogbox sandbox pod: bundles the cogbox
+			# CLI so a Kubernetes control plane (e.g. cogworx) runs `cogbox start`
+			# against /dev/kvm inside the pod. streamLayeredImage (not
+			# buildLayeredImage) makes the image a build script that streams the
+			# tarball on demand -- nothing multi-hundred-MB is realized into the
+			# Nix store; pipe it to skopeo / `docker load` (see push-pod-image).
+			cogbox-pod-image = pkgs.dockerTools.streamLayeredImage {
+				name = "cogbox-pod";
+				tag = "latest";
+				contents = [
+					cogbox
+					pkgs.bashInteractive
+					pkgs.coreutils
+					# cogbox-launch.sh is `#!/usr/bin/env bash`; without /usr/bin/env
+					# the kernel can't find the interpreter and `cogbox init` ExecvFails.
+					pkgs.dockerTools.usrBinEnv
+					# passt drops privileges to `nobody` and cogbox calls `id`; both
+					# need /etc/passwd + /etc/group. fakeNss seeds root + nobody.
+					pkgs.dockerTools.fakeNss
+				];
+				config = {
+					Entrypoint = [ "/bin/sh" ];
+					Env = [ "PATH=/bin" ];
+				};
+			};
 		} // lib.optionalAttrs (system == "x86_64-linux") {
 			# Test fixture: a cogbox wrapper baked against the
 			# pre-built test-hello runner. Used by tests/cogbox.nix
@@ -684,6 +710,30 @@
 			# runner (see cogbox-x86_64-test-plugin).
 			cogbox-test-plugin = mkCogbox
 				self.nixosConfigurations.cogbox-x86_64-test-plugin.config.microvm.declaredRunner;
+		});
+
+		# `nix run .#push-pod-image [-- <registry-ref>]` streams the sandbox-pod
+		# image straight into the destination registry. Supply the ref as the arg
+		# or via $COGBOX_POD_REF (default is a placeholder); registry auth comes
+		# from $REGISTRY_AUTH_FILE, else ~/.docker/config.json.
+		apps = forAllSystems (system: let
+			pkgs = nixpkgs.legacyPackages.${system};
+			image = self.packages.${system}.cogbox-pod-image;
+		in {
+			push-pod-image = {
+				type = "app";
+				program = "${pkgs.writeShellApplication {
+					name = "push-pod-image";
+					runtimeInputs = [ pkgs.skopeo ];
+					text = ''
+						ref="''${1:-''${COGBOX_POD_REF:-registry.example.com/team/cogbox-pod:latest}}"
+						authfile="''${REGISTRY_AUTH_FILE:-$HOME/.docker/config.json}"
+						echo "Pushing cogbox-pod -> docker://$ref (auth: $authfile)" >&2
+						${image} | skopeo copy --insecure-policy --authfile "$authfile" docker-archive:/dev/stdin "docker://$ref"
+						echo "Pushed $ref" >&2
+					'';
+				}}/bin/push-pod-image";
+			};
 		});
 
 		checks = forAllSystems (system: let
