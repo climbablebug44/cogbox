@@ -20,23 +20,29 @@ pub const RunOut = struct {
 	}
 };
 
-pub fn runNix(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !RunOut {
+/// Run a `nix` subcommand. `env`, when non-null, REPLACES the child
+/// environment for this one invocation -- the plugin fetch passes a per-fetch
+/// map (a clone of the parent env with HOME / GIT_CONFIG_* / GIT_TERMINAL_PROMPT
+/// overridden) so a private-repo clone authenticates from a temp netrc scoped to
+/// exactly this exec. Null inherits the parent env
+/// unchanged -- the default for every non-authenticated nix call.
+pub fn runNix(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, args: []const []const u8) !RunOut {
 	var argv: std.ArrayList([]const u8) = .empty;
 	defer argv.deinit(allocator);
 	try argv.appendSlice(allocator, &.{ "nix", "--extra-experimental-features", "nix-command flakes" });
 	try argv.appendSlice(allocator, args);
 
-	const res = try std.process.run(allocator, io, .{ .argv = argv.items });
+	const res = try std.process.run(allocator, io, .{ .argv = argv.items, .environ_map = env });
 	const ok = res.term == .exited and res.term.exited == 0;
 	return .{ .stdout = res.stdout, .stderr = res.stderr, .ok = ok };
 }
 
-pub fn flakeMetadata(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !RunOut {
-	return runNix(allocator, io, &.{ "flake", "metadata", "--json", url });
+pub fn flakeMetadata(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "flake", "metadata", "--json", url });
 }
 
-pub fn flakeArchive(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !RunOut {
-	return runNix(allocator, io, &.{ "flake", "archive", "--json", url });
+pub fn flakeArchive(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "flake", "archive", "--json", url });
 }
 
 /// Outcome of the nixosModules.<attr> contract check. `missing` is the
@@ -52,12 +58,12 @@ pub const ModuleCheck = union(enum) {
 
 /// `nix eval URL#nixosModules --apply 'm: m ? "<attr>"' --json`. `attr` must
 /// satisfy name.isValidAttr (it is interpolated into a nix expression).
-pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: []const u8) !ModuleCheck {
+pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, attr: []const u8) !ModuleCheck {
 	const installable = try std.fmt.allocPrint(allocator, "{s}#nixosModules", .{url});
 	defer allocator.free(installable);
 	const apply = try std.fmt.allocPrint(allocator, "m: m ? \"{s}\"", .{attr});
 	defer allocator.free(apply);
-	var out = try runNix(allocator, io, &.{ "eval", installable, "--apply", apply, "--json" });
+	var out = try runNix(allocator, io, env, &.{ "eval", installable, "--apply", apply, "--json" });
 	defer out.deinit(allocator);
 	return switch (classifyModuleCheck(out.ok, out.stdout, out.stderr)) {
 		.present => .present,
@@ -88,13 +94,13 @@ pub fn classifyModuleCheck(ok: bool, stdout: []const u8, stderr: []const u8) std
 /// (L4 CIDR rules) or `l7Rules` (vhost rules). IFD is blocked: reading the
 /// rules must never trigger a build of untrusted code at add time. `attr`
 /// must satisfy name.isValidAttr; `leaf` is always caller-controlled.
-pub fn evalPluginRules(allocator: std.mem.Allocator, io: std.Io, url: []const u8, attr: ?[]const u8, leaf: []const u8) !RunOut {
+pub fn evalPluginRules(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, attr: ?[]const u8, leaf: []const u8) !RunOut {
 	const installable = if (attr) |a|
 		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.\"{s}\".{s}", .{ url, a, leaf })
 	else
 		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.{s}", .{ url, leaf });
 	defer allocator.free(installable);
-	return runNix(allocator, io, &.{ "eval", installable, "--json", "--no-allow-import-from-derivation" });
+	return runNix(allocator, io, env, &.{ "eval", installable, "--json", "--no-allow-import-from-derivation" });
 }
 
 /// Whether a failed eval's stderr means "that attribute just isn't there"

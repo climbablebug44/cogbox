@@ -22,6 +22,9 @@ pub const AddArgs = struct {
 	url: []const u8,
 	as: ?[]const u8 = null,
 	yes: bool = false,
+	// --git-credential-stdin: read one `host\tuser\ttoken` line from stdin and
+	// authenticate the single nix fetch with it.
+	git_credential_stdin: bool = false,
 };
 
 pub const DelArgs = struct {
@@ -31,6 +34,8 @@ pub const DelArgs = struct {
 
 pub const UpdateArgs = struct {
 	plugin: ?[]const u8 = null,
+	// update re-resolves the flake, so it takes the same single-fetch credential.
+	git_credential_stdin: bool = false,
 };
 
 pub const ParseError = error{
@@ -60,6 +65,7 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	var url: ?[]const u8 = null;
 	var as: ?[]const u8 = null;
 	var yes = false;
+	var git_cred = false;
 
 	var i: usize = 0;
 	while (i < args.len) : (i += 1) {
@@ -72,6 +78,8 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 			as = a[5..];
 		} else if (std.mem.eql(u8, a, "-y") or std.mem.eql(u8, a, "--yes")) {
 			yes = true;
+		} else if (std.mem.eql(u8, a, "--git-credential-stdin")) {
+			git_cred = true;
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -81,7 +89,7 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	}
 
 	const u = url orelse return error.MissingUrl;
-	return .{ .add = .{ .url = u, .as = as, .yes = yes } };
+	return .{ .add = .{ .url = u, .as = as, .yes = yes, .git_credential_stdin = git_cred } };
 }
 
 fn parseDel(args: []const []const u8) ParseError!Cmd {
@@ -104,12 +112,19 @@ fn parseDel(args: []const []const u8) ParseError!Cmd {
 }
 
 fn parseUpdate(args: []const []const u8) ParseError!Cmd {
-	if (args.len > 1) return error.InvalidArgs;
-	if (args.len == 1) {
-		if (std.mem.startsWith(u8, args[0], "-")) return error.InvalidArgs;
-		return .{ .update = .{ .plugin = args[0] } };
+	var plugin: ?[]const u8 = null;
+	var git_cred = false;
+	for (args) |a| {
+		if (std.mem.eql(u8, a, "--git-credential-stdin")) {
+			git_cred = true;
+		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
+			return error.InvalidArgs;
+		} else {
+			if (plugin != null) return error.InvalidArgs;
+			plugin = a;
+		}
 	}
-	return .{ .update = .{} };
+	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred } };
 }
 
 // --- Tests ---
@@ -143,6 +158,20 @@ test "add missing url / extra positional / unknown flag" {
 	try t.expectError(error.InvalidArgs, parse(&.{ "add", "a", "--frob" }));
 }
 
+test "add --git-credential-stdin" {
+	const c = try parse(&.{ "add", "git+https://git.example.com/g/r", "--git-credential-stdin" });
+	try t.expect(c.add.git_credential_stdin);
+	try t.expectEqualStrings("git+https://git.example.com/g/r", c.add.url);
+	// Default is off.
+	const c2 = try parse(&.{ "add", "git+https://git.example.com/g/r" });
+	try t.expect(!c2.add.git_credential_stdin);
+	// Combines with --as / -y.
+	const c3 = try parse(&.{ "add", "u", "--as", "p", "--git-credential-stdin", "-y" });
+	try t.expect(c3.add.git_credential_stdin);
+	try t.expectEqualStrings("p", c3.add.as.?);
+	try t.expect(c3.add.yes);
+}
+
 test "del parses" {
 	const c = try parse(&.{ "del", "myplugin" });
 	try t.expectEqualStrings("myplugin", c.del.plugin);
@@ -154,9 +183,19 @@ test "del parses" {
 test "update with and without name" {
 	const all = try parse(&.{"update"});
 	try t.expect(all.update.plugin == null);
+	try t.expect(!all.update.git_credential_stdin);
 	const one = try parse(&.{ "update", "myplugin" });
 	try t.expectEqualStrings("myplugin", one.update.plugin.?);
 	try t.expectError(error.InvalidArgs, parse(&.{ "update", "a", "b" }));
+}
+
+test "update --git-credential-stdin (with and without name)" {
+	const c = try parse(&.{ "update", "--git-credential-stdin" });
+	try t.expect(c.update.git_credential_stdin);
+	try t.expect(c.update.plugin == null);
+	const c2 = try parse(&.{ "update", "myplugin", "--git-credential-stdin" });
+	try t.expect(c2.update.git_credential_stdin);
+	try t.expectEqualStrings("myplugin", c2.update.plugin.?);
 }
 
 test "unknown / missing subcommand" {

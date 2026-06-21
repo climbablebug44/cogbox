@@ -13,6 +13,7 @@ const plugin_module = @import("plugin_module");
 pub fn run(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *const std.process.Environ.Map,
 	p: *const paths.Paths,
 	argv: []const []const u8,
 ) !void {
@@ -71,5 +72,5 @@ pub fn run(
 		util.die(allocator, io, "plugin", exit_codes.noinput, "no config found at {s}", .{cfg_path});
 	};
 
-	try plugin_module.dispatch(allocator, io, name, cfg_path, inst_runtime, user_flake_dir, plugins_flake_dir, rest.items);
+	try plugin_module.dispatch(allocator, io, env, name, cfg_path, inst_runtime, user_flake_dir, plugins_flake_dir, rest.items);
 }

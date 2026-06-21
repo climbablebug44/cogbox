@@ -109,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "remap")) return remap_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, &p, rest);
-	if (std.mem.eql(u8, verb, "plugin")) return plugin_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "plugin")) return plugin_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "secret")) return secret_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "__l7proxy")) {
 		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__l7proxy requires a runtime dir [l7-base-port]", .{});

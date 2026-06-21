@@ -9,6 +9,7 @@ test {
 	std.testing.refAllDecls(@import("compose.zig"));
 	std.testing.refAllDecls(@import("mutate.zig"));
 	std.testing.refAllDecls(@import("nix.zig"));
+	std.testing.refAllDecls(@import("gitcred.zig"));
 	_ = @import("name_test.zig");
 	_ = @import("compose_test.zig");
 	_ = @import("mutate_test.zig");

@@ -15,6 +15,7 @@ pub const name_mod = @import("name.zig");
 pub const compose = @import("compose.zig");
 pub const mutate = @import("mutate.zig");
 pub const nix = @import("nix.zig");
+pub const gitcred = @import("gitcred.zig");
 
 const rules_module = @import("rules_module");
 const config = rules_module.config;
@@ -25,6 +26,7 @@ const l7_rule = l7_module.rule;
 pub fn dispatch(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *const std.process.Environ.Map,
 	instance: ?[]const u8,
 	config_path: []const u8,
 	runtime_path: []const u8,
@@ -50,9 +52,10 @@ pub fn dispatch(
 	};
 	defer loaded.deinit();
 
-	const ctx: Ctx = .{
+	var ctx: Ctx = .{
 		.allocator = allocator,
 		.io = io,
+		.parent_env = env,
 		.instance = instance,
 		.config_path = config_path,
 		.runtime_path = runtime_path,
@@ -61,26 +64,34 @@ pub fn dispatch(
 	};
 
 	switch (cmd) {
-		.list => try cmdList(ctx, &loaded),
-		.add => |a| try cmdAdd(ctx, &loaded, a),
-		.del => |d| try cmdDel(ctx, &loaded, d),
-		.update => |u| try cmdUpdate(ctx, &loaded, u),
+		.list => try cmdList(&ctx, &loaded),
+		.add => |a| try cmdAdd(&ctx, &loaded, a),
+		.del => |d| try cmdDel(&ctx, &loaded, d),
+		.update => |u| try cmdUpdate(&ctx, &loaded, u),
 	}
 }
 
 const Ctx = struct {
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	// The parent environment, used to clone a per-fetch env when a credential
+	// is supplied. The nix fetch otherwise inherits this unchanged.
+	parent_env: *const std.process.Environ.Map,
 	instance: ?[]const u8,
 	config_path: []const u8,
 	runtime_path: []const u8,
 	user_flake_dir: []const u8,
 	plugins_flake_dir: []const u8,
+	// Per-fetch credential env. null => the nix
+	// fetch runs with the inherited parent env (public/unauthenticated). When a
+	// `--git-credential-stdin` add/update supplies a token, cmdAdd/cmdUpdate set
+	// this to the temp-netrc env for the duration of the fetch, then tear it down.
+	fetch_env: ?*const std.process.Environ.Map = null,
 };
 
 // --- list ---------------------------------------------------------------
 
-fn cmdList(ctx: Ctx, loaded: *config.Loaded) !void {
+fn cmdList(ctx: *const Ctx, loaded: *config.Loaded) !void {
 	const arr = mutate.existingPluginsArray(loaded.root());
 	if (arr == null or arr.?.items.len == 0) {
 		try announce(ctx, "(no plugins)", .{});
@@ -125,9 +136,30 @@ fn shortRev(obj: std.json.ObjectMap) []const u8 {
 
 // --- add ----------------------------------------------------------------
 
-fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
+fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
+
+	// --git-credential-stdin: read the one credential line, materialize a temp
+	// 0600 netrc + clear-helper gitconfig, and scope a per-fetch env to it for
+	// every nix call below. Torn down (temp dir removed) when this verb returns.
+	// The token is never in argv/env-of-record/log; it lives only in the temp
+	// netrc for the lifetime of the fetch.
+	var fetch_env: ?gitcred.FetchEnv = null;
+	defer if (fetch_env) |*fe| fe.deinit();
+	if (a.git_credential_stdin) {
+		const raw = gitcred.readStdin(allocator, io) catch {
+			die(allocator, io, "could not read git credential from stdin", .{}, 65);
+		};
+		defer allocator.free(raw);
+		const cred = gitcred.parseLine(raw) catch {
+			die(allocator, io, "malformed git credential on stdin (want host<TAB>user<TAB>token)", .{}, 65);
+		};
+		fetch_env = gitcred.FetchEnv.setup(allocator, io, ctx.parent_env, cred) catch {
+			die(allocator, io, "could not set up authenticated fetch", .{}, 70);
+		};
+		ctx.fetch_env = fetch_env.?.map();
+	}
 
 	// `URL#attr` selects nixosModules.<attr>; bare URL means `default`.
 	const split = name_mod.splitFragment(a.url) catch |err| switch (err) {
@@ -198,7 +230,7 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	}
 
 	const module_attr = attr orelse "default";
-	switch (try nix.evalHasNixosModule(allocator, io, meta.locked_url, module_attr)) {
+	switch (try nix.evalHasNixosModule(allocator, io, ctx.fetch_env, meta.locked_url, module_attr)) {
 		.present => {},
 		.missing => die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65),
 		.failed => |stderr| die(allocator, io, "could not evaluate flake '{s}':\n{s}", .{ meta.locked_url, nix.stderrTail(stderr) }, 65),
@@ -290,7 +322,7 @@ fn cmdAdd(ctx: Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 // --- del ----------------------------------------------------------------
 
-fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
+fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
 
@@ -330,9 +362,28 @@ fn cmdDel(ctx: Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 
 // --- update -------------------------------------------------------------
 
-fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
+fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
+
+	// --git-credential-stdin: same single-fetch netrc setup as add. update
+	// re-resolves the flake (nix flake metadata + archive), so the private repo
+	// needs the acting user's token for those fetches too.
+	var fetch_env: ?gitcred.FetchEnv = null;
+	defer if (fetch_env) |*fe| fe.deinit();
+	if (u.git_credential_stdin) {
+		const raw = gitcred.readStdin(allocator, io) catch {
+			die(allocator, io, "could not read git credential from stdin", .{}, 65);
+		};
+		defer allocator.free(raw);
+		const cred = gitcred.parseLine(raw) catch {
+			die(allocator, io, "malformed git credential on stdin (want host<TAB>user<TAB>token)", .{}, 65);
+		};
+		fetch_env = gitcred.FetchEnv.setup(allocator, io, ctx.parent_env, cred) catch {
+			die(allocator, io, "could not set up authenticated fetch", .{}, 70);
+		};
+		ctx.fetch_env = fetch_env.?.map();
+	}
 
 	const plugins_arr = mutate.existingPluginsArray(loaded.root()) orelse {
 		if (u.plugin) |p| die(allocator, io, "no such plugin '{s}'", .{p}, 65);
@@ -390,7 +441,7 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 			for (resolved.items) |*r| {
 				if (std.mem.eql(u8, r.url, url)) break :blk &r.meta;
 			}
-			var meta_out = nix.flakeMetadata(allocator, io, url) catch {
+			var meta_out = nix.flakeMetadata(allocator, io, ctx.fetch_env, url) catch {
 				die(allocator, io, "failed to run nix (is it on PATH?)", .{}, 70);
 			};
 			defer meta_out.deinit(allocator);
@@ -510,8 +561,8 @@ fn cmdUpdate(ctx: Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 // --- shared helpers ------------------------------------------------------
 
 /// nix flake metadata + parse, with fatal errors on failure.
-fn resolveFlake(ctx: Ctx, url: []const u8) nix.Meta {
-	var out = nix.flakeMetadata(ctx.allocator, ctx.io, url) catch {
+fn resolveFlake(ctx: *const Ctx, url: []const u8) nix.Meta {
+	var out = nix.flakeMetadata(ctx.allocator, ctx.io, ctx.fetch_env, url) catch {
 		die(ctx.allocator, ctx.io, "failed to run nix (is it on PATH?)", .{}, 70);
 	};
 	defer out.deinit(ctx.allocator);
@@ -526,8 +577,8 @@ fn resolveFlake(ctx: Ctx, url: []const u8) nix.Meta {
 /// Pre-fetch the plugin and its transitive inputs into the store so later
 /// (offline) starts resolve the pinned URLs locally. Failure is non-fatal:
 /// the plugin still works, the first start just needs network.
-fn archiveFlake(ctx: Ctx, locked_url: []const u8) void {
-	var out = nix.flakeArchive(ctx.allocator, ctx.io, locked_url) catch return;
+fn archiveFlake(ctx: *const Ctx, locked_url: []const u8) void {
+	var out = nix.flakeArchive(ctx.allocator, ctx.io, ctx.fetch_env, locked_url) catch return;
 	defer out.deinit(ctx.allocator);
 	if (!out.ok) {
 		warn(ctx, "could not pre-fetch flake inputs (offline starts may fail): {s}", .{nix.stderrTail(out.stderr)}) catch {};
@@ -538,13 +589,13 @@ fn archiveFlake(ctx: Ctx, locked_url: []const u8) void {
 /// cogboxPlugin."<attr>".<leaf>, with the flat path cogboxPlugin.<leaf> as
 /// fallback for the default module. Returns the parsed tree when the output
 /// exists and is a JSON list; null when the flake doesn't declare it.
-fn evalRuleList(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8, leaf: []const u8) ?std.json.Parsed(std.json.Value) {
+fn evalRuleList(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8, leaf: []const u8) ?std.json.Parsed(std.json.Value) {
 	const allocator = ctx.allocator;
-	var out = nix.evalPluginRules(allocator, ctx.io, locked_url, attr orelse "default", leaf) catch return null;
+	var out = nix.evalPluginRules(allocator, ctx.io, ctx.fetch_env, locked_url, attr orelse "default", leaf) catch return null;
 	if (!out.ok and attr == null and nix.stderrSaysMissingAttribute(out.stderr)) {
 		// No cogboxPlugin.default -- fall back to the flat form.
 		out.deinit(allocator);
-		out = nix.evalPluginRules(allocator, ctx.io, locked_url, null, leaf) catch return null;
+		out = nix.evalPluginRules(allocator, ctx.io, ctx.fetch_env, locked_url, null, leaf) catch return null;
 	}
 	defer out.deinit(allocator);
 	if (!out.ok) {
@@ -564,7 +615,7 @@ fn evalRuleList(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8, leaf: []con
 }
 
 /// L4 CIDR rules (cogboxPlugin.<attr>.networkRules), validated.
-fn evalRules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+fn evalRules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "networkRules") orelse return null;
 	for (parsed.value.array.items, 0..) |r, i| {
 		mutate.validatePluginRule(r) catch |err| {
@@ -582,7 +633,7 @@ fn evalRules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Pars
 
 /// L7 vhost rules (cogboxPlugin.<attr>.l7Rules), validated with the same
 /// constraints `l7 add` enforces.
-fn evalL7Rules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+fn evalL7Rules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "l7Rules") orelse return null;
 	for (parsed.value.array.items, 0..) |r, i| {
 		mutate.validatePluginL7Rule(r) catch |err| {
@@ -603,7 +654,7 @@ fn evalL7Rules(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Pa
 
 /// Credential injection specs (cogboxPlugin.<attr>.inject), validated:
 /// name-only, exact audience host, no inline secret material.
-fn evalInjectSpecs(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
+fn evalInjectSpecs(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "inject") orelse return null;
 	for (parsed.value.array.items, 0..) |s, i| {
 		mutate.validatePluginInjectSpec(s) catch |err| {
@@ -696,7 +747,7 @@ fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
 /// from the current .plugins array. Pure function of config.json, rebuilt on
 /// every mutation, so a crash between config save and this write self-heals
 /// on the next plugin command.
-fn regenComposition(ctx: Ctx, plugins_arr: *std.json.Array) !void {
+fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
 	const allocator = ctx.allocator;
 	if (plugins_arr.items.len == 0) {
 		try compose.removeCompositionFlake(allocator, ctx.io, ctx.plugins_flake_dir);
@@ -734,7 +785,7 @@ fn pinLabel(meta: *const nix.Meta) []const u8 {
 	return stripped[0..@min(stripped.len, 8)];
 }
 
-fn printRuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
+fn printRuleLine(ctx: *const Ctx, sign: []const u8, r: std.json.Value) !void {
 	if (r != .object) return;
 	const p = rule.ruleAction(r.object) orelse return;
 	const action = switch (p.action) {
@@ -748,7 +799,7 @@ fn printRuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
 	}
 }
 
-fn printL7RuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
+fn printL7RuleLine(ctx: *const Ctx, sign: []const u8, r: std.json.Value) !void {
 	if (r != .object) return;
 	const p = l7_rule.ruleAction(r.object) orelse return;
 	const action = switch (p.action) {
@@ -794,7 +845,7 @@ fn printL7RuleLine(ctx: Ctx, sign: []const u8, r: std.json.Value) !void {
 	}
 }
 
-fn printInjectLine(ctx: Ctx, sign: []const u8, s: std.json.Value) !void {
+fn printInjectLine(ctx: *const Ctx, sign: []const u8, s: std.json.Value) !void {
 	if (s != .object) return;
 	const host = blk: {
 		const h = s.object.get("host") orelse return;
@@ -822,7 +873,7 @@ fn printInjectLine(ctx: Ctx, sign: []const u8, s: std.json.Value) !void {
 /// host-side. We don't (yet) check bound state here -- the point is the
 /// command to run; an unbound secret simply renders no conf and injection
 /// stays inert (fail closed) until bound.
-fn printBindChecklist(ctx: Ctx, specs: []const std.json.Value) !void {
+fn printBindChecklist(ctx: *const Ctx, specs: []const std.json.Value) !void {
 	if (specs.len == 0) return;
 	try announce(ctx, "Bind these secrets host-side so injection takes effect (they stay OUT of the guest):", .{});
 	for (specs) |s| {
@@ -834,7 +885,7 @@ fn printBindChecklist(ctx: Ctx, specs: []const std.json.Value) !void {
 	}
 }
 
-fn printRestartHint(ctx: Ctx, why: []const u8) !void {
+fn printRestartHint(ctx: *const Ctx, why: []const u8) !void {
 	if (!isRunning(ctx)) {
 		try announce(ctx, "It will take effect at the next start.", .{});
 		return;
@@ -846,7 +897,7 @@ fn printRestartHint(ctx: Ctx, why: []const u8) !void {
 	}
 }
 
-fn isRunning(ctx: Ctx) bool {
+fn isRunning(ctx: *const Ctx) bool {
 	const pid_path = std.fs.path.join(ctx.allocator, &.{ ctx.runtime_path, "pid" }) catch return false;
 	defer ctx.allocator.free(pid_path);
 
@@ -866,7 +917,7 @@ fn isRunning(ctx: Ctx) bool {
 
 /// Interactive confirmation. Non-tty stdin auto-confirms, matching the
 /// launcher's behavior for its own prompts (scripted/test use).
-fn confirm(ctx: Ctx, prompt: []const u8) !bool {
+fn confirm(ctx: *const Ctx, prompt: []const u8) !bool {
 	const stdin = std.Io.File.stdin();
 	const tty = stdin.isTty(ctx.io) catch false;
 	if (!tty) return true;
@@ -902,13 +953,13 @@ fn writeStderr(io: std.Io, bytes: []const u8) !void {
 	try w.flush();
 }
 
-fn announce(ctx: Ctx, comptime fmt: []const u8, args: anytype) !void {
+fn announce(ctx: *const Ctx, comptime fmt: []const u8, args: anytype) !void {
 	const msg = try std.fmt.allocPrint(ctx.allocator, fmt ++ "\n", args);
 	defer ctx.allocator.free(msg);
 	try writeStdout(ctx.io, msg);
 }
 
-fn warn(ctx: Ctx, comptime fmt: []const u8, args: anytype) !void {
+fn warn(ctx: *const Ctx, comptime fmt: []const u8, args: anytype) !void {
 	const msg = try std.fmt.allocPrint(ctx.allocator, "cogbox plugin: warning: " ++ fmt ++ "\n", args);
 	defer ctx.allocator.free(msg);
 	try writeStderr(ctx.io, msg);
