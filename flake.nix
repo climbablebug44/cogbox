@@ -700,6 +700,26 @@
 					# passt drops privileges to `nobody` and cogbox calls `id`; both
 					# need /etc/passwd + /etc/group. fakeNss seeds root + nobody.
 					pkgs.dockerTools.fakeNss
+					# In-pod nix must BUILD the microvm runner when an instance has a
+					# plugin: a no-plugin runner is the baked-in cache hit, but a
+					# plugin's custom NixOS module makes a fresh closure. The pod has
+					# no `nixbld` group, so nix's default `build-users-group = nixbld`
+					# aborts every build -- empty it so nix builds single-user as root
+					# (the pod is itself the isolation boundary). `sandbox = false`:
+					# the build sandbox needs namespace/mount setup the pod doesn't
+					# grant, and plugin builds are trusted-on-add. `substituters` makes
+					# the standard leaf deps (nodejs, ...) substitute from the public
+					# caches the pod is given egress to, so only the small
+					# plugin-specific top is built from source. cogbox-launch.sh still
+					# adds the per-instance PVC plugin-cache via `--extra-substituters`
+					# (require-sigs false) on top of this.
+					(pkgs.writeTextDir "etc/nix/nix.conf" (lib.concatStringsSep "\n" [
+						"experimental-features = nix-command flakes"
+						"build-users-group ="
+						"sandbox = false"
+						"substituters = https://cache.nixos.org https://cache.numtide.com"
+						"trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+					] + "\n"))
 				];
 				config = {
 					Entrypoint = [ "/bin/sh" ];
