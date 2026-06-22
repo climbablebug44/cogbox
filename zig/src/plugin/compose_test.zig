@@ -3,12 +3,12 @@ const compose = @import("compose.zig");
 const t = std.testing;
 
 test "render refuses zero plugins" {
-	try t.expectError(error.NoPlugins, compose.render(t.allocator, "default", "/cfg/flake", &.{}));
+	try t.expectError(error.NoPlugins, compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{}));
 }
 
-test "golden render: one plugin" {
-	const out = try compose.render(t.allocator, "default", "/home/u/.config/cogbox/instances/default/flake", &.{
-		.{ .name = "myplugin", .locked_url = "github:o/myplugin/abc123?narHash=sha256-AAAA" },
+test "golden render: one plugin (hydrated -> path: input)" {
+	const out = try compose.render(t.allocator, "default", "/home/u/.config/cogbox/instances/default/flake", "/home/u/.config/cogbox/instances/default/plugin-sources", &.{
+		.{ .name = "myplugin", .locked_url = "github:o/myplugin/abc123?narHash=sha256-AAAA", .has_source = true },
 	});
 	defer t.allocator.free(out);
 
@@ -20,7 +20,7 @@ test "golden render: one plugin" {
 		"\n" ++
 		"\tinputs = {\n" ++
 		"\t\tuser.url = \"path:/home/u/.config/cogbox/instances/default/flake\";\n" ++
-		"\t\t\"p-myplugin\".url = \"github:o/myplugin/abc123?narHash=sha256-AAAA\";\n" ++
+		"\t\t\"p-myplugin\".url = \"path:/home/u/.config/cogbox/instances/default/plugin-sources/myplugin\";\n" ++
 		"\t};\n" ++
 		"\n" ++
 		"\toutputs = { self, user, ... }@inputs: {\n" ++
@@ -35,8 +35,27 @@ test "golden render: one plugin" {
 	try t.expectEqualStrings(expected, out);
 }
 
+test "hydrated source emits path: input; unhydrated falls back to locked URL" {
+	// has_source=true -> a `path:<sources_dir>/<name>` input (offline at launch).
+	const hydrated = try compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{
+		.{ .name = "p", .locked_url = "git+https://git.example.com/o/r?ref=main&rev=deadbeef", .has_source = true },
+	});
+	defer t.allocator.free(hydrated);
+	try t.expect(std.mem.indexOf(u8, hydrated, "\"p-p\".url = \"path:/cfg/plugin-sources/p\";") != null);
+	// The locked git URL must NOT appear when the source is materialized.
+	try t.expect(std.mem.indexOf(u8, hydrated, "git.example.com") == null);
+
+	// has_source=false (migration fallback) -> the locked URL verbatim.
+	const fallback = try compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{
+		.{ .name = "p", .locked_url = "git+https://git.example.com/o/r?ref=main&rev=deadbeef", .has_source = false },
+	});
+	defer t.allocator.free(fallback);
+	try t.expect(std.mem.indexOf(u8, fallback, "\"p-p\".url = \"git+https://git.example.com/o/r?ref=main&rev=deadbeef\";") != null);
+	try t.expect(std.mem.indexOf(u8, fallback, "path:/cfg/plugin-sources/p") == null);
+}
+
 test "two plugins keep config order, user module last" {
-	const out = try compose.render(t.allocator, "work", "/cfg/flake", &.{
+	const out = try compose.render(t.allocator, "work", "/cfg/flake", "/cfg/plugin-sources", &.{
 		.{ .name = "alpha", .locked_url = "path:/a?narHash=sha256-A" },
 		.{ .name = "beta", .locked_url = "path:/b?narHash=sha256-B" },
 	});
@@ -55,7 +74,7 @@ test "two plugins keep config order, user module last" {
 }
 
 test "non-default module attrs are emitted quoted" {
-	const out = try compose.render(t.allocator, "default", "/cfg/flake", &.{
+	const out = try compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{
 		.{ .name = "hello", .locked_url = "path:/m?narHash=sha256-M" },
 		.{ .name = "extra", .locked_url = "path:/m?narHash=sha256-M", .attr = "extra" },
 	});
@@ -68,7 +87,7 @@ test "non-default module attrs are emitted quoted" {
 }
 
 test "nix string escaping in urls and paths" {
-	const out = try compose.render(t.allocator, "default", "/odd \"dir\"/flake", &.{
+	const out = try compose.render(t.allocator, "default", "/odd \"dir\"/flake", "/odd \"dir\"/plugin-sources", &.{
 		.{ .name = "x", .locked_url = "path:/p?x=${q}&y=a\\b" },
 	});
 	defer t.allocator.free(out);
@@ -76,4 +95,23 @@ test "nix string escaping in urls and paths" {
 	try t.expect(std.mem.indexOf(u8, out, "path:/odd \\\"dir\\\"/flake") != null);
 	try t.expect(std.mem.indexOf(u8, out, "\\${q}") != null);
 	try t.expect(std.mem.indexOf(u8, out, "a\\\\b") != null);
+}
+
+test "hydrated source path is nix-string escaped" {
+	// The sources_dir and name both flow through appendNixString.
+	const out = try compose.render(t.allocator, "default", "/cfg/flake", "/odd \"dir\"/plugin-sources", &.{
+		.{ .name = "x", .locked_url = "ignored", .has_source = true },
+	});
+	defer t.allocator.free(out);
+	try t.expect(std.mem.indexOf(u8, out, "path:/odd \\\"dir\\\"/plugin-sources/x") != null);
+}
+
+test "hydrated subdir plugin carries ?dir= on the path: input" {
+	// nix flake metadata's .path is the repo ROOT for a ?dir= flake, so the
+	// path: rewrite must re-add the dir to locate the flake in the tree.
+	const out = try compose.render(t.allocator, "default", "/cfg/flake", "/cfg/plugin-sources", &.{
+		.{ .name = "sub", .locked_url = "github:o/r/abc?dir=flake&narHash=sha256-A", .has_source = true, .dir = "flake" },
+	});
+	defer t.allocator.free(out);
+	try t.expect(std.mem.indexOf(u8, out, "\"p-sub\".url = \"path:/cfg/plugin-sources/sub?dir=flake\";") != null);
 }

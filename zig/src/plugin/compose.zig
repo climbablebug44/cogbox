@@ -1,12 +1,19 @@
 // Render and write the generated composition flake that folds every plugin's
 // nixosModules.default (plus the per-instance user flake) into one module.
 //
-// The file is a pure function of config.json's .plugins array and is
-// regenerated on every plugin mutation; cogbox-launch.sh points
-// --override-input userExtensions at its directory when plugins exist.
-// Plugin inputs are pinned by locked URL (rev + narHash, or rev alone for
-// git/hg schemes whose fetchers reject extra query params), so evaluating
-// the composition never needs the network once `nix flake archive` has run.
+// The file is a pure function of config.json's .plugins array plus the
+// on-disk plugin sources, and is regenerated on every plugin mutation;
+// cogbox-launch.sh points --override-input userExtensions at its directory
+// when plugins exist.
+//
+// Each plugin input resolves OFFLINE at launch: when the plugin's source has
+// been materialized on the persistent PVC (has_source), the input is a `path:`
+// ref read straight from disk (no fetcher, so no network and no credential
+// needed at launch -- which is the whole point: launch has no token). A
+// `git+http(s)` input pinned by ?ref=&rev= cannot be made offline (nix's git
+// fetcher re-contacts the remote to verify the rev on a fresh store), so the
+// locked git URL is only a migration fallback for a plugin added before the
+// source was materialized.
 
 const std = @import("std");
 
@@ -14,6 +21,15 @@ pub const PluginRef = struct {
 	name: []const u8,
 	locked_url: []const u8,
 	attr: []const u8 = "default", // nixosModules attr to import
+	// Whether this plugin's source has been materialized under
+	// <sources_dir>/<name>; when true, render emits a `path:` input (offline)
+	// instead of the locked git/tarball URL. Set by the caller from a
+	// filesystem check, so render stays a pure function of config + disk.
+	has_source: bool = false,
+	// The flake's subdir (`?dir=` query param) when the plugin lives in a
+	// subdir of its repo. The materialized source is the repo ROOT, so the
+	// path: input must carry `?dir=<dir>` to locate the flake. null = repo root.
+	dir: ?[]const u8 = null,
 };
 
 pub const RenderError = error{
@@ -23,11 +39,15 @@ pub const RenderError = error{
 
 /// Render the composition flake. Plugin inputs are named "p-<name>" (quoted
 /// attrs) so they can never collide with `user`/`self`; the user flake is
-/// always imported, last.
+/// always imported, last. `sources_dir` is the absolute base dir under which
+/// each materialized plugin source lives (<sources_dir>/<name>); a plugin with
+/// has_source=true points its input there as `path:` (offline at launch),
+/// otherwise it falls back to the locked git/tarball URL (migration path).
 pub fn render(
 	allocator: std.mem.Allocator,
 	instance: []const u8,
 	user_flake_dir: []const u8,
+	sources_dir: []const u8,
 	plugins: []const PluginRef,
 ) RenderError![]u8 {
 	if (plugins.len == 0) return error.NoPlugins;
@@ -47,7 +67,24 @@ pub fn render(
 		try out.appendSlice(allocator, "\t\t\"p-");
 		try out.appendSlice(allocator, p.name);
 		try out.appendSlice(allocator, "\".url = \"");
-		try appendNixString(allocator, &out, p.locked_url);
+		if (p.has_source) {
+			// Offline at launch: read the materialized source from disk. For a
+			// subdir flake (`?dir=`) the materialized tree is the repo root, so
+			// carry the same dir param to locate the flake within it.
+			try out.appendSlice(allocator, "path:");
+			try appendNixString(allocator, &out, sources_dir);
+			try out.append(allocator, '/');
+			try appendNixString(allocator, &out, p.name);
+			if (p.dir) |d| {
+				try out.appendSlice(allocator, "?dir=");
+				try appendNixString(allocator, &out, d);
+			}
+		} else {
+			// Not yet hydrated (added before source materialization): fall
+			// back to the locked URL. A git+ URL still needs the network at
+			// launch -- the path: rewrite above is the actual offline fix.
+			try appendNixString(allocator, &out, p.locked_url);
+		}
 		try out.appendSlice(allocator, "\";\n");
 	}
 	try out.appendSlice(allocator, "\t};\n\n" ++
@@ -89,8 +126,11 @@ fn appendNixString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []c
 }
 
 /// Atomically write `rendered` as <dir>/flake.nix (mkdir -p, .tmp + rename).
-/// Stale flake.lock files from earlier nix invocations are removed so the
-/// locked-URL inputs are always re-resolved from the rendered file alone.
+/// An existing flake.lock is KEPT (not deleted): the caller reconciles it with
+/// `nix flake lock` after this write, so launch resolves from a coherent,
+/// already-pinned lock instead of re-resolving every input (which a fresh-store
+/// launch can't do offline for a git+ input). The lock is dropped only when the
+/// last plugin is removed (removeCompositionFlake).
 pub fn writeCompositionFlake(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -115,10 +155,6 @@ pub fn writeCompositionFlake(
 		try f.sync(io);
 	}
 	try cwd.rename(tmp_path, cwd, path, io);
-
-	const lock_path = try std.fs.path.join(allocator, &.{ dir, "flake.lock" });
-	defer allocator.free(lock_path);
-	cwd.deleteFile(io, lock_path) catch {};
 }
 
 /// Remove the generated flake (used when the last plugin is deleted, so the

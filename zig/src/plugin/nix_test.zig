@@ -31,6 +31,29 @@ test "parseMetadata: path flake already carries narHash, no rev" {
 	try t.expectEqualStrings("sha256-zzz=", m.nar_hash);
 }
 
+test "parseMetadata: source store path parsed from .path" {
+	// nix flake metadata's top-level .path is the locked source store path; it
+	// backs the path: rewrite (the materialized source is copied from here).
+	const json =
+		\\{"locked":{"narHash":"sha256-q=","rev":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","type":"git","url":"https://git.example.com/o/r"},
+		\\ "path":"/nix/store/aaaa-source",
+		\\ "url":"git+https://git.example.com/o/r?ref=main&rev=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
+	;
+	var m = try nix.parseMetadata(t.allocator, json);
+	defer m.deinit(t.allocator);
+	try t.expectEqualStrings("/nix/store/aaaa-source", m.source_path);
+}
+
+test "parseMetadata: missing .path defaults source_path to empty" {
+	const json =
+		\\{"locked":{"narHash":"sha256-q=","rev":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","type":"git","url":"https://git.example.com/o/r"},
+		\\ "url":"git+https://git.example.com/o/r?ref=main&rev=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
+	;
+	var m = try nix.parseMetadata(t.allocator, json);
+	defer m.deinit(t.allocator);
+	try t.expectEqualStrings("", m.source_path);
+}
+
 test "parseMetadata: git scheme never grows a narHash param" {
 	// nix's git fetcher passes unknown query params through to the remote
 	// URL, so an appended narHash corrupts the repo path the forge sees
@@ -120,4 +143,16 @@ test "stderr helpers" {
 	try t.expect(nix.stderrSaysMissingAttribute("error: attribute 'networkRules' ... has no attribute"));
 	try t.expect(!nix.stderrSaysMissingAttribute("error: infinite recursion encountered"));
 	try t.expectEqualStrings("short", nix.stderrTail("  short \n"));
+}
+
+test "dirParam: extracts ?dir= value, ignores absent/empty and path dir=" {
+	try t.expectEqualStrings("flake", nix.dirParam("github:o/r/abc?dir=flake&narHash=sha256-A").?);
+	try t.expectEqualStrings("flake", nix.dirParam("git+https://e.com/g/r?ref=main&rev=deadbeef&dir=flake").?);
+	// No query / no dir param -> null.
+	try t.expect(nix.dirParam("git+https://e.com/g/r?ref=main&rev=deadbeef") == null);
+	try t.expect(nix.dirParam("github:o/r") == null);
+	// A literal dir= in the PATH (before ?) must not false-match.
+	try t.expect(nix.dirParam("git+https://e.com/my/dir=weird/r?ref=main") == null);
+	// Empty value -> null.
+	try t.expect(nix.dirParam("path:/p?dir=") == null);
 }

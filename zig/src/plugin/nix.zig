@@ -45,6 +45,25 @@ pub fn flakeArchive(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.p
 	return runNix(allocator, io, env, &.{ "flake", "archive", "--json", url });
 }
 
+/// `nix flake archive --to <dest> --json <url>`: copy the flake AND its
+/// transitive inputs into the `dest` binary cache (a `file://<dir>` URI). The
+/// launcher points `--extra-substituters` at that cache so a fresh-store
+/// launch substitutes the plugin's tarball/narHash inputs offline (only git+
+/// inputs can't substitute -- those are handled by the path: rewrite). Best-
+/// effort: a launch with network still rebuilds from the inputs.
+pub fn flakeArchiveTo(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, dest: []const u8, url: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "flake", "archive", "--to", dest, "--json", url });
+}
+
+/// `nix flake lock <url>`: reconcile the composition flake's lock against its
+/// current inputs, writing/updating flake.lock in place. Run after every
+/// regen so launch resolves from a coherent lock (path: inputs are read from
+/// disk; no fetch). Authenticated (the rewritten inputs are local path: refs,
+/// but a migration-fallback git+ input still needs the acting user's token).
+pub fn flakeLock(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "flake", "lock", url });
+}
+
 /// Outcome of the nixosModules.<attr> contract check. `missing` is the
 /// contract violation ("this flake is not a cogbox plugin"); `failed` is
 /// everything else that can go wrong with the eval (fetch error, eval error
@@ -115,11 +134,19 @@ pub const Meta = struct {
 	locked_url: []const u8,
 	rev: ?[]const u8,
 	nar_hash: []const u8,
+	// The locked flake's source store path (`.path` of `nix flake metadata
+	// --json`): the read-only /nix/store/... directory holding the plugin's
+	// source. Empty ("") when the metadata didn't carry it (older nix) or when
+	// the Meta was built WITHOUT a metadata call (the sibling-reuse path in
+	// cmdAdd) -- callers that need it fall back to `flakeSourcePath`. It backs
+	// the path: rewrite that makes launch resolve offline.
+	source_path: []const u8,
 
 	pub fn deinit(self: *Meta, allocator: std.mem.Allocator) void {
 		allocator.free(self.locked_url);
 		if (self.rev) |r| allocator.free(r);
 		allocator.free(self.nar_hash);
+		allocator.free(self.source_path);
 	}
 };
 
@@ -136,6 +163,24 @@ pub fn isGitOrHgUrl(url: []const u8) bool {
 	return std.mem.startsWith(u8, url, "git+") or
 		std.mem.startsWith(u8, url, "hg+") or
 		std.mem.startsWith(u8, url, "git://");
+}
+
+/// Extract the `dir` query-param value from a flake URL (the subdir the flake
+/// lives in, e.g. `?dir=flake`), or null if absent/empty. Only the `?...`
+/// query is scanned, so a literal `dir=` in the path can't false-match.
+/// Returns a slice into `url`. `nix flake metadata`'s `.path` is the repo ROOT
+/// for a `?dir=` flake (the flake.nix is at <path>/<dir>), so a path: rewrite
+/// of the materialized source must carry the same `?dir=` to find the flake.
+pub fn dirParam(url: []const u8) ?[]const u8 {
+	const q = std.mem.indexOfScalar(u8, url, '?') orelse return null;
+	var it = std.mem.splitScalar(u8, url[q + 1 ..], '&');
+	while (it.next()) |param| {
+		if (std.mem.startsWith(u8, param, "dir=")) {
+			const v = param["dir=".len..];
+			return if (v.len == 0) null else v;
+		}
+	}
+	return null;
 }
 
 /// Parse `nix flake metadata --json` output. `.url` is nix's locked URL.
@@ -168,6 +213,16 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) MetaEr
 	const nar_hash = try allocator.dupe(u8, nar_v.string);
 	errdefer allocator.free(nar_hash);
 
+	// `.path` is the locked flake's source store path; absent on older nix,
+	// so default to "" (callers fall back to flakeSourcePath).
+	const source_path = blk: {
+		if (root.object.get("path")) |pv| {
+			if (pv == .string) break :blk try allocator.dupe(u8, pv.string);
+		}
+		break :blk try allocator.dupe(u8, "");
+	};
+	errdefer allocator.free(source_path);
+
 	const locked_url = blk: {
 		if (std.mem.indexOf(u8, url_v.string, "narHash=") != null) {
 			break :blk try allocator.dupe(u8, url_v.string);
@@ -192,7 +247,29 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) MetaEr
 		break :blk try buf.toOwnedSlice(allocator);
 	};
 
-	return .{ .locked_url = locked_url, .rev = rev, .nar_hash = nar_hash };
+	return .{ .locked_url = locked_url, .rev = rev, .nar_hash = nar_hash, .source_path = source_path };
+}
+
+/// Resolve a flake URL to its source store path (`.path` of `nix flake
+/// metadata --json`), for callers that hold a URL whose Meta lacked a
+/// source_path (the sibling-reuse path in cmdAdd builds Meta WITHOUT a
+/// metadata call). Returns an allocated path the caller frees, or "" when nix
+/// fails or the field is absent (best-effort; the composition then falls back
+/// to the git URL). Authenticated via `env` like every other fetch.
+pub fn flakeSourcePath(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) ![]u8 {
+	var out = try flakeMetadata(allocator, io, env, url);
+	defer out.deinit(allocator);
+	if (!out.ok) return try allocator.dupe(u8, "");
+
+	const parsed = std.json.parseFromSlice(std.json.Value, allocator, out.stdout, .{}) catch {
+		return try allocator.dupe(u8, "");
+	};
+	defer parsed.deinit();
+	if (parsed.value != .object) return try allocator.dupe(u8, "");
+	if (parsed.value.object.get("path")) |pv| {
+		if (pv == .string) return try allocator.dupe(u8, pv.string);
+	}
+	return try allocator.dupe(u8, "");
 }
 
 /// Percent-encode a query param value (narHash carries `+`, `/`, `=`).

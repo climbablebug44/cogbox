@@ -52,6 +52,18 @@ pub fn dispatch(
 	};
 	defer loaded.deinit();
 
+	// plugin-sources/ and plugin-cache/ are SIBLINGS of plugins-flake/ (under
+	// the instance config dir): putting them INSIDE plugins-flake/ would change
+	// the composition flake's source hash. plugins-flake/ holds only flake.nix
+	// + flake.lock. plugin-sources/<name>/ is the materialized (writable) copy
+	// of each plugin's source, referenced as a path: input; plugin-cache/ is a
+	// file:// binary cache for the launch-time substituter.
+	const instance_config_dir = std.fs.path.dirname(plugins_flake_dir) orelse ".";
+	const sources_dir = try std.fs.path.join(allocator, &.{ instance_config_dir, "plugin-sources" });
+	defer allocator.free(sources_dir);
+	const cache_dir = try std.fs.path.join(allocator, &.{ instance_config_dir, "plugin-cache" });
+	defer allocator.free(cache_dir);
+
 	var ctx: Ctx = .{
 		.allocator = allocator,
 		.io = io,
@@ -61,6 +73,8 @@ pub fn dispatch(
 		.runtime_path = runtime_path,
 		.user_flake_dir = user_flake_dir,
 		.plugins_flake_dir = plugins_flake_dir,
+		.sources_dir = sources_dir,
+		.cache_dir = cache_dir,
 	};
 
 	switch (cmd) {
@@ -82,6 +96,12 @@ const Ctx = struct {
 	runtime_path: []const u8,
 	user_flake_dir: []const u8,
 	plugins_flake_dir: []const u8,
+	// Siblings of plugins_flake_dir (see dispatch): plugin-sources/ holds the
+	// materialized writable source of each plugin (referenced as a path: input
+	// so launch resolves it offline); plugin-cache/ is the file:// binary cache
+	// the launcher uses as an extra substituter for transitive inputs.
+	sources_dir: []const u8,
+	cache_dir: []const u8,
 	// Per-fetch credential env. null => the nix
 	// fetch runs with the inherited parent env (public/unauthenticated). When a
 	// `--git-credential-stdin` add/update supplies a token, cmdAdd/cmdUpdate set
@@ -213,6 +233,9 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 					.locked_url = try allocator.dupe(u8, locked.?),
 					.rev = if (mutate.entryField(sibling.object, "rev")) |r| try allocator.dupe(u8, r) else null,
 					.nar_hash = try allocator.dupe(u8, hash.?),
+					// No metadata call on this path: resolve the source store
+					// path lazily via flakeSourcePath when we materialize.
+					.source_path = try allocator.dupe(u8, ""),
 				};
 			}
 		}
@@ -235,6 +258,15 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		.missing => die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65),
 		.failed => |stderr| die(allocator, io, "could not evaluate flake '{s}':\n{s}", .{ meta.locked_url, nix.stderrTail(stderr) }, 65),
 	}
+
+	// Materialize the plugin source onto the PVC so the composition can point
+	// a path: input at it (offline at launch -- the git+ URL needs a token we
+	// don't have at start). Done here, under the still-authenticated fetch env,
+	// so the source store path is already realized. Best-effort: on failure the
+	// composition falls back to the locked URL (has_source=false).
+	materializeSource(ctx, plugin_name, &meta, ref) catch |err| {
+		warn(ctx, "could not materialize plugin source (launch may need network): {s}", .{@errorName(err)}) catch {};
+	};
 
 	archiveFlake(ctx, meta.locked_url);
 
@@ -313,6 +345,7 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
+	finalizeComposition(ctx);
 	if (merged) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' added at {s}.", .{ plugin_name, pinLabel(&meta) });
@@ -352,8 +385,14 @@ fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	removed += if (l7_arr) |la| mutate.removeTaggedRules(la, d.plugin) else 0;
 	removed += if (inject_arr) |ia| mutate.removeTaggedRules(ia, d.plugin) else 0;
 
+	// Drop the materialized source for the removed plugin so it stops being a
+	// path: input and its disk space is reclaimed.
+	removeSource(ctx, d.plugin);
+
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
+	// No fetch needed: remaining inputs are local path: refs. Best-effort.
+	finalizeComposition(ctx);
 	if (removed > 0) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' removed ({d} contributed entr(ies) dropped).", .{ d.plugin, removed });
@@ -464,6 +503,13 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 			continue;
 		}
 
+		// Re-materialize this plugin's source at the new rev so its path: input
+		// tracks the update (offline at launch). `url` is the original ref, used
+		// only as the lazy fallback for flakeSourcePath. Best-effort.
+		materializeSource(ctx, n, meta, url) catch |err| {
+			warn(ctx, "{s}: could not materialize plugin source (launch may need network): {s}", .{ n, @errorName(err) }) catch {};
+		};
+
 		archiveFlake(ctx, meta.locked_url);
 
 		var l4_parsed: ?std.json.Parsed(std.json.Value) = null;
@@ -552,8 +598,10 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 		if (rules_touched) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 	}
 	// Regenerate even without changes: update doubles as the self-heal for
-	// a missing/stale composition flake (it is a pure function of config).
+	// a missing/stale composition flake (it is a pure function of config +
+	// on-disk sources).
 	try regenComposition(ctx, plugins_arr);
+	finalizeComposition(ctx);
 	if (changed) try printRestartHint(ctx, "to load the updated NixOS modules");
 	if (failed) std.process.exit(65);
 }
@@ -583,6 +631,113 @@ fn archiveFlake(ctx: *const Ctx, locked_url: []const u8) void {
 	if (!out.ok) {
 		warn(ctx, "could not pre-fetch flake inputs (offline starts may fail): {s}", .{nix.stderrTail(out.stderr)}) catch {};
 	}
+}
+
+/// Whether the plugin's source has been materialized -- the marker that lets
+/// render emit a path: input. For a subdir flake (`?dir=`) the flake.nix lives
+/// at <sources_dir>/<name>/<dir>/flake.nix (the materialized tree is the repo
+/// root); `dir` null means the repo root.
+fn sourceHydrated(ctx: *const Ctx, name: []const u8, dir: ?[]const u8) bool {
+	const cwd = std.Io.Dir.cwd();
+	const flake = std.fs.path.join(ctx.allocator, &.{ ctx.sources_dir, name, dir orelse ".", "flake.nix" }) catch return false;
+	defer ctx.allocator.free(flake);
+	cwd.access(ctx.io, flake, .{}) catch return false;
+	return true;
+}
+
+/// Copy a plugin's locked source tree onto the PVC at <sources_dir>/<name>/ as
+/// a WRITABLE directory, so the composition can reference it as a `path:` input
+/// that launch resolves offline (no fetcher, no credential). The store source
+/// path is read-only, so the copy is reset to writable modes.
+///
+/// `meta.source_path` is used when present (the metadata path); otherwise (the
+/// cmdAdd sibling-reuse path, which built Meta WITHOUT a metadata call) the
+/// store path is resolved lazily via `flakeSourcePath` for `url`, under the
+/// authenticated fetch env. An empty resolved path is a hard error (the caller
+/// downgrades it to a warning and falls back to the locked URL).
+fn materializeSource(ctx: *const Ctx, name: []const u8, meta: *const nix.Meta, url: []const u8) !void {
+	const allocator = ctx.allocator;
+
+	var owned_src: ?[]u8 = null;
+	defer if (owned_src) |s| allocator.free(s);
+	const src: []const u8 = blk: {
+		if (meta.source_path.len > 0) break :blk meta.source_path;
+		owned_src = try nix.flakeSourcePath(allocator, ctx.io, ctx.fetch_env, url);
+		break :blk owned_src.?;
+	};
+	if (src.len == 0) return error.NoSourcePath;
+
+	const dest = try std.fs.path.join(allocator, &.{ ctx.sources_dir, name });
+	defer allocator.free(dest);
+
+	const cwd = std.Io.Dir.cwd();
+	try cwd.createDirPath(ctx.io, ctx.sources_dir);
+	// Replace any prior copy so a downgrade/re-add can't leave stale files.
+	cwd.deleteTree(ctx.io, dest) catch {};
+
+	// Recursive copy with writable reset. Coreutils are present in the pod
+	// image (the launcher already uses cp/mv/rm); a native walk would have to
+	// re-implement mode reset for read-only store trees. `cp -a SRC/. DEST`
+	// copies SRC's contents into DEST (DEST is the plugin's own dir);
+	// --no-preserve drops the store's read-only modes, and chmod then forces
+	// u+w across the tree so a later deleteTree/replace and nix's path: read
+	// both work.
+	const src_dot = try std.fmt.allocPrint(allocator, "{s}/.", .{src});
+	defer allocator.free(src_dot);
+	try runTool(ctx, &.{ "cp", "-a", "--no-preserve=mode,ownership", src_dot, dest });
+	try runTool(ctx, &.{ "chmod", "-R", "u+rwX", dest });
+}
+
+/// Remove a plugin's materialized source dir (del path). Best-effort.
+fn removeSource(ctx: *const Ctx, name: []const u8) void {
+	const dest = std.fs.path.join(ctx.allocator, &.{ ctx.sources_dir, name }) catch return;
+	defer ctx.allocator.free(dest);
+	std.Io.Dir.cwd().deleteTree(ctx.io, dest) catch {};
+}
+
+/// Run a host tool (cp/chmod), inheriting the parent env so PATH resolves the
+/// coreutils binaries. Errors if the tool can't run or exits non-zero.
+fn runTool(ctx: *const Ctx, argv: []const []const u8) !void {
+	const res = try std.process.run(ctx.allocator, ctx.io, .{ .argv = argv, .environ_map = null });
+	defer {
+		ctx.allocator.free(res.stdout);
+		ctx.allocator.free(res.stderr);
+	}
+	if (res.term != .exited or res.term.exited != 0) return error.ToolFailed;
+}
+
+/// After regenerating the composition: reconcile its flake.lock and populate
+/// the launch-time binary cache. Both are best-effort (warn, never die): the
+/// lock makes launch deterministic (resolved from a coherent pin, offline for
+/// path: inputs), and the cache substitutes any transitive tarball/narHash
+/// input on a fresh store. Skipped when no composition exists (no plugins).
+fn finalizeComposition(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const cwd = std.Io.Dir.cwd();
+
+	// Only run when the composition flake actually exists.
+	const flake = std.fs.path.join(allocator, &.{ ctx.plugins_flake_dir, "flake.nix" }) catch return;
+	defer allocator.free(flake);
+	cwd.access(ctx.io, flake, .{}) catch return;
+
+	const flake_url = std.fmt.allocPrint(allocator, "path:{s}", .{ctx.plugins_flake_dir}) catch return;
+	defer allocator.free(flake_url);
+
+	// Reconcile/write the lock so launch resolves deterministically offline.
+	if (nix.flakeLock(allocator, ctx.io, ctx.fetch_env, flake_url)) |out| {
+		var o = out;
+		defer o.deinit(allocator);
+		if (!o.ok) warn(ctx, "could not lock composition (launch may re-resolve inputs): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+	} else |_| {}
+
+	// Populate the file:// binary cache the launcher uses as a substituter.
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+	defer allocator.free(cache_url);
+	if (nix.flakeArchiveTo(allocator, ctx.io, ctx.fetch_env, cache_url, flake_url)) |out| {
+		var o = out;
+		defer o.deinit(allocator);
+		if (!o.ok) warn(ctx, "could not populate offline plugin cache (transitive inputs may need network at launch): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+	} else |_| {}
 }
 
 /// Evaluate one of the plugin's suggested-rule lists:
@@ -764,10 +919,24 @@ fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
 		// The attr lands quoted inside the generated flake; never emit one
 		// that fails the safe-charset check (hand-edited config).
 		if (!name_mod.isValidAttr(attr)) continue;
-		try refs.append(allocator, .{ .name = n, .locked_url = locked, .attr = attr });
+		// The plugin's subdir, if it lives in one (`?dir=` on the locked URL);
+		// the materialized source is the repo root, so both the hydration check
+		// and the path: input use it.
+		const dir = nix.dirParam(locked);
+		// has_source is a pure filesystem check (the flake.nix under the
+		// materialized source exists), so render stays a function of config +
+		// on-disk sources and self-heals: a materialize that failed earlier just
+		// keeps the locked URL until a later add/update succeeds.
+		try refs.append(allocator, .{
+			.name = n,
+			.locked_url = locked,
+			.attr = attr,
+			.has_source = sourceHydrated(ctx, n, dir),
+			.dir = dir,
+		});
 	}
 
-	const rendered = compose.render(allocator, ctx.instance orelse "default", ctx.user_flake_dir, refs.items) catch |err| switch (err) {
+	const rendered = compose.render(allocator, ctx.instance orelse "default", ctx.user_flake_dir, ctx.sources_dir, refs.items) catch |err| switch (err) {
 		error.NoPlugins => {
 			try compose.removeCompositionFlake(allocator, ctx.io, ctx.plugins_flake_dir);
 			return;
