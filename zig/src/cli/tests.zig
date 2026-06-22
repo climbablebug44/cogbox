@@ -6,4 +6,5 @@
 
 test {
 	_ = @import("verbs/ssh.zig");
+	_ = @import("verbs/status.zig");
 }
