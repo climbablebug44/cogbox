@@ -683,6 +683,11 @@
 				tag = "latest";
 				contents = [
 					cogbox
+					# nix's git+http(s)/ssh flake fetcher execs the `git` CLI; without it
+					# `cogbox plugin add <git+...>` fails "executing git: No such file".
+					# cacert + SSL_CERT_FILE (below) let the https variant verify TLS.
+					pkgs.git
+					pkgs.cacert
 					pkgs.bashInteractive
 					pkgs.coreutils
 					# cogbox-launch.sh is `#!/usr/bin/env bash`; without /usr/bin/env
@@ -694,7 +699,7 @@
 				];
 				config = {
 					Entrypoint = [ "/bin/sh" ];
-					Env = [ "PATH=/bin" ];
+					Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
 				};
 			};
 		} // lib.optionalAttrs (system == "x86_64-linux") {
