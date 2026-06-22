@@ -681,6 +681,10 @@
 			cogbox-pod-image = pkgs.dockerTools.streamLayeredImage {
 				name = "cogbox-pod";
 				tag = "latest";
+				# passt self-sandboxes by mounting a tmpfs at /tmp and pivot_root-ing
+				# into it; streamLayeredImage creates no /tmp, so passt failed with
+				# ENOENT and the guest VM booted with no networking. Provide /tmp.
+				extraCommands = "mkdir -m 1777 -p tmp var/tmp";
 				contents = [
 					cogbox
 					# nix's git+http(s)/ssh flake fetcher execs the `git` CLI; without it
