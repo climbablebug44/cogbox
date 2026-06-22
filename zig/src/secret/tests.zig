@@ -73,3 +73,28 @@ test "buildMeta emits null audience/bound_at literally" {
 	try t.expect(std.mem.indexOf(u8, json, "\"tier\": \"derived\"") != null);
 	try t.expect(std.mem.indexOf(u8, json, "\"bound_at\": null") != null);
 }
+
+// `secret ls --json` shape the control plane (cogworx) parses. A bound secret
+// carries its audience + bound_at; an unset audience / missing value render as
+// JSON null / bound:false so cogworx shows the inject request as not injectable.
+test "appendSecretJson emits bound and unbound shapes" {
+	const a = t.allocator;
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(a);
+		try main.appendSecretJson(a, &out, "api-token", .{ .audience = "api.example.com", .kind = "bearer", .tier = "durable", .bound_at = 1700000000 }, true);
+		try t.expectEqualStrings(
+			"{\"name\":\"api-token\",\"kind\":\"bearer\",\"audience\":\"api.example.com\",\"tier\":\"durable\",\"bound\":true,\"bound_at\":1700000000}",
+			out.items,
+		);
+	}
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(a);
+		try main.appendSecretJson(a, &out, "app-session", .{ .audience = null, .kind = "cookie", .tier = "durable", .bound_at = null }, false);
+		try t.expectEqualStrings(
+			"{\"name\":\"app-session\",\"kind\":\"cookie\",\"audience\":null,\"tier\":\"durable\",\"bound\":false,\"bound_at\":null}",
+			out.items,
+		);
+	}
+}

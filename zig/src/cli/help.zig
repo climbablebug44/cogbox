@@ -498,9 +498,10 @@ pub const SECRET =
 	\\
 	\\Usage:
 	\\  cogbox secret add NAME --from-file F | --from-stdin
-	\\                        [--audience HOST] [--kind bearer|cookie]
-	\\  cogbox secret ls
-	\\  cogbox secret rm NAME
+	\\                        [--audience HOST] [--kind bearer|cookie] [-n INSTANCE]
+	\\  cogbox secret ls [--json]
+	\\  cogbox secret rm NAME [-n INSTANCE]
+	\\  cogbox secret reload -n INSTANCE
 	\\
 	\\Options:
 	\\  --from-file F     Read the secret value from file F (mode preserved 0600)
@@ -511,6 +512,10 @@ pub const SECRET =
 	\\                    host other than its bound audience, so a plugin cannot
 	\\                    redirect a bound credential to an attacker host.
 	\\  --kind K          Injection style hint: bearer (default) or cookie
+	\\  -n INSTANCE       After the bind/remove, re-render that instance's inject
+	\\                    conf and SIGHUP its proxy, so the change takes effect on a
+	\\                    RUNNING VM without a restart. Omit to only write the store
+	\\                    (the binding then applies at the instance's next start).
 	\\  -h, --help        Show this help and exit
 	\\
 	\\A plugin REQUESTS a credential by symbolic name (cogboxPlugin.<attr>.inject =
@@ -530,6 +535,10 @@ pub const SECRET =
 	\\        --audience api.example.com
 	\\  printf '%s' "$TOKEN" | cogbox secret add api-token --from-stdin --audience api.internal
 	\\  cogbox secret ls
+	\\  cogbox secret ls --json   # name/kind/audience/bound, for a control plane
+	\\  cogbox secret add api-bearer --from-stdin --audience api.example.com -n web
+	\\                            # bind AND apply to running instance 'web'
+	\\  cogbox secret reload -n web   # re-apply an already-bound secret to 'web'
 	\\  cogbox secret rm api-bearer
 	\\
 ;

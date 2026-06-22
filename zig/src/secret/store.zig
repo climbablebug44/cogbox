@@ -49,7 +49,7 @@ pub const Meta = struct {
 	bound_at: ?i64 = null,
 };
 
-fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+pub fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
 	try out.append(allocator, '"');
 	for (s) |c| switch (c) {
 		'"' => try out.appendSlice(allocator, "\\\""),

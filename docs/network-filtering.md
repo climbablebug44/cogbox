@@ -315,8 +315,11 @@ Operators bind the real credential with `cogbox secret`, host-side, never on the
 ```sh
 cogbox secret add api-bearer --from-file ~/.secrets/api.token --audience api.example.com
 cogbox secret ls
+cogbox secret ls --json   # machine-readable inventory for a control plane
 cogbox secret rm api-bearer
 ```
+
+`cogbox secret ls --json` emits a JSON array of `{name, kind, audience, tier, bound, bound_at}` (the **value is never included**). A control plane (e.g. cogworx) reads it to show each plugin-declared inject request as bound vs unbound -- correctly reflecting the host-side store even when an operator bound the secret directly with `cogbox secret add` rather than through the UI. `audience` is `null` when unset (not injectable), `bound` is `false` when the named secret has no value file. A store that was never created prints `[]`.
 
 The value is read from a file or stdin (never argv, which leaks to the process table) and stored at `~/.config/cogbox/secrets/<name>` (mode `0600`) alongside a `<name>.meta` sidecar recording `audience`, `kind`, `tier`, and `bound_at`. The stored value is a single line -- a bare bearer token, a `user:password` pair, or a cookie value -- interpreted according to `--kind`.
 

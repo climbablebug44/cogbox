@@ -5,9 +5,12 @@
 // process table / shell history.
 //
 //   cogbox secret add <name> --from-file F | --from-stdin
-//                            [--audience HOST] [--kind bearer|cookie]
-//   cogbox secret ls
-//   cogbox secret rm <name>
+//                            [--audience HOST] [--kind bearer|cookie] [-n INST]
+//   cogbox secret ls [--json]
+//   cogbox secret rm <name> [-n INST]
+//   cogbox secret reload -n INST   (-n + reload handled by the cli verb layer:
+//      re-render INST's inject conf so a bind applies to a running VM; this
+//      module only writes the store.)
 
 const std = @import("std");
 pub const store = @import("store.zig");
@@ -114,14 +117,31 @@ fn cmdRm(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, argv
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, argv: []const []const u8) !void {
-	_ = argv;
+	var json = false;
+	for (argv) |a| {
+		if (eql(a, "--json")) {
+			json = true;
+		} else {
+			return die(allocator, io, "unknown argument '{s}' (secret ls accepts only --json)", .{a}, 64);
+		}
+	}
+
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
+
+	// store.lookup allocates the value path + meta strings into the allocator it's
+	// given; an arena frees them all at once (the bytes we keep are copied into
+	// `out`). Without this, listing N secrets leaks N*(path+meta) allocations.
+	var arena_inst = std.heap.ArenaAllocator.init(allocator);
+	defer arena_inst.deinit();
+	const arena = arena_inst.allocator();
 
 	const cwd = std.Io.Dir.cwd();
 	var dir = cwd.openDir(io, secrets_dir, .{ .iterate = true }) catch |err| switch (err) {
 		error.FileNotFound => {
-			try writeStdout(io, "No secrets bound.\n");
+			// A never-bound store has no dir yet. The JSON form must still be a
+			// valid (empty) array so a machine reader doesn't choke.
+			try writeStdout(io, if (json) "[]\n" else "No secrets bound.\n");
 			return;
 		},
 		else => return err,
@@ -129,6 +149,7 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, ar
 	defer dir.close(io);
 
 	var count: usize = 0;
+	if (json) try out.append(allocator, '[');
 	var iter = dir.iterate();
 	while (try iter.next(io)) |entry| {
 		if (entry.kind != .file) continue;
@@ -137,22 +158,56 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, ar
 		if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
 		if (!store.validName(entry.name)) continue;
 
-		const resolved = (try store.lookup(allocator, io, secrets_dir, entry.name)) orelse continue;
+		const resolved = (try store.lookup(arena, io, secrets_dir, entry.name)) orelse continue;
+		if (json) {
+			if (count != 0) try out.append(allocator, ',');
+			try appendSecretJson(allocator, &out, entry.name, resolved.meta, resolved.bound);
+		} else {
+			try out.appendSlice(allocator, entry.name);
+			try out.appendSlice(allocator, "  kind=");
+			try out.appendSlice(allocator, resolved.meta.kind);
+			try out.appendSlice(allocator, " audience=");
+			try out.appendSlice(allocator, resolved.meta.audience orelse "(unset, not injectable)");
+			if (!resolved.bound) try out.appendSlice(allocator, " [MISSING VALUE]");
+			try out.append(allocator, '\n');
+		}
 		count += 1;
-		try out.appendSlice(allocator, entry.name);
-		try out.appendSlice(allocator, "  kind=");
-		try out.appendSlice(allocator, resolved.meta.kind);
-		try out.appendSlice(allocator, " audience=");
-		try out.appendSlice(allocator, resolved.meta.audience orelse "(unset, not injectable)");
-		if (!resolved.bound) try out.appendSlice(allocator, " [MISSING VALUE]");
-		try out.append(allocator, '\n');
 	}
 
+	if (json) {
+		try out.appendSlice(allocator, "]\n");
+		try writeStdout(io, out.items);
+		return;
+	}
 	if (count == 0) {
 		try writeStdout(io, "No secrets bound.\n");
 		return;
 	}
 	try writeStdout(io, out.items);
+}
+
+/// Append one secret's `--json` object to `out`. The control plane (cogworx)
+/// reads this to learn the per-instance bound/audience state of each named
+/// secret, so it can show a plugin's inject request as bound vs unbound without
+/// ever seeing the value. Pure (no IO); exposed for tests. `bound` is whether
+/// the value file exists; an unbound or audience-null secret is not injectable.
+pub fn appendSecretJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, meta: store.Meta, bound: bool) !void {
+	try out.appendSlice(allocator, "{\"name\":");
+	try store.appendJsonString(allocator, out, name);
+	try out.appendSlice(allocator, ",\"kind\":");
+	try store.appendJsonString(allocator, out, meta.kind);
+	try out.appendSlice(allocator, ",\"audience\":");
+	if (meta.audience) |a| try store.appendJsonString(allocator, out, a) else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\"tier\":");
+	try store.appendJsonString(allocator, out, meta.tier);
+	try out.appendSlice(allocator, ",\"bound\":");
+	try out.appendSlice(allocator, if (bound) "true" else "false");
+	try out.appendSlice(allocator, ",\"bound_at\":");
+	if (meta.bound_at) |b| {
+		var nb: [32]u8 = undefined;
+		try out.appendSlice(allocator, std.fmt.bufPrint(&nb, "{d}", .{b}) catch unreachable);
+	} else try out.appendSlice(allocator, "null");
+	try out.append(allocator, '}');
 }
 
 // --- small helpers ---------------------------------------------------------
