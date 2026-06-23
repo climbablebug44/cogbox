@@ -815,7 +815,77 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 		return;
 	}
 
-	pushToCache(ctx, push_config, first);
+	const pushed = pushToCache(ctx, push_config, first);
+
+	// Pre-write the launcher's skip-eval fast-path record so a FRESH instance's
+	// FIRST boot fast-paths instead of paying the ~18min --override-input eval.
+	// Normally that record ($INSTANCE_CONFIG_DIR/runner.path) is written only by
+	// a prior eval boot (cogbox-launch.sh); a brand-new instance would have to
+	// eval once. Since we already built the composed runner and pushed it here,
+	// record it now so the very first boot realises it from the cache (a fetch,
+	// no eval). We ONLY record after a successful push: on a new instance the
+	// persistent /nix is empty, so the launcher's fast path runs
+	// `nix-store --realise` to fetch the recorded runner from the cache -- a
+	// record pointing at a closure that never made it into the cache would make
+	// that realise fail (the launcher then falls back to eval, so it's still
+	// safe, but recording it would be pointless). The rev marker we write is
+	// flake_source, which equals the launcher's baked @flakeSource@ (both the
+	// worker pod and the sandbox launcher run the SAME cogbox image, so the same
+	// COGBOX_FLAKE_SOURCE / @flakeSource@ store path) -- the marker therefore
+	// matches and the record self-heals across image bumps (a stale rev simply
+	// fails the launcher's `[ "$FP_REV" = "@flakeSource@" ]` guard and re-evals).
+	if (pushed) writeRunnerRecord(ctx, flake_source, first);
+}
+
+/// Best-effort pre-write of cogbox-launch.sh's runner.path fast-path record.
+/// The file lives at <instance_config_dir>/runner.path on the shared state PVC
+/// (the worker pod mounts it at the SAME XDG_CONFIG_HOME the sandbox launcher
+/// does), where instance_config_dir = dirname(plugins_flake_dir). Contents must
+/// byte-match what the launcher writes/reads: `printf '%s\n%s\n' <rev> <runner>`
+/// -- two newline-terminated lines, line1 = the flakeSource (image rev) marker,
+/// line2 = the composed runner out-path. Written atomically (tmp + rename) so a
+/// partial write can't leave a half-record the launcher would misread; any
+/// failure is warned and swallowed (a missing/short record just makes the first
+/// boot fall back to eval, never a failed verb).
+fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8) void {
+	const allocator = ctx.allocator;
+	const cwd = std.Io.Dir.cwd();
+
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
+		warn(ctx, "runner push: plugins-flake dir has no parent; skipping record (boot will eval)", .{}) catch {};
+		return;
+	};
+	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return;
+	defer allocator.free(path);
+	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
+	defer allocator.free(tmp_path);
+
+	const contents = std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ flake_source, runner }) catch return;
+	defer allocator.free(contents);
+
+	{
+		const f = cwd.createFile(ctx.io, tmp_path, .{ .truncate = true }) catch {
+			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
+			return;
+		};
+		defer f.close(ctx.io);
+		var write_buf: [512]u8 = undefined;
+		var writer = f.writer(ctx.io, &write_buf);
+		writer.interface.writeAll(contents) catch {
+			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
+			return;
+		};
+		writer.flush() catch {
+			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
+			return;
+		};
+		f.sync(ctx.io) catch {};
+	}
+	cwd.rename(tmp_path, cwd, path, ctx.io) catch {
+		cwd.deleteFile(ctx.io, tmp_path) catch {};
+		warn(ctx, "runner push: could not finalize runner record (boot will eval)", .{}) catch {};
+		return;
+	};
 }
 
 /// Push `out_path` (and its closure) to the attic cache described by the
@@ -824,8 +894,9 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 /// XDG_CONFIG_HOME whose attic/config.toml symlinks the supplied config, then
 /// run `attic push <cache> <path>` (attic computes the closure by default).
 /// The cache name comes from COGBOX_PUSH_CACHE (generic; the config's
-/// default-server resolves the server) or defaults to "store". Best-effort.
-fn pushToCache(ctx: *const Ctx, config_path: []const u8, out_path: []const u8) void {
+/// default-server resolves the server) or defaults to "store". Best-effort;
+/// returns true iff `attic push` exited 0 (every failure path returns false).
+fn pushToCache(ctx: *const Ctx, config_path: []const u8, out_path: []const u8) bool {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
 
@@ -835,37 +906,37 @@ fn pushToCache(ctx: *const Ctx, config_path: []const u8, out_path: []const u8) v
 	ctx.io.random(&rnd);
 	var hex: [24]u8 = undefined;
 	_ = std.fmt.bufPrint(&hex, "{x}", .{&rnd}) catch unreachable;
-	const xdg = std.fmt.allocPrint(allocator, "{s}/cogbox-attic-{s}", .{ base, hex }) catch return;
+	const xdg = std.fmt.allocPrint(allocator, "{s}/cogbox-attic-{s}", .{ base, hex }) catch return false;
 	defer allocator.free(xdg);
 	defer cwd.deleteTree(ctx.io, xdg) catch {};
 
-	const attic_dir = std.fs.path.join(allocator, &.{ xdg, "attic" }) catch return;
+	const attic_dir = std.fs.path.join(allocator, &.{ xdg, "attic" }) catch return false;
 	defer allocator.free(attic_dir);
 	cwd.createDirPath(ctx.io, attic_dir) catch {
 		warn(ctx, "runner push: could not stage attic config dir (boot will rebuild)", .{}) catch {};
-		return;
+		return false;
 	};
-	const link = std.fs.path.join(allocator, &.{ attic_dir, "config.toml" }) catch return;
+	const link = std.fs.path.join(allocator, &.{ attic_dir, "config.toml" }) catch return false;
 	defer allocator.free(link);
 	cwd.symLink(ctx.io, config_path, link, .{}) catch {
 		warn(ctx, "runner push: could not link attic config (boot will rebuild)", .{}) catch {};
-		return;
+		return false;
 	};
 
 	const cache = ctx.parent_env.get("COGBOX_PUSH_CACHE") orelse "store";
 
 	// Run attic with the staged XDG_CONFIG_HOME; clone the parent env so PATH
 	// (attic lives next to git in the pod image) and any netrc/SSL vars survive.
-	var env = cloneEnvMap(allocator, ctx.parent_env) catch return;
+	var env = cloneEnvMap(allocator, ctx.parent_env) catch return false;
 	defer env.deinit();
-	env.put("XDG_CONFIG_HOME", xdg) catch return;
+	env.put("XDG_CONFIG_HOME", xdg) catch return false;
 
 	const res = std.process.run(allocator, ctx.io, .{
 		.argv = &.{ "attic", "push", cache, out_path },
 		.environ_map = &env,
 	}) catch {
 		warn(ctx, "runner push: could not run attic (boot will rebuild)", .{}) catch {};
-		return;
+		return false;
 	};
 	defer {
 		allocator.free(res.stdout);
@@ -873,7 +944,9 @@ fn pushToCache(ctx: *const Ctx, config_path: []const u8, out_path: []const u8) v
 	}
 	if (res.term != .exited or res.term.exited != 0) {
 		warn(ctx, "runner push: attic push failed (boot will rebuild): {s}", .{nix.stderrTail(res.stderr)}) catch {};
+		return false;
 	}
+	return true;
 }
 
 /// Clone an Environ.Map (every key/value copied; Map.put dupes internally) so a
