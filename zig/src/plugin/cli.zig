@@ -25,6 +25,12 @@ pub const AddArgs = struct {
 	// --git-credential-stdin: read one `host\tuser\ttoken` line from stdin and
 	// authenticate the single nix fetch with it.
 	git_credential_stdin: bool = false,
+	// --defer-rules: install the module + merge inject specs as usual, but DON'T
+	// merge the plugin's L4/L7 networkRules into config.json. Instead emit the
+	// withheld rules as one JSON line on stdout for the control plane to route
+	// through its admin-approval flow. Suppresses the human "suggested rules"
+	// block + the confirm prompt so stdout carries only the JSON line.
+	defer_rules: bool = false,
 };
 
 pub const DelArgs = struct {
@@ -66,6 +72,7 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	var as: ?[]const u8 = null;
 	var yes = false;
 	var git_cred = false;
+	var defer_rules = false;
 
 	var i: usize = 0;
 	while (i < args.len) : (i += 1) {
@@ -80,6 +87,8 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 			yes = true;
 		} else if (std.mem.eql(u8, a, "--git-credential-stdin")) {
 			git_cred = true;
+		} else if (std.mem.eql(u8, a, "--defer-rules")) {
+			defer_rules = true;
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -89,7 +98,7 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	}
 
 	const u = url orelse return error.MissingUrl;
-	return .{ .add = .{ .url = u, .as = as, .yes = yes, .git_credential_stdin = git_cred } };
+	return .{ .add = .{ .url = u, .as = as, .yes = yes, .git_credential_stdin = git_cred, .defer_rules = defer_rules } };
 }
 
 fn parseDel(args: []const []const u8) ParseError!Cmd {
@@ -167,6 +176,21 @@ test "add --git-credential-stdin" {
 	try t.expect(!c2.add.git_credential_stdin);
 	// Combines with --as / -y.
 	const c3 = try parse(&.{ "add", "u", "--as", "p", "--git-credential-stdin", "-y" });
+	try t.expect(c3.add.git_credential_stdin);
+	try t.expectEqualStrings("p", c3.add.as.?);
+	try t.expect(c3.add.yes);
+}
+
+test "add --defer-rules" {
+	const c = try parse(&.{ "add", "github:owner/repo", "--defer-rules" });
+	try t.expect(c.add.defer_rules);
+	try t.expectEqualStrings("github:owner/repo", c.add.url);
+	// Default is off.
+	const c2 = try parse(&.{ "add", "github:owner/repo" });
+	try t.expect(!c2.add.defer_rules);
+	// Combines with --as / -y / --git-credential-stdin.
+	const c3 = try parse(&.{ "add", "u", "--as", "p", "--defer-rules", "--git-credential-stdin", "-y" });
+	try t.expect(c3.add.defer_rules);
 	try t.expect(c3.add.git_credential_stdin);
 	try t.expectEqualStrings("p", c3.add.as.?);
 	try t.expect(c3.add.yes);

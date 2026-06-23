@@ -158,17 +158,29 @@ fn cmdAdd(
 	loaded: *config.Loaded,
 ) !void {
 	const tree_alloc = loaded.treeAllocator();
+	// The 0-based index of the rule object once inserted, so an optional --plugin
+	// tag can be stamped onto exactly it.
+	var inserted_idx: usize = undefined;
 	if (a.pos) |p| {
 		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
+		inserted_idx = p - 1;
 	} else {
-		_ = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
+		const n = rule.append(tree_alloc, rules_arr, a.action, a.host, a.path, a.terminate, a.insecure, a.passthrough) catch |err| switch (err) {
 			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
 			else => return err,
 		};
+		inserted_idx = n - 1;
+	}
+
+	// --plugin NAME: tag the inserted rule so `plugin del NAME` removes exactly it
+	// (the same `"plugin"` field the plugin verb's merge stamps).
+	if (a.plugin) |tag| {
+		const obj = &rules_arr.items[inserted_idx].object;
+		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
 	}
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);

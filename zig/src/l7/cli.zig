@@ -26,6 +26,9 @@ pub const AddArgs = struct {
 	terminate: bool = false, // route this host through the terminate tier
 	insecure: bool = false, // skip upstream cert verification; implies terminate
 	passthrough: bool = false, // opt OUT of the terminate default (SNI-only)
+	// --plugin NAME: tag the inserted rule with `"plugin": "<name>"` so a later
+	// `plugin del <name>` removes exactly it (admin-approved deferred plugin rule).
+	plugin: ?[]const u8 = null,
 };
 
 pub const DelArgs = struct {
@@ -106,6 +109,7 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	var terminate = false;
 	var insecure = false;
 	var passthrough = false;
+	var plugin: ?[]const u8 = null;
 
 	var i: usize = 2;
 	while (i < args.len) : (i += 1) {
@@ -125,6 +129,10 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 			insecure = true;
 		} else if (std.mem.eql(u8, args[i], "--passthrough")) {
 			passthrough = true;
+		} else if (std.mem.eql(u8, args[i], "--plugin")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			plugin = args[i];
 		} else {
 			return error.InvalidArgs;
 		}
@@ -142,7 +150,7 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure, .passthrough = passthrough } },
+		.cmd = .{ .add = .{ .action = action, .host = host, .pos = pos, .path = path, .terminate = terminate, .insecure = insecure, .passthrough = passthrough, .plugin = plugin } },
 	};
 }
 
@@ -246,6 +254,21 @@ test "add --passthrough opts out, and rejects mixing with terminate flags" {
 	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--terminate" }));
 	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--path", "/v1/" }));
 	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "x.test", "--passthrough", "--insecure-upstream" }));
+}
+
+test "add --plugin tag" {
+	const a = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.example.com", "--plugin", "obs-plugin" });
+	try t.expectEqualStrings("obs-plugin", a.cmd.add.plugin.?);
+	try t.expectEqualStrings("api.example.com", a.cmd.add.host);
+	// Default is no tag (backward compat).
+	const b = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.example.com" });
+	try t.expect(b.cmd.add.plugin == null);
+	// Combines with --path / --at.
+	const c = try parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.example.com", "--path", "/v1/", "--plugin", "p", "--at", "1" });
+	try t.expectEqualStrings("p", c.cmd.add.plugin.?);
+	try t.expect(c.cmd.add.terminate);
+	// --plugin without a value errors.
+	try t.expectError(error.InvalidArgs, parse(&.{ "--config", "/c", "--runtime", "/r", "add", "allow", "api.example.com", "--plugin" }));
 }
 
 test "mode terminate parses (no longer rejected at parse)" {

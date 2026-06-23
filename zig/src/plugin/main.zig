@@ -108,6 +108,11 @@ const Ctx = struct {
 	// `--git-credential-stdin` add/update supplies a token, cmdAdd/cmdUpdate set
 	// this to the temp-netrc env for the duration of the fetch, then tear it down.
 	fetch_env: ?*const std.process.Environ.Map = null,
+	// --defer-rules: when true, every human announce() is redirected to STDERR so
+	// the only thing on STDOUT is the one `{"deferred":...}` JSON line cmdAdd
+	// emits. The control plane parses that line; routing chatter to stderr keeps
+	// it clean. Set by cmdAdd for the duration of a deferred add.
+	defer_rules: bool = false,
 };
 
 // --- list ---------------------------------------------------------------
@@ -160,6 +165,10 @@ fn shortRev(obj: std.json.ObjectMap) []const u8 {
 fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
+
+	// Under --defer-rules every human announce()/warn() routes to stderr so the
+	// only thing on stdout is the one deferred-rules JSON line emitted at the end.
+	ctx.defer_rules = a.defer_rules;
 
 	// --git-credential-stdin: read the one credential line, materialize a temp
 	// 0600 netrc + clear-helper gitconfig, and scope a per-fetch env to it for
@@ -297,15 +306,24 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		break :blk p.value.array.items;
 	};
 
+	// --defer-rules: withhold the plugin's L4/L7 networkRules from config.json and
+	// report them on stdout instead (the control plane routes them through admin
+	// approval). The module install and the inject-spec merge are UNCHANGED:
+	// injection is a separate trust class, gated host-side by `secret bind`, so it
+	// keeps its own confirm/merge path. The withheld L4/L7 rules count zero toward
+	// the prompt below; only inject specs prompt under defer.
+	const merge_l4 = if (a.defer_rules) &[_]std.json.Value{} else incoming_l4;
+	const merge_l7 = if (a.defer_rules) &[_]std.json.Value{} else incoming_l7;
+
 	var merged = false;
 	var merged_inject = false;
-	const total = incoming_l4.len + incoming_l7.len + incoming_inject.len;
+	const total = merge_l4.len + merge_l7.len + incoming_inject.len;
 	if (total > 0) {
 		if (rulesOrNull(loaded)) |rules_arr| {
-			if (incoming_l4.len + incoming_l7.len > 0) {
+			if (merge_l4.len + merge_l7.len > 0) {
 				try announce(ctx, "Suggested network rules from '{s}':", .{plugin_name});
-				for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
-				for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
+				for (merge_l4) |r| try printRuleLine(ctx, "+", r);
+				for (merge_l7) |r| try printL7RuleLine(ctx, "+", r);
 			}
 			if (incoming_inject.len > 0) {
 				try announce(ctx, "Credential injection requests from '{s}' (host-side; the secret stays OUT of the guest):", .{plugin_name});
@@ -313,16 +331,18 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 			}
 			const prompt = try std.fmt.allocPrint(allocator, "Apply these {d} change(s) at the top of the lists?", .{total});
 			defer allocator.free(prompt);
-			if (!a.yes and !try confirm(ctx, prompt)) {
+			// Under defer the confirm prompt is suppressed (stdout stays the JSON
+			// line; the deferred rules are not applied here regardless).
+			if (!a.yes and !a.defer_rules and !try confirm(ctx, prompt)) {
 				try announce(ctx, "Aborted.", .{});
 				return;
 			}
-			if (incoming_l4.len > 0) {
-				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, plugin_name, incoming_l4);
+			if (merge_l4.len > 0) {
+				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, plugin_name, merge_l4);
 			}
-			if (incoming_l7.len > 0) {
+			if (merge_l7.len > 0) {
 				const l7_arr = try ensureL7Rules(loaded);
-				try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, plugin_name, incoming_l7);
+				try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, plugin_name, merge_l7);
 			}
 			if (incoming_inject.len > 0) {
 				const inj_arr = try ensureInjectSpecs(loaded);
@@ -352,6 +372,105 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	try announce(ctx, "Plugin '{s}' added at {s}.", .{ plugin_name, pinLabel(&meta) });
 	if (merged_inject) try printBindChecklist(ctx, incoming_inject);
 	try printRestartHint(ctx, "to load its NixOS module");
+
+	// Under --defer-rules emit the withheld L4/L7 rules as one JSON line on
+	// stdout (the ONLY stdout output; all human chatter went to stderr). The
+	// control plane parses this and files one admin-approval request per rule.
+	if (a.defer_rules) {
+		const line = try renderDeferredJson(allocator, plugin_name, incoming_l4, incoming_l7);
+		defer allocator.free(line);
+		try writeStdout(io, line);
+	}
+}
+
+/// Build the one-line deferred-rules JSON the control plane consumes:
+///   {"deferred":{"plugin":"<name>","l4":[<L4 rule objects>],"l7":[<L7 rule objects>]}}
+/// The rule objects are the SAME validated shapes evalRules/evalL7Rules produced
+/// (so the control plane never re-encodes CIDR/host semantics), serialized
+/// compactly on a single line. Caller frees. Pure (testable) function.
+fn renderDeferredJson(
+	allocator: std.mem.Allocator,
+	plugin_name: []const u8,
+	l4: []const std.json.Value,
+	l7: []const std.json.Value,
+) ![]u8 {
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(allocator);
+	try out.appendSlice(allocator, "{\"deferred\":{\"plugin\":");
+	try writeCompactString(allocator, &out, plugin_name);
+	try out.appendSlice(allocator, ",\"l4\":");
+	try writeCompactArray(allocator, &out, l4);
+	try out.appendSlice(allocator, ",\"l7\":");
+	try writeCompactArray(allocator, &out, l7);
+	try out.appendSlice(allocator, "}}\n");
+	return out.toOwnedSlice(allocator);
+}
+
+fn writeCompactArray(allocator: std.mem.Allocator, out: *std.ArrayList(u8), items: []const std.json.Value) std.mem.Allocator.Error!void {
+	try out.append(allocator, '[');
+	for (items, 0..) |item, i| {
+		if (i > 0) try out.append(allocator, ',');
+		try writeCompactValue(allocator, out, item);
+	}
+	try out.append(allocator, ']');
+}
+
+/// Compact (no-whitespace, single-line) JSON serializer for a std.json.Value.
+/// Mirrors config.writeJqTab's escaping but emits no indentation/newlines, so
+/// the deferred line parses as exactly one line.
+fn writeCompactValue(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: std.json.Value) std.mem.Allocator.Error!void {
+	switch (value) {
+		.null => try out.appendSlice(allocator, "null"),
+		.bool => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
+		.integer => |i| {
+			var buf: [32]u8 = undefined;
+			const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+			try out.appendSlice(allocator, s);
+		},
+		.float => |f| {
+			var buf: [64]u8 = undefined;
+			const s = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+			try out.appendSlice(allocator, s);
+		},
+		.number_string => |s| try out.appendSlice(allocator, s),
+		.string => |s| try writeCompactString(allocator, out, s),
+		.array => |arr| try writeCompactArray(allocator, out, arr.items),
+		.object => |obj| {
+			try out.append(allocator, '{');
+			var it = obj.iterator();
+			var i: usize = 0;
+			while (it.next()) |entry| {
+				if (i > 0) try out.append(allocator, ',');
+				try writeCompactString(allocator, out, entry.key_ptr.*);
+				try out.append(allocator, ':');
+				try writeCompactValue(allocator, out, entry.value_ptr.*);
+				i += 1;
+			}
+			try out.append(allocator, '}');
+		},
+	}
+}
+
+fn writeCompactString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+	try out.append(allocator, '"');
+	for (s) |c| {
+		switch (c) {
+			'"' => try out.appendSlice(allocator, "\\\""),
+			'\\' => try out.appendSlice(allocator, "\\\\"),
+			'\n' => try out.appendSlice(allocator, "\\n"),
+			'\r' => try out.appendSlice(allocator, "\\r"),
+			'\t' => try out.appendSlice(allocator, "\\t"),
+			0x08 => try out.appendSlice(allocator, "\\b"),
+			0x0c => try out.appendSlice(allocator, "\\f"),
+			0...0x07, 0x0b, 0x0e...0x1f => {
+				var buf: [8]u8 = undefined;
+				const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+				try out.appendSlice(allocator, esc);
+			},
+			else => try out.append(allocator, c),
+		}
+	}
+	try out.append(allocator, '"');
 }
 
 // --- del ----------------------------------------------------------------
@@ -1345,7 +1464,13 @@ fn writeStderr(io: std.Io, bytes: []const u8) !void {
 fn announce(ctx: *const Ctx, comptime fmt: []const u8, args: anytype) !void {
 	const msg = try std.fmt.allocPrint(ctx.allocator, fmt ++ "\n", args);
 	defer ctx.allocator.free(msg);
-	try writeStdout(ctx.io, msg);
+	// Under --defer-rules the only thing on stdout is the deferred-rules JSON
+	// line; send all human chatter to stderr so that line parses cleanly.
+	if (ctx.defer_rules) {
+		try writeStderr(ctx.io, msg);
+	} else {
+		try writeStdout(ctx.io, msg);
+	}
 }
 
 fn warn(ctx: *const Ctx, comptime fmt: []const u8, args: anytype) !void {
@@ -1358,4 +1483,46 @@ fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args:
 	const msg = std.fmt.allocPrint(allocator, "cogbox plugin: error: " ++ fmt ++ "\n", args) catch "cogbox plugin: error: (message too long)\n";
 	writeStderr(io, msg) catch {};
 	std.process.exit(code);
+}
+
+// --- tests ---------------------------------------------------------------
+
+const t = std.testing;
+
+test "renderDeferredJson emits one line with the validated rule shapes" {
+	const a = t.allocator;
+	// The exact validated shapes evalRules/evalL7Rules produce: an L4 allow on a
+	// CIDR, and an L7 deny on a host with a terminate flag + comment.
+	var l4_parsed = try std.json.parseFromSlice(std.json.Value, a, "[{\"allow\":\"203.0.113.0/24\"}]", .{});
+	defer l4_parsed.deinit();
+	var l7_parsed = try std.json.parseFromSlice(std.json.Value, a, "[{\"deny\":\"api.example.com\",\"terminate\":true,\"comment\":\"x\"}]", .{});
+	defer l7_parsed.deinit();
+
+	const line = try renderDeferredJson(a, "obs-plugin", l4_parsed.value.array.items, l7_parsed.value.array.items);
+	defer a.free(line);
+
+	// Trailing newline, single line otherwise (no embedded newlines in the body).
+	try t.expect(line.len > 0 and line[line.len - 1] == '\n');
+	try t.expect(std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') == null);
+
+	// It round-trips to the documented contract.
+	var rt = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+	defer rt.deinit();
+	const deferred = rt.value.object.get("deferred").?.object;
+	try t.expectEqualStrings("obs-plugin", deferred.get("plugin").?.string);
+	const l4 = deferred.get("l4").?.array;
+	try t.expectEqual(@as(usize, 1), l4.items.len);
+	try t.expectEqualStrings("203.0.113.0/24", l4.items[0].object.get("allow").?.string);
+	const l7 = deferred.get("l7").?.array;
+	try t.expectEqual(@as(usize, 1), l7.items.len);
+	try t.expectEqualStrings("api.example.com", l7.items[0].object.get("deny").?.string);
+	try t.expect(l7.items[0].object.get("terminate").?.bool);
+	try t.expectEqualStrings("x", l7.items[0].object.get("comment").?.string);
+}
+
+test "renderDeferredJson with no rules emits empty arrays" {
+	const a = t.allocator;
+	const line = try renderDeferredJson(a, "p", &.{}, &.{});
+	defer a.free(line);
+	try t.expectEqualStrings("{\"deferred\":{\"plugin\":\"p\",\"l4\":[],\"l7\":[]}}\n", line);
 }
