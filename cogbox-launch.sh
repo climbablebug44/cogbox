@@ -901,20 +901,40 @@ fi
 #     customize flake.nix (or add plugins) opt into the re-eval. `cmp`
 #     is byte-exact and avoids the trailing-newline trim that command
 #     substitution does.
+#
+# Where the runner comes from: the microvm "run" script (line ~1326) is
+# generated from "$RUNNER_DIR/bin/microvm-run". RUNNER_DIR defaults to the
+# baked @runner@ sentinel (the plugin-less, image-default runner). The
+# re-exec below rebuilds cogbox with the plugins overlaid so the rebuilt
+# wrapper's @runner@ is the plugin-composed runner; that pass then points
+# RUNNER_DIR at it. The plugins re-exec re-evaluates the ENTIRE cogbox NixOS
+# config every boot (~100s cold) because --override-input marks the flake
+# mutable and disables nix's eval cache.
+RUNNER_DIR="${RUNNER_DIR:-@runner@}"
+# Self-recorded fast path (plugins only). Once a plugins re-exec has built the
+# composed runner, it writes its out-path here so the NEXT boot can realize
+# that store path directly -- no flake eval. The file lives on the state PVC
+# (under INSTANCE_CONFIG_DIR), so it persists across boots. Two lines:
+#   line1 = the cogbox flakeSource (image rev) the runner was built against;
+#   line2 = the composed runner out-path.
+RUNNER_PATH_FILE="$INSTANCE_CONFIG_DIR/runner.path"
+FAST_PATH=0
+
 if [ -z "${COGBOX_REEXECED:-}" ]; then
 	PLUGIN_COUNT=0
 	if [ -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		PLUGIN_COUNT=$(jq -r '(.plugins // []) | length' "$INSTANCE_CONFIG_DIR/config.json" 2>/dev/null || echo 0)
 	fi
-	# Substituter options shared by both re-exec branches (this nix run only).
-	# The per-instance file:// plugin cache resolves transitive tarball/narHash
-	# inputs offline; require-sigs false is safe there: a file:// cache is
-	# content-addressed and nix still verifies narHash; a local trusted cache is
-	# just unsigned. When cogworx configured a remote runner cache (COGBOX_EXTRA_*
-	# / COGBOX_NETRC_FILE) the worker pod pre-built and pushed the microvm runner
-	# closure there, so boot substitutes it instead of rebuilding from source.
-	# Each remote knob is a no-op when its env var is empty/unset (byte-identical
-	# to the pre-cache behavior).
+	# Substituter options shared by both re-exec branches and the fast-path
+	# realise below (this nix invocation only). The per-instance file:// plugin
+	# cache resolves transitive tarball/narHash inputs offline; require-sigs
+	# false is safe there: a file:// cache is content-addressed and nix still
+	# verifies narHash; a local trusted cache is just unsigned. When cogworx
+	# configured a remote runner cache (COGBOX_EXTRA_* / COGBOX_NETRC_FILE) the
+	# worker pod pre-built and pushed the microvm runner closure there, so boot
+	# substitutes it instead of rebuilding from source. Each remote knob is a
+	# no-op when its env var is empty/unset (byte-identical to the pre-cache
+	# behavior).
 	PLUGIN_SUBST_OPTS=()
 	SUBSTITUTERS=""
 	if [ -d "$PLUGIN_CACHE_DIR" ]; then
@@ -932,6 +952,34 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 	if [ -n "${COGBOX_NETRC_FILE:-}" ]; then
 		PLUGIN_SUBST_OPTS+=(--option netrc-file "$COGBOX_NETRC_FILE")
 	fi
+
+	# -- Skip-eval fast path (plugins only) ---------------------------
+	# If a previous plugins re-exec recorded a runner out-path for THIS image
+	# rev, realize that store path directly and skip the re-exec/eval entirely.
+	# This is strictly an optimization and MUST be fail-safe: on any problem
+	# (no record, rev marker mismatch, realise fails, run script absent) we
+	# leave FAST_PATH=0 and fall through to the normal re-exec/eval path, which
+	# re-records the (possibly new) rev -- so the path self-heals across image
+	# upgrades.
+	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$RUNNER_PATH_FILE" ]; then
+		FP_REV="" FP_RUNNER=""
+		{ IFS= read -r FP_REV; IFS= read -r FP_RUNNER; } < "$RUNNER_PATH_FILE" || true
+		# Only trust the record when it was written against the current image
+		# rev (@flakeSource@ expands to this cogbox's source store path).
+		if [ "$FP_REV" = "@flakeSource@" ] && [ -n "$FP_RUNNER" ]; then
+			if [ -e "$FP_RUNNER/bin/microvm-run" ]; then
+				RUNNER_DIR="$FP_RUNNER"
+				FAST_PATH=1
+			elif nix-store --realise "${PLUGIN_SUBST_OPTS[@]}" "$FP_RUNNER" >/dev/null 2>&1 \
+				&& [ -e "$FP_RUNNER/bin/microvm-run" ]; then
+				RUNNER_DIR="$FP_RUNNER"
+				FAST_PATH=1
+			fi
+		fi
+	fi
+fi
+
+if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
@@ -954,6 +1002,17 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 			--override-input userExtensions/nixpkgs "path:@nixpkgsSource@" \
 			-- "${ORIG_ARGS[@]}"
 	fi
+fi
+
+# -- Self-record the composed runner for the next boot's fast path -
+# Reached here in the re-exec'd (eval) pass, @runner@/@flakeSource@ have been
+# substituted to THIS rev's freshly-built values, so the record is always
+# correct for the current image. Only the plugins case is fast-pathed, so only
+# record when the plugins flake drove this re-exec (a customized 0-plugin flake
+# re-exec stays on the eval path). Best-effort: a write failure must not abort
+# boot, hence the `|| true`.
+if [ -n "${COGBOX_REEXECED:-}" ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+	printf '%s\n%s\n' "@flakeSource@" "@runner@" > "$RUNNER_PATH_FILE" 2>/dev/null || true
 fi
 
 # -- init-only stops here ------------------------------------------
@@ -1341,7 +1400,7 @@ else
 	SED_ARGS+=(-e "s|-netdev '[^']*'|-netdev 'stream,id=usernet,server=off,addr.type=unix,addr.path=${PASST_SOCK}'|")
 fi
 
-sed -E "${SED_ARGS[@]}" "@runner@/bin/microvm-run" > "$RUNTIME/run"
+sed -E "${SED_ARGS[@]}" "$RUNNER_DIR/bin/microvm-run" > "$RUNTIME/run"
 chmod +x "$RUNTIME/run"
 
 # Fail loud if the serial-console rewrite did not take (e.g. microvm changed
