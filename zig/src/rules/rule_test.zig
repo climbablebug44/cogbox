@@ -38,6 +38,25 @@ test "validateActionCidr accepts good CIDR, rejects bad" {
 	try t.expect(!rule.validateActionCidr(.deny, "10.0.0.0/33", &buf));
 }
 
+test "validateActionCidr accepts proto + :PORT qualified specs" {
+	var buf: [128]u8 = undefined;
+	try t.expect(rule.validateActionCidr(.deny, "0.0.0.0/0:25", &buf));
+	try t.expect(rule.validateActionCidr(.allow, "tcp 10.0.0.0/8", &buf));
+	try t.expect(rule.validateActionCidr(.allow, "tcp 1.2.3.4/32:443", &buf));
+	try t.expect(!rule.validateActionCidr(.allow, "tcp 1.2.3.4/32:99999", &buf));
+}
+
+test "append stores a proto + :PORT spec verbatim" {
+	var arena = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena.deinit();
+	var arr: std.json.Array = .init(arena.allocator());
+	const idx = try rule.append(arena.allocator(), &arr, .allow, "tcp 1.2.3.4/32:443");
+	try t.expectEqual(@as(usize, 1), idx);
+	const p = rule.ruleAction(arr.items[0].object).?;
+	try t.expect(p.action == .allow);
+	try t.expectEqualStrings("tcp 1.2.3.4/32:443", p.cidr);
+}
+
 test "newRuleObject builds the right shape" {
 	var arena = std.heap.ArenaAllocator.init(t.allocator);
 	defer arena.deinit();

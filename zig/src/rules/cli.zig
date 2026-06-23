@@ -1,6 +1,6 @@
 // Argument parsing for cogbox-rules. Shape:
 //   cogbox-rules --config CFG --runtime RT list
-//   cogbox-rules --config CFG --runtime RT add allow|deny CIDR [--at N]
+//   cogbox-rules --config CFG --runtime RT add allow|deny [tcp|udp] CIDR[:PORT] [--at N]
 //   cogbox-rules --config CFG --runtime RT del INDEX
 //   cogbox-rules --config CFG --runtime RT set       # reads stdin
 
@@ -16,8 +16,13 @@ pub const Cmd = union(enum) {
 
 pub const AddArgs = struct {
 	action: rule.Action,
-	cidr: []const u8,
+	proto: ?[]const u8 = null, // optional "tcp"/"udp" qualifier; null = any proto
+	cidr: []const u8, // CIDR, optionally with a :PORT suffix
 	pos: ?usize = null, // 1-based; null = append
+	// --plugin NAME: tag the inserted rule with `"plugin": "<name>"` so a later
+	// `plugin del <name>` removes exactly it. Used by the control plane when an
+	// admin approves a deferred plugin-contributed rule.
+	plugin: ?[]const u8 = null,
 };
 
 pub const DelArgs = struct {
@@ -87,16 +92,34 @@ pub fn parse(argv: []const []const u8) ParseError!Args {
 fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseError!Args {
 	if (args.len < 2) return error.InvalidArgs;
 	const action = parseAction(args[0]) orelse return error.InvalidAction;
-	const cidr = args[1];
-	var pos: ?usize = null;
 
-	var i: usize = 2;
+	// An optional proto qualifier ("tcp"/"udp") may precede the CIDR, mirroring
+	// the runtime rule-file grammar (`allow|deny [tcp|udp] CIDR[:PORT]`) and
+	// `cogbox rules set`. A leading "tcp"/"udp" is unambiguous since no CIDR
+	// begins that way. The port, if any, rides in the CIDR token as :PORT.
+	var idx: usize = 1;
+	var proto: ?[]const u8 = null;
+	if (isProtoToken(args[idx])) {
+		proto = args[idx];
+		idx += 1;
+	}
+	if (idx >= args.len) return error.InvalidArgs; // proto given but no CIDR
+	const cidr = args[idx];
+	idx += 1;
+
+	var pos: ?usize = null;
+	var plugin: ?[]const u8 = null;
+	var i: usize = idx;
 	while (i < args.len) : (i += 1) {
 		if (std.mem.eql(u8, args[i], "--at")) {
 			i += 1;
 			if (i >= args.len) return error.InvalidArgs;
 			pos = std.fmt.parseInt(usize, args[i], 10) catch return error.InvalidIndex;
 			if (pos.? == 0) return error.InvalidIndex;
+		} else if (std.mem.eql(u8, args[i], "--plugin")) {
+			i += 1;
+			if (i >= args.len) return error.InvalidArgs;
+			plugin = args[i];
 		} else {
 			return error.InvalidArgs;
 		}
@@ -105,8 +128,12 @@ fn parseAdd(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseErro
 	return .{
 		.config_path = cfg,
 		.runtime_path = rt,
-		.cmd = .{ .add = .{ .action = action, .cidr = cidr, .pos = pos } },
+		.cmd = .{ .add = .{ .action = action, .proto = proto, .cidr = cidr, .pos = pos, .plugin = plugin } },
 	};
+}
+
+fn isProtoToken(s: []const u8) bool {
+	return std.mem.eql(u8, s, "tcp") or std.mem.eql(u8, s, "udp");
 }
 
 fn parseDel(cfg: []const u8, rt: []const u8, args: []const []const u8) ParseError!Args {

@@ -159,17 +159,39 @@ fn cmdAdd(
 	loaded: *config.Loaded,
 ) !void {
 	const tree_alloc = loaded.treeAllocator();
+
+	// The stored rule value is the whole spec after the action, matching the
+	// on-disk/runtime grammar (`[tcp|udp] CIDR[:PORT]`). Fold an optional proto
+	// qualifier into that spec so `list`/`set` round-trip it unchanged.
+	const spec = if (a.proto) |pr|
+		try std.fmt.allocPrint(allocator, "{s} {s}", .{ pr, a.cidr })
+	else
+		a.cidr;
+	defer if (a.proto != null) allocator.free(spec);
+
+	// The 0-based index of the rule object once inserted, so an optional --plugin
+	// tag can be stamped onto exactly it.
+	var inserted_idx: usize = undefined;
 	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.cidr) catch |err| switch (err) {
+		rule.insertAt(tree_alloc, rules_arr, p, a.action, spec) catch |err| switch (err) {
 			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
-			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}, 65),
+			error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
 			else => return err,
 		};
+		inserted_idx = p - 1;
 	} else {
-		_ = rule.append(tree_alloc, rules_arr, a.action, a.cidr) catch |err| switch (err) {
-			error.InvalidCidr => return die(allocator, io, "invalid CIDR: {s}", .{a.cidr}, 65),
+		const n = rule.append(tree_alloc, rules_arr, a.action, spec) catch |err| switch (err) {
+			error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
 			else => return err,
 		};
+		inserted_idx = n - 1;
+	}
+
+	// --plugin NAME: tag the inserted rule so `plugin del NAME` removes exactly it
+	// (the same `"plugin"` field the plugin verb's merge stamps).
+	if (a.plugin) |tag| {
+		const obj = &rules_arr.items[inserted_idx].object;
+		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
 	}
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
@@ -178,9 +200,9 @@ fn cmdAdd(
 		.deny => "deny",
 	};
 	if (a.pos) |p| {
-		try announce(allocator, io, "Added: {s} {s} at position {d}", .{ action_str, a.cidr, p });
+		try announce(allocator, io, "Added: {s} {s} at position {d}", .{ action_str, spec, p });
 	} else {
-		try announce(allocator, io, "Added: {s} {s}", .{ action_str, a.cidr });
+		try announce(allocator, io, "Added: {s} {s}", .{ action_str, spec });
 	}
 	try maybeReload(allocator, io, args.runtime_path, loaded);
 }

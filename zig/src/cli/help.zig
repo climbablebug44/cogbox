@@ -317,13 +317,21 @@ pub const RULES =
 	\\
 	\\Usage:
 	\\  cogbox rules [-n NAME] list
-	\\  cogbox rules [-n NAME] add allow|deny CIDR [--at N]
+	\\  cogbox rules [-n NAME] add allow|deny [tcp|udp] CIDR[:PORT] [--at N]
 	\\  cogbox rules [-n NAME] del INDEX
 	\\  cogbox rules [-n NAME] set            (reads rules from stdin)
 	\\
 	\\Options:
 	\\  -n, --name NAME       Instance name (default: "default")
 	\\  -h, --help            Show this help and exit
+	\\
+	\\Spec syntax: an optional proto (tcp|udp) and :PORT narrow the rule;
+	\\both default to "any" when omitted.
+	\\
+	\\Examples:
+	\\  cogbox rules add allow 10.0.0.0/8              any proto, any port
+	\\  cogbox rules add deny  0.0.0.0/0:25            any proto, port 25
+	\\  cogbox rules add allow tcp 1.2.3.4/32:443      TCP port 443 to one host
 	\\
 	\\Rules apply only when the instance's network mode is "rules". The
 	\\evaluator walks the list top-down and stops at the first match; an

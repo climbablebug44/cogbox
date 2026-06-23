@@ -362,7 +362,7 @@ fn ipv6Matches(net: [16]u8, ip: [16]u8, prefix_len: u8) bool {
 ///   allow|deny tcp|udp CIDR               (port=any)
 ///   allow|deny CIDR:PORT                  (proto=any)
 ///   allow|deny tcp|udp CIDR:PORT
-/// IPv6 CIDRs and port suffixes on IPv6 are not supported in v1.
+/// IPv6 CIDRs are matched port-less only; `:PORT` suffixes are IPv4-only in v1.
 pub fn parseLine(line: []const u8) ?Rule {
 	const trimmed = std.mem.trim(u8, line, " \t\r\n");
 	if (trimmed.len == 0 or trimmed[0] == '#') return null;

@@ -75,6 +75,13 @@ cogbox rules add allow 192.168.1.50/32 --at 8
 cogbox rules add deny 8.8.8.8/32 --at 1
 ```
 
+**Allow only one port on a host** -- scope the allow with a proto and `:PORT`, then deny the rest of the host. The narrower rule must come first:
+
+```sh
+cogbox rules add allow tcp 1.2.3.4/32:443 --at 1   # HTTPS to that host
+cogbox rules add deny 1.2.3.4/32 --at 2            # nothing else to it
+```
+
 Implicit rules (applied before user rules, not configurable):
 
 - **DNS (port 53)** is always allowed so hostname resolution works
@@ -82,7 +89,7 @@ Implicit rules (applied before user rules, not configurable):
 
 ### Rule format
 
-CIDR rules accept optional `tcp`/`udp` and `:PORT` qualifiers when hand-edited in `config.json` (the CLI currently only emits the unqualified form). The runtime file format is:
+CIDR rules accept optional `tcp`/`udp` and `:PORT` qualifiers, both via `cogbox rules add` (e.g. `cogbox rules add allow tcp 1.2.3.4/32:443`) and when hand-edited in `config.json`. The runtime file format is:
 
 ```
 allow 10.0.0.0/8                 # any proto, any port
@@ -91,12 +98,14 @@ deny  0.0.0.0/0:25               # any proto, port 25
 allow tcp 0.0.0.0/0:443          # tcp, port 443
 ```
 
+IPv6 CIDRs are matched port-less only (e.g. `deny tcp ::/0`); the `:PORT` qualifier is IPv4-only in v1, so a rule like `allow tcp ::1/128:443` is rejected.
+
 ### Rules verb reference
 
 | Form | Description |
 |---|---|
 | `cogbox rules list [-n NAME]` | List current rules with 1-based indices |
-| `cogbox rules add allow\|deny CIDR [--at N] [-n NAME]` | Add a rule. Appends by default; `--at N` inserts at 1-based position N. |
+| `cogbox rules add allow\|deny [tcp\|udp] CIDR[:PORT] [--at N] [-n NAME]` | Add a rule. An optional `tcp`/`udp` proto and `:PORT` narrow the match (both default to any). Appends by default; `--at N` inserts at 1-based position N. |
 | `cogbox rules del INDEX [-n NAME]` | Delete a rule by index |
 | `cogbox rules set [-n NAME]` | Replace all rules from stdin |
 
