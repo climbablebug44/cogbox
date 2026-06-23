@@ -10,6 +10,7 @@
 // the shared rules_module path like every other rules-table edit.
 
 const std = @import("std");
+const builtin_mod = @import("builtin");
 pub const cli = @import("cli.zig");
 pub const name_mod = @import("name.zig");
 pub const compose = @import("compose.zig");
@@ -738,6 +739,152 @@ fn finalizeComposition(ctx: *const Ctx) void {
 		defer o.deinit(allocator);
 		if (!o.ok) warn(ctx, "could not populate offline plugin cache (transitive inputs may need network at launch): {s}", .{nix.stderrTail(o.stderr)}) catch {};
 	} else |_| {}
+
+	// Pre-build the microvm runner and push it to the configured remote cache so
+	// boot SUBSTITUTES it instead of rebuilding the expensive closure from source.
+	// Gated on cogworx opting in via env;
+	// best-effort throughout -- a failure here only means boot rebuilds, never a
+	// failed plugin verb.
+	prebuildAndPushRunner(ctx);
+}
+
+/// The env-driven runner pre-build + push (Stage 1 of the offline-launch
+/// optimization). Runs only when cogworx (the worker pod) requests it:
+/// COGBOX_RUNNER_PUSH == "1" AND COGBOX_PUSH_CONFIG is set. It builds the SAME
+/// microvm runner the boot path would build (identical flake ref +
+/// --override-input set => byte-identical out-path; nothing instance-specific
+/// is in the closure -- hostname/ports/keys are launch-time sed rewrites on the
+/// OUTPUT), then pushes that out-path's closure to the cache so a fresh-store
+/// boot substitutes it. Every failure is logged and swallowed.
+fn prebuildAndPushRunner(ctx: *const Ctx) void {
+	const allocator = ctx.allocator;
+	const env = ctx.parent_env;
+
+	const push = env.get("COGBOX_RUNNER_PUSH") orelse return;
+	if (!std.mem.eql(u8, push, "1")) return;
+	const push_config = env.get("COGBOX_PUSH_CONFIG") orelse return;
+	if (push_config.len == 0) return;
+
+	// The cogbox flake + nixpkgs store paths, baked by mkCogbox (--set-default).
+	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
+		warn(ctx, "runner push: COGBOX_FLAKE_SOURCE unset; skipping pre-build", .{}) catch {};
+		return;
+	};
+	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
+		warn(ctx, "runner push: COGBOX_NIXPKGS_SOURCE unset; skipping pre-build", .{}) catch {};
+		return;
+	};
+
+	// The config-name suffix: cogbox-x86_64 / cogbox-aarch64. builtin.cpu.arch
+	// is fixed at compile time to the arch this cogbox image was built for, and
+	// its tag name (x86_64 / aarch64) matches flake.nix's archSuffix exactly.
+	const arch = @tagName(builtin_mod.cpu.arch);
+
+	// Combine the per-instance file:// cache with cogworx's remote substituters
+	// so the runner's transitive deps substitute rather than build from source.
+	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
+	const substituters = blk: {
+		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
+		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
+	};
+	defer allocator.free(substituters);
+
+	const out = nix.buildRunner(allocator, ctx.io, env, .{
+		.flake_source = flake_source,
+		.nixpkgs_source = nixpkgs_source,
+		.plugins_flake_dir = ctx.plugins_flake_dir,
+		.arch = arch,
+		.substituters = substituters,
+		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
+		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+	}) catch {
+		warn(ctx, "runner push: build failed to launch (boot will rebuild)", .{}) catch {};
+		return;
+	};
+	var o = out;
+	defer o.deinit(allocator);
+	if (!o.ok) {
+		warn(ctx, "runner push: build failed (boot will rebuild): {s}", .{nix.stderrTail(o.stderr)}) catch {};
+		return;
+	}
+	// --print-out-paths emits the store path(s), one per line; take the first.
+	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
+	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
+	if (first.len == 0) {
+		warn(ctx, "runner push: build produced no out-path (boot will rebuild)", .{}) catch {};
+		return;
+	}
+
+	pushToCache(ctx, push_config, first);
+}
+
+/// Push `out_path` (and its closure) to the attic cache described by the
+/// config.toml at `config_path`. attic has no config-path env override; it
+/// reads $XDG_CONFIG_HOME/attic/config.toml, so we stand up a throwaway
+/// XDG_CONFIG_HOME whose attic/config.toml symlinks the supplied config, then
+/// run `attic push <cache> <path>` (attic computes the closure by default).
+/// The cache name comes from COGBOX_PUSH_CACHE (generic; the config's
+/// default-server resolves the server) or defaults to "store". Best-effort.
+fn pushToCache(ctx: *const Ctx, config_path: []const u8, out_path: []const u8) void {
+	const allocator = ctx.allocator;
+	const cwd = std.Io.Dir.cwd();
+
+	// Throwaway XDG_CONFIG_HOME/attic/config.toml -> config_path.
+	const base = ctx.parent_env.get("TMPDIR") orelse "/tmp";
+	var rnd: [12]u8 = undefined;
+	ctx.io.random(&rnd);
+	var hex: [24]u8 = undefined;
+	_ = std.fmt.bufPrint(&hex, "{x}", .{&rnd}) catch unreachable;
+	const xdg = std.fmt.allocPrint(allocator, "{s}/cogbox-attic-{s}", .{ base, hex }) catch return;
+	defer allocator.free(xdg);
+	defer cwd.deleteTree(ctx.io, xdg) catch {};
+
+	const attic_dir = std.fs.path.join(allocator, &.{ xdg, "attic" }) catch return;
+	defer allocator.free(attic_dir);
+	cwd.createDirPath(ctx.io, attic_dir) catch {
+		warn(ctx, "runner push: could not stage attic config dir (boot will rebuild)", .{}) catch {};
+		return;
+	};
+	const link = std.fs.path.join(allocator, &.{ attic_dir, "config.toml" }) catch return;
+	defer allocator.free(link);
+	cwd.symLink(ctx.io, config_path, link, .{}) catch {
+		warn(ctx, "runner push: could not link attic config (boot will rebuild)", .{}) catch {};
+		return;
+	};
+
+	const cache = ctx.parent_env.get("COGBOX_PUSH_CACHE") orelse "store";
+
+	// Run attic with the staged XDG_CONFIG_HOME; clone the parent env so PATH
+	// (attic lives next to git in the pod image) and any netrc/SSL vars survive.
+	var env = cloneEnvMap(allocator, ctx.parent_env) catch return;
+	defer env.deinit();
+	env.put("XDG_CONFIG_HOME", xdg) catch return;
+
+	const res = std.process.run(allocator, ctx.io, .{
+		.argv = &.{ "attic", "push", cache, out_path },
+		.environ_map = &env,
+	}) catch {
+		warn(ctx, "runner push: could not run attic (boot will rebuild)", .{}) catch {};
+		return;
+	};
+	defer {
+		allocator.free(res.stdout);
+		allocator.free(res.stderr);
+	}
+	if (res.term != .exited or res.term.exited != 0) {
+		warn(ctx, "runner push: attic push failed (boot will rebuild): {s}", .{nix.stderrTail(res.stderr)}) catch {};
+	}
+}
+
+/// Clone an Environ.Map (every key/value copied; Map.put dupes internally) so a
+/// single child exec can run with an overridden variable without mutating ours.
+fn cloneEnvMap(allocator: std.mem.Allocator, src: *const std.process.Environ.Map) !std.process.Environ.Map {
+	var out = std.process.Environ.Map.init(allocator);
+	errdefer out.deinit();
+	const ks = src.keys();
+	const vs = src.values();
+	for (ks, vs) |k, v| try out.put(k, v);
+	return out;
 }
 
 /// Evaluate one of the plugin's suggested-rule lists:

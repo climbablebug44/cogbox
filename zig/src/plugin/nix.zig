@@ -64,6 +64,90 @@ pub fn flakeLock(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.proc
 	return runNix(allocator, io, env, &.{ "flake", "lock", url });
 }
 
+/// Inputs for buildRunner. `flake_source`/`nixpkgs_source` are the cogbox
+/// flake + nixpkgs store paths (COGBOX_FLAKE_SOURCE / COGBOX_NIXPKGS_SOURCE,
+/// baked by mkCogbox); `plugins_flake_dir` is the composition; `arch` is the
+/// config-name suffix (x86_64 / aarch64). The substituter knobs combine the
+/// per-instance file:// cache with cogworx's remote runner cache so transitive
+/// deps substitute rather than build. Empty optional knobs are simply omitted.
+pub const RunnerBuild = struct {
+	flake_source: []const u8,
+	nixpkgs_source: []const u8,
+	plugins_flake_dir: []const u8,
+	arch: []const u8,
+	// "file://<cache_dir> <COGBOX_EXTRA_SUBSTITUTERS>", already joined by the
+	// caller (either piece may be empty; the whole string is omitted if empty).
+	substituters: []const u8,
+	trusted_public_keys: []const u8, // COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS ("" => skip)
+	netrc_file: []const u8, // COGBOX_NETRC_FILE ("" => skip)
+};
+
+/// Build the `nix build` argv for the runner (everything after `nix
+/// --extra-experimental-features ...`, which runNix prepends). Separated from
+/// buildRunner so the load-bearing invariant -- that the installable + the
+/// --override-input set EXACTLY match cogbox-launch.sh's re-exec, which is what
+/// makes the worker-built out-path byte-identical to the one boot looks for --
+/// is unit-testable. The returned slice and every interpolated string it owns
+/// are freed by argvDeinit. Optional substituter/key/netrc knobs are appended
+/// only when non-empty (so an unconfigured worker emits no extra options).
+fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
+	const installable = try std.fmt.allocPrint(allocator, "path:{s}#nixosConfigurations.cogbox-{s}.config.microvm.declaredRunner", .{ b.flake_source, b.arch });
+	errdefer allocator.free(installable);
+	const plugins_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.plugins_flake_dir});
+	errdefer allocator.free(plugins_input);
+	const nixpkgs_input = try std.fmt.allocPrint(allocator, "path:{s}", .{b.nixpkgs_source});
+	errdefer allocator.free(nixpkgs_input);
+
+	var argv: std.ArrayList([]const u8) = .empty;
+	errdefer argv.deinit(allocator);
+	try argv.appendSlice(allocator, &.{
+		"build",
+		installable,
+		"--override-input",
+		"userExtensions",
+		plugins_input,
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		nixpkgs_input,
+		"--no-link",
+		"--print-out-paths",
+	});
+	if (b.substituters.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "extra-substituters", b.substituters, "--option", "require-sigs", "false" });
+	}
+	if (b.trusted_public_keys.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "extra-trusted-public-keys", b.trusted_public_keys });
+	}
+	if (b.netrc_file.len > 0) {
+		try argv.appendSlice(allocator, &.{ "--option", "netrc-file", b.netrc_file });
+	}
+	return argv;
+}
+
+/// Free the three interpolated installable/input strings runnerBuildArgv owns
+/// (the path:... installable at index 1 and the two path: inputs at 4 and 7),
+/// then the list itself. The literal flags are static and must not be freed.
+fn argvDeinit(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8)) void {
+	allocator.free(argv.items[1]);
+	allocator.free(argv.items[4]);
+	allocator.free(argv.items[7]);
+	argv.deinit(allocator);
+}
+
+/// Build the microvm runner the boot path would build -- the SAME flake ref +
+/// the SAME --override-input set as cogbox-launch.sh's re-exec -- so the
+/// resulting out-path is byte-identical to the one boot looks for, then return
+/// it (`--print-out-paths`, `--no-link`). The worker pod pushes this closure to
+/// a binary cache so boot substitutes it instead of rebuilding from source.
+/// Determinism: nothing instance-specific is baked into the closure (hostname,
+/// ports, keys are launch-time sed rewrites on the OUTPUT), so every worker for
+/// the same (cogbox-rev, plugin-set) builds the identical path.
+pub fn buildRunner(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, b: RunnerBuild) !RunOut {
+	var argv = try runnerBuildArgv(allocator, b);
+	defer argvDeinit(allocator, &argv);
+	return runNix(allocator, io, env, argv.items);
+}
+
 /// Outcome of the nixosModules.<attr> contract check. `missing` is the
 /// contract violation ("this flake is not a cogbox plugin"); `failed` is
 /// everything else that can go wrong with the eval (fetch error, eval error
@@ -296,4 +380,89 @@ pub fn stderrTail(stderr: []const u8) []const u8 {
 	// Start at the next line boundary so we don't emit half a line.
 	if (std.mem.indexOfScalar(u8, cut, '\n')) |i| return cut[i + 1 ..];
 	return cut;
+}
+
+// --- Tests (private runnerBuildArgv is in scope here) ---
+
+const t = std.testing;
+
+/// Per-element string comparison: expectEqualSlices compares pointers for a
+/// []const u8 element, so it can't check argv content. This checks length then
+/// each string's bytes.
+fn expectArgv(expected: []const []const u8, actual: []const []const u8) !void {
+	try t.expectEqual(expected.len, actual.len);
+	for (expected, actual) |e, a| try t.expectEqualStrings(e, a);
+}
+
+// The load-bearing invariant: the runner build invocation must use the SAME
+// installable + the SAME --override-input set as cogbox-launch.sh's re-exec, so
+// the worker-built out-path is byte-identical to the one boot substitutes. With
+// no substituter/key/netrc knobs set, NO extra --option args are emitted.
+test "runnerBuildArgv: matches the boot-path flake ref + override-inputs, no knobs" {
+	var argv = try runnerBuildArgv(t.allocator, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.plugins_flake_dir = "/var/lib/cogbox/inst/plugins-flake",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"build",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.microvm.declaredRunner",
+		"--override-input",
+		"userExtensions",
+		"path:/var/lib/cogbox/inst/plugins-flake",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-link",
+		"--print-out-paths",
+	}, argv.items);
+}
+
+// The arch suffix flows straight into the config name (cogbox-aarch64), and
+// every configured knob appends its --option in order: extra-substituters (with
+// require-sigs false), extra-trusted-public-keys, then netrc-file.
+test "runnerBuildArgv: aarch64 config name + all substituter knobs appended" {
+	var argv = try runnerBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "aarch64",
+		.substituters = "file:///cache https://cache.example.com",
+		.trusted_public_keys = "cache.example.com-1:KEY=",
+		.netrc_file = "/run/secrets/netrc",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64.config.microvm.declaredRunner", argv.items[1]);
+	try expectArgv(&.{
+		"--option", "extra-substituters",       "file:///cache https://cache.example.com",
+		"--option", "require-sigs",              "false",
+		"--option", "extra-trusted-public-keys", "cache.example.com-1:KEY=",
+		"--option", "netrc-file",                "/run/secrets/netrc",
+	}, argv.items[10..]);
+}
+
+// A configured substituter but no keys/netrc emits exactly the substituter
+// option pair -- no stray trusted-keys or netrc options.
+test "runnerBuildArgv: substituters only, no keys/netrc" {
+	var argv = try runnerBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "x86_64",
+		.substituters = "file:///cache",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"--option", "extra-substituters", "file:///cache", "--option", "require-sigs", "false",
+	}, argv.items[10..]);
 }

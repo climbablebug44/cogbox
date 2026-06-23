@@ -633,6 +633,8 @@
 
 				wrapProgram $out/bin/cogbox \
 					--set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
+					--set-default COGBOX_FLAKE_SOURCE "${self}" \
+					--set-default COGBOX_NIXPKGS_SOURCE "${nixpkgs}" \
 					--prefix PATH : "${lib.makeBinPath (with pkgs; [
 						coreutils gnused gnugrep jq diffutils nix bashInteractive openssh
 					] ++ [ self.packages.${system}.passt-cc ])}"
@@ -691,6 +693,10 @@
 					# `cogbox plugin add <git+...>` fails "executing git: No such file".
 					# cacert + SSL_CERT_FILE (below) let the https variant verify TLS.
 					pkgs.git
+					# The worker pod pre-builds the microvm runner at plugin-add time and
+					# pushes the closure to a binary cache so boot substitutes it instead
+					# of rebuilding from source (cogbox plugin's COGBOX_RUNNER_PUSH path).
+					pkgs.attic-client
 					pkgs.cacert
 					pkgs.bashInteractive
 					pkgs.coreutils

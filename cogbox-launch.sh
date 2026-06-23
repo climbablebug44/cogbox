@@ -906,15 +906,33 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 	if [ -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		PLUGIN_COUNT=$(jq -r '(.plugins // []) | length' "$INSTANCE_CONFIG_DIR/config.json" 2>/dev/null || echo 0)
 	fi
+	# Substituter options shared by both re-exec branches (this nix run only).
+	# The per-instance file:// plugin cache resolves transitive tarball/narHash
+	# inputs offline; require-sigs false is safe there: a file:// cache is
+	# content-addressed and nix still verifies narHash; a local trusted cache is
+	# just unsigned. When cogworx configured a remote runner cache (COGBOX_EXTRA_*
+	# / COGBOX_NETRC_FILE) the worker pod pre-built and pushed the microvm runner
+	# closure there, so boot substitutes it instead of rebuilding from source.
+	# Each remote knob is a no-op when its env var is empty/unset (byte-identical
+	# to the pre-cache behavior).
+	PLUGIN_SUBST_OPTS=()
+	SUBSTITUTERS=""
+	if [ -d "$PLUGIN_CACHE_DIR" ]; then
+		SUBSTITUTERS="file://$PLUGIN_CACHE_DIR"
+	fi
+	if [ -n "${COGBOX_EXTRA_SUBSTITUTERS:-}" ]; then
+		SUBSTITUTERS="${SUBSTITUTERS:+$SUBSTITUTERS }$COGBOX_EXTRA_SUBSTITUTERS"
+	fi
+	if [ -n "$SUBSTITUTERS" ]; then
+		PLUGIN_SUBST_OPTS+=(--option extra-substituters "$SUBSTITUTERS" --option require-sigs false)
+	fi
+	if [ -n "${COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS:-}" ]; then
+		PLUGIN_SUBST_OPTS+=(--option extra-trusted-public-keys "$COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS")
+	fi
+	if [ -n "${COGBOX_NETRC_FILE:-}" ]; then
+		PLUGIN_SUBST_OPTS+=(--option netrc-file "$COGBOX_NETRC_FILE")
+	fi
 	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
-		# Use the per-instance plugin binary cache as an extra substituter (this
-		# nix run only) so transitive tarball/narHash inputs resolve offline.
-		# require-sigs false is safe: a file:// cache is content-addressed and
-		# nix still verifies narHash; a local trusted cache is just unsigned.
-		PLUGIN_SUBST_OPTS=()
-		if [ -d "$PLUGIN_CACHE_DIR" ]; then
-			PLUGIN_SUBST_OPTS=(--option extra-substituters "file://$PLUGIN_CACHE_DIR" --option require-sigs false)
-		fi
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
@@ -930,6 +948,7 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 		&& ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
+			"${PLUGIN_SUBST_OPTS[@]}" \
 			run "path:@flakeSource@" \
 			--override-input userExtensions "path:$INSTANCE_FLAKE_DIR" \
 			--override-input userExtensions/nixpkgs "path:@nixpkgsSource@" \
