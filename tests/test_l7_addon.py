@@ -538,6 +538,63 @@ check(_load(p)["accessToken"] == "NEW-ACCESS" and os.stat(p).st_uid == _uid_befo
       "refresh: write-back preserves cred file owner")
 
 
+# --- request() over PLAIN HTTP (no SNI): injection still fires -------------
+# The L7 proxy now routes an http:// inject host through this addon (a plain
+# http:// vhost otherwise bypasses it via the native splice, so its cred would
+# never be stamped). On such a flow there is NO client SNI, so the addon must
+# skip the upstream-SNI set + the Host==SNI guard (both gated on `sni`) and
+# still enforce allow/deny on the Host header + inject the host-side credential.
+class _Conn:
+    def __init__(self, sni=None):
+        self.sni = sni
+
+
+class _Req:
+    def __init__(self, host, path, headers):
+        self.pretty_host = host
+        self.path = path
+        self.headers = headers
+
+
+class _Flow:
+    def __init__(self, host, path, headers, sni=None):
+        self.client_conn = _Conn(sni)
+        self.server_conn = _Conn(None)
+        self.request = _Req(host, path, headers)
+        self.response = None
+
+
+_hd = tempfile.mkdtemp()
+_http_rules = os.path.join(_hd, "l7-rules")
+with open(_http_rules, "w") as f:
+    f.write("mode terminate\nallow notes.internal.test\n")
+m.RULES_PATH = _http_rules
+m.RULES = m.Rules()  # fresh: maybe_reload() loads from the path above
+
+_sid = os.path.join(_hd, "sid")
+_write_raw(_sid, "REAL-SESSION-COOKIE\n", 1000)
+_http_conf = os.path.join(_hd, "inject.json")
+_write(_http_conf, [{"host": "notes.internal.test", "style": "cookie",
+                     "cookie_name": "connect.sid", "cred_file": _sid,
+                     "cred_format": "raw"}], 1000)
+m.CREDS = m.CredStore(_http_conf)
+
+# plain HTTP request (sni=None), no cookie yet -> the session cookie is injected
+_h = CIDict({"Host": "notes.internal.test"})
+_fl = _Flow("notes.internal.test", "/", _h, sni=None)
+m.request(_fl)
+check(_fl.response is None, "http inject: allowed no-SNI request is not denied")
+check(_h.get("cookie") == "connect.sid=REAL-SESSION-COOKIE",
+      "http inject: session cookie injected over plain HTTP (no SNI)")
+check(_fl.server_conn.sni is None, "http inject: no upstream SNI set on a no-SNI flow")
+
+# a no-SNI request to an UNLISTED host is denied (default-deny), not injected.
+# (Build the flow but assert via evaluate() to avoid _deny -> http.Response,
+# which is unavailable without mitmproxy imported.)
+check(m.evaluate(m.RULES, "evil.internal.test", "/") == "deny",
+      "http inject: unlisted host stays default-deny")
+
+
 if fails:
     print("FAIL:", *fails, sep="\n  ")
     sys.exit(1)

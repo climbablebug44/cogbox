@@ -1279,6 +1279,30 @@ with subtest("Phase R: L7 host-side credential injection keeps the token out of 
     assert ("auth=Bearer " + real_token) in hits, f"injected token missing at origin: {hits!r}"
     assert placeholder not in hits, f"guest placeholder leaked upstream: {hits!r}"
 
+    # Same injection over PLAIN HTTP. A plain http:// inject host used to bypass
+    # the addon entirely (the Zig proxy native-spliced it), so its credential was
+    # never stamped -- HTTPS-only injection. The proxy now routes an inject host's
+    # HTTP egress through the terminate backend too (driven by the l7-inject-hosts
+    # list it derives from this same inject-conf), so the cred is injected on the
+    # cleartext leg as well. No CA needed (no TLS to the guest).
+    http_cmd = (
+        "curl -sS --max-time 12 "
+        "--resolve vhost-a.test:80:203.0.113.5 "
+        "-H 'Authorization: Bearer " + placeholder + "' http://vhost-a.test/"
+    )
+    machine.wait_until_succeeds(
+        as_user("cogbox ssh --name work " + shlex.quote(
+            http_cmd + " | grep -q 'auth=Bearer " + real_token + "'")),
+        timeout=20,
+    )
+    # The origin logged a plain-HTTP request carrying the REAL token (the origin
+    # tags the cleartext listener "HTTP"), confirming the cleartext leg was
+    # injected, not bypassed.
+    hits = machine.succeed("cat /tmp/origin-hits.log")
+    assert ("HTTP host=vhost-a.test path=/ auth=Bearer " + real_token) in hits, \
+        f"http injection missing at origin: {hits!r}"
+    assert placeholder not in hits, f"guest placeholder leaked upstream (http): {hits!r}"
+
     # The real token never crossed into the guest: it is in no guest-readable
     # mount, the inject-conf and cred file are host-only.
     rc_leak, _ = machine.execute(as_user(

@@ -625,6 +625,11 @@ pub fn parseRules(content: []const u8) RuleSet {
 
 pub const max_l7_rules = 128;
 pub const max_l7_path_len = 256;
+// Upper bound on hosts the terminate-tier addon injects a credential into (the
+// `l7-inject-hosts` set the proxy reads to route their plain-HTTP egress
+// through the addon too). Generous: harness specs are HTTPS-only and don't need
+// it, so in practice this only counts plugin/operator inject hosts.
+pub const max_inject_hosts = 64;
 
 // Loopback ports the L7 proxy listens on, and the funnel remap targets.
 // PER-INSTANCE: each instance is assigned a contiguous triple derived from a
@@ -772,6 +777,54 @@ pub fn isHarnessPassthroughHost(host: []const u8) bool {
 		if (std.ascii.eqlIgnoreCase(h, hh)) return true;
 	}
 	return false;
+}
+
+/// Hosts the terminate-tier addon injects a host-side credential into -- the
+/// `host` of every emitted inject-conf entry, written one-per-line to
+/// `<runtime>/l7-inject-hosts` by the renderer. The L7 proxy consults this so a
+/// host's PLAIN-HTTP egress is also routed through the terminate backend: TLS
+/// injection already rides `needsTerminate` (inject hosts carry a terminate
+/// rule), but plain HTTP otherwise bypasses the addon via the native splice, so
+/// a bearer/cookie destined for an `http://` vhost would never be stamped.
+///
+/// Matching is EXACT host (case-insensitive). The addon injects by an exact
+/// dict lookup on the request host (CredStore.spec_for), so a `*.suffix` or
+/// bare-`*` entry would NEVER actually inject there -- but it WOULD over-route
+/// plain HTTP through mitmproxy here (bare `*` = all of it). Keeping this set
+/// exact-only keeps the proxy's HTTP routing in lockstep with what the addon
+/// can inject; wildcards are dropped at parse time (see `parseInjectHosts`).
+pub const InjectHosts = struct {
+	hosts: [max_inject_hosts]DnsPattern = undefined,
+	len: usize = 0,
+
+	pub fn contains(self: *const InjectHosts, host: []const u8) bool {
+		const h = stripRootDot(host);
+		for (self.hosts[0..self.len]) |p| {
+			if (matchDnsPattern(p, h)) return true;
+		}
+		return false;
+	}
+};
+
+/// Parse `<runtime>/l7-inject-hosts` (one host per line; blank lines and `#`
+/// comments skipped) into `out`. Only EXACT hostnames are admitted -- a
+/// wildcard / bare-`*` line is dropped (it can't correspond to an addon-injected
+/// host, which is keyed exactly, and would over-route HTTP). Per-line fail-open
+/// otherwise, matching the other runtime-file parsers: a bad line can only drop
+/// an injection's HTTP routing, never widen it.
+pub fn parseInjectHosts(content: []const u8, out: *InjectHosts) void {
+	out.* = .{};
+	var lines = std.mem.splitScalar(u8, content, '\n');
+	while (lines.next()) |line| {
+		const t = std.mem.trim(u8, line, " \t\r\n");
+		if (t.len == 0 or t[0] == '#') continue;
+		const pat = parseDnsPattern(t) orelse continue;
+		if (pat.kind != .exact) continue; // drop wildcards: addon injects exact-keyed only
+		if (out.len < max_inject_hosts) {
+			out.hosts[out.len] = pat;
+			out.len += 1;
+		}
+	}
 }
 
 fn stripRootDot(host: []const u8) []const u8 {
@@ -1456,4 +1509,43 @@ test "parseL7Line insecure token + needsTerminate" {
 	parseL7Rules("allow internal.svc insecure", &rs);
 	try std.testing.expect(rs.needsTerminate("internal.svc"));
 	try std.testing.expectEqual(L7Verdict.allow, rs.evaluate("internal.svc", null));
+}
+
+test "parseInjectHosts: exact-only, drops wildcards, comments, fail-open" {
+	var ih: InjectHosts = undefined;
+	parseInjectHosts(
+		\\# inject hosts, one per line
+		\\notes.internal.test
+		\\
+		\\  *.apps.example
+		\\*
+		\\*.foo.*
+		\\analytics.example
+	, &ih);
+	// blank line + comment skipped; the wildcard `*.apps.example`, the bare `*`,
+	// and the malformed `*.foo.*` are ALL dropped (exact-only) -- so only the 2
+	// exact hosts remain. This is the load-bearing guard: a bare `*` must NOT
+	// turn into "route every plain-HTTP flow through mitmproxy".
+	try std.testing.expectEqual(@as(usize, 2), ih.len);
+
+	// exact match, case-insensitive; a trailing root dot on the QUERY is
+	// stripped by contains() (the FILE side rejects trailing dots, as l7-rules
+	// does, so we don't test that as a positive).
+	try std.testing.expect(ih.contains("notes.internal.test"));
+	try std.testing.expect(ih.contains("NOTES.INTERNAL.test"));
+	try std.testing.expect(ih.contains("notes.internal.test."));
+	try std.testing.expect(ih.contains("analytics.example"));
+	try std.testing.expect(!ih.contains("other.internal.test"));
+
+	// the dropped wildcard does NOT match a subdomain (it was never admitted),
+	// and the dropped bare `*` does NOT match an unrelated host.
+	try std.testing.expect(!ih.contains("a.apps.example"));
+	try std.testing.expect(!ih.contains("apps.example"));
+	try std.testing.expect(!ih.contains("anything.unrelated.test"));
+
+	// empty input -> empty set, contains() never matches
+	var empty: InjectHosts = undefined;
+	parseInjectHosts("", &empty);
+	try std.testing.expectEqual(@as(usize, 0), empty.len);
+	try std.testing.expect(!empty.contains("notes.internal.test"));
 }

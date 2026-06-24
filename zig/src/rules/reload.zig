@@ -236,6 +236,7 @@ pub fn renderL7Inject(
 	global_secrets_dir: []const u8,
 	instance_secrets_dir: []const u8,
 	out: *std.ArrayList(u8),
+	hosts_out: *std.ArrayList(u8),
 ) !void {
 	var arena_inst = std.heap.ArenaAllocator.init(allocator);
 	defer arena_inst.deinit();
@@ -266,6 +267,14 @@ pub fn renderL7Inject(
 				try el.put(arena, "stub_token", .{ .string = st });
 			}
 			try arr.append(.{ .object = el });
+
+			// Mirror the host into the proxy's inject-host list (one per line):
+			// it routes this host's PLAIN-HTTP egress through the terminate
+			// backend too, so an `http://` vhost's credential is still stamped.
+			// Only EMITTED (bound + audience-matched) hosts go here, so an
+			// unbound/mismatched spec neither injects nor reroutes HTTP.
+			try hosts_out.appendSlice(allocator, host);
+			try hosts_out.append(allocator, '\n');
 		}
 	}
 	try config.writeJqTab(allocator, out, .{ .array = arr });
@@ -302,8 +311,10 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 }
 
 /// Write `<runtime>/l7-inject-conf.json` (the mitmproxy addon's
-/// COGBOX_L7_INJECT_CONF). Resolves each spec's named secret against the
-/// per-instance then global store.
+/// COGBOX_L7_INJECT_CONF) AND `<runtime>/l7-inject-hosts` (the L7 proxy's
+/// plain-HTTP inject-routing list). Resolves each spec's named secret against
+/// the per-instance then global store. Both files are written from the same
+/// pass so the proxy's HTTP routing can never drift from what the addon injects.
 pub fn writeL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -314,8 +325,11 @@ pub fn writeL7Inject(
 ) !void {
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
-	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(allocator);
+	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out, &hosts);
 	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-conf.json", out.items);
+	try writeRuntimeFile(allocator, io, runtime_dir, "l7-inject-hosts", hosts.items);
 }
 
 fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {

@@ -1259,6 +1259,24 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 		else
 			rm -f "$RUNTIME/l7-inject-conf.json.tmp"
 		fi
+		# l7-inject-hosts (the L7 proxy's plain-HTTP inject-routing list) was
+		# already written by __render-rules from the PLUGIN/OPERATOR specs only.
+		# We deliberately do NOT add the HARNESS hosts to it: their providers are
+		# HTTPS-only, and routing their plain-HTTP egress through the injector
+		# would let the guest force a cleartext send of the real OAuth token.
+	else
+		# Operator override: the addon reads exactly $COGBOX_L7_INJECT_CONF, so
+		# the proxy's HTTP inject-routing list must mirror ITS hosts (replacing
+		# the config-rendered plugin set __render-rules just wrote). Capture jq
+		# on its OWN (no pipe) so its exit status is observed: a malformed or
+		# unreadable conf (jq non-zero) fails CLOSED to an empty list -- no
+		# routing, never a wrong one. (Piping jq into sort would mask the failure
+		# behind sort's always-zero exit.)
+		if _override_hosts=$(jq -r '.[].host // empty' "$COGBOX_L7_INJECT_CONF" 2>/dev/null); then
+			printf '%s\n' "$_override_hosts" | sort -u > "$RUNTIME/l7-inject-hosts"
+		else
+			: > "$RUNTIME/l7-inject-hosts"
+		fi
 	fi
 fi
 

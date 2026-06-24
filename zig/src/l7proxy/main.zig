@@ -71,6 +71,11 @@ var mitm_port: u16 = filter.l7_default_base + 2;
 var rules_lock = std.atomic.Value(bool).init(false);
 var cidr_rs: filter.RuleSet = .{};
 var l7_rs: filter.L7RuleSet = .{};
+// Hosts the terminate-tier addon injects a host-side credential into (read from
+// <runtime>/l7-inject-hosts, reloaded alongside the rules). Used to route a
+// host's PLAIN-HTTP egress through the terminate backend so its credential is
+// stamped -- TLS injection already rides l7_rs.needsTerminate.
+var inject_hosts: filter.InjectHosts = .{};
 
 fn lockRules() void {
 	while (rules_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
@@ -124,13 +129,16 @@ fn loadRules() void {
 	const rt = runtime_dir_buf[0..runtime_dir_len];
 	var nf_buf: [16384]u8 = undefined;
 	var l7_buf: [16384]u8 = undefined;
+	var inj_buf: [16384]u8 = undefined;
 	const nf = readFileInto(rt, "netfilter-rules", &nf_buf);
 	const l7 = readFileInto(rt, "l7-rules", &l7_buf);
+	const inj = readFileInto(rt, "l7-inject-hosts", &inj_buf);
 
 	lockRules();
 	defer unlockRules();
 	cidr_rs = filter.parseRules(nf);
 	filter.parseL7Rules(l7, &l7_rs);
+	filter.parseInjectHosts(inj, &inject_hosts);
 }
 
 fn readFileInto(rt: []const u8, name: []const u8, buf: []u8) []const u8 {
@@ -245,6 +253,7 @@ fn worker(client_fd: c_int) void {
 	lockRules();
 	const needs_term = l7_rs.needsTerminate(host);
 	const verdict = l7_rs.evaluate(host, path);
+	const needs_inject = inject_hosts.contains(host);
 	unlockRules();
 
 	// ECH policy: an ECH extension means the cleartext SNI we keyed on may be a
@@ -259,13 +268,22 @@ fn worker(client_fd: c_int) void {
 		return;
 	}
 
-	if (is_tls and needs_term) {
-		// Terminate tier: re-resolve + vet here (SSRF/CIDR stays authoritative
-		// in this proxy), then hand the VETTED IP to the mitmproxy backend over
-		// SOCKS5. mitmproxy mints a per-SNI leaf from the instance CA, decrypts,
-		// and an addon enforces allow/deny + path + Host==SNI. The allow/deny
-		// decision for terminate hosts is made there (it needs the path), not
-		// here -- so we do NOT consult `action` on this branch.
+	// Route to the terminate backend (mitmproxy + the enforcement/injection
+	// addon) when:
+	//   - TLS  and the host needs MITM termination (the existing tier choice), OR
+	//   - plain HTTP and the host has host-side credential injection configured.
+	// The HTTP arm is the credless-injection fix: a plain `http://` vhost
+	// otherwise bypasses the addon (the native splice below), so its bearer/
+	// cookie would never be stamped. We gate the HTTP arm on `needs_inject` (NOT
+	// `needs_term`) deliberately -- under the terminate-by-default tier almost
+	// every allowed host "needs terminate", so reusing it would shove ALL plain
+	// HTTP through mitmproxy; and a cert-pinned host the operator left in
+	// `passthrough` must keep its TLS un-MITM'd. mitmproxy mints a per-SNI leaf
+	// (TLS) or speaks plain HTTP (no SNI), and the addon enforces allow/deny +
+	// path (+ Host==SNI for TLS); that allow/deny decision is made there, not
+	// here -- so we do NOT consult `verdict` on this branch.
+	const route_terminate = if (is_tls) needs_term else needs_inject;
+	if (route_terminate) {
 		terminateHandoff(client_fd, host, orig, buf[0..buffered]);
 		return;
 	}
