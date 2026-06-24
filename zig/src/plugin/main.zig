@@ -612,13 +612,14 @@ fn evalInjectSpecs(ctx: Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.jso
 				error.MissingHost => "missing/empty host",
 				error.InvalidHost => "invalid host pattern",
 				error.WildcardHost => "host must be exact (no wildcard)",
-				error.BadStyle => "style must be \"bearer\" or \"cookie\"",
+				error.BadStyle => "style must be \"bearer\", \"cookie\", or \"basic\"",
 				error.BadStub => "stub must be a string",
 				error.MissingSecret => "missing secret name",
 				error.BadSecretName => "secret name must be [A-Za-z0-9_-] (max 64)",
 				error.MissingCookieName => "cookie style requires a non-empty cookieName",
 				error.BadCookieName => "invalid cookieName",
 				error.InlineSecretForbidden => "may not inline a value or a path (path/cred_file/token/refresh/...); name a secret instead",
+				error.BadPort => "port must be an integer in 1..65535",
 				error.OutOfMemory => "out of memory",
 			};
 			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.inject[{d}]: {s}", .{ i, what }, 65);
@@ -802,11 +803,18 @@ fn printInjectLine(ctx: Ctx, sign: []const u8, s: std.json.Value) !void {
 	};
 	const style = if (s.object.get("style")) |sv| (if (sv == .string) sv.string else "bearer") else "bearer";
 	const secret = if (s.object.get("secret")) |sv| (if (sv == .string) sv.string else "?") else "?";
+	// Show :port only when a non-standard one is declared, so the operator can
+	// see the funnel will cover it (a bare host implies 80/443).
+	var port_buf: [8]u8 = undefined;
+	const port_sfx: []const u8 = if (s.object.get("port")) |pv|
+		(if (pv == .integer) (std.fmt.bufPrint(&port_buf, ":{d}", .{pv.integer}) catch "") else "")
+	else
+		"";
 	if (std.mem.eql(u8, style, "cookie")) {
 		const cn = if (s.object.get("cookieName")) |cv| (if (cv == .string) cv.string else "?") else "?";
-		try announce(ctx, "  {s} inject {s} cookie({s}) secret={s}", .{ sign, host, cn, secret });
+		try announce(ctx, "  {s} inject {s}{s} cookie({s}) secret={s}", .{ sign, host, port_sfx, cn, secret });
 	} else {
-		try announce(ctx, "  {s} inject {s} {s} secret={s}", .{ sign, host, style, secret });
+		try announce(ctx, "  {s} inject {s}{s} {s} secret={s}", .{ sign, host, port_sfx, style, secret });
 	}
 }
 

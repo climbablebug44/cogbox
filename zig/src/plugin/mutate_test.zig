@@ -276,6 +276,7 @@ test "validatePluginInjectSpec" {
 	var ok = try parseDoc(
 		\\[{"host": "api.example.com", "style": "bearer", "secret": "api-bearer"},
 		\\ {"host": "api.internal", "secret": "api_token"},
+		\\ {"host": "es.internal", "style": "basic", "secret": "es-creds", "port": 9200},
 		\\ {"host": "app.example.com", "style": "cookie", "cookieName": "app.sid", "secret": "app-session", "stub": "cogbox-stub"}]
 	);
 	defer ok.deinit();
@@ -292,7 +293,10 @@ test "validatePluginInjectSpec" {
 		\\ {"host": "a.test", "secret": "x", "secretValue": "leak"},
 		\\ {"host": "a.test", "secret": "x", "cred_file": "/etc/passwd"},
 		\\ {"host": "a.test", "secret": "x", "token": "abc"},
-		\\ {"host": "a.test", "secret": "x", "refresh": {"u": "v"}}]
+		\\ {"host": "a.test", "secret": "x", "refresh": {"u": "v"}},
+		\\ {"host": "a.test", "secret": "x", "port": 0},
+		\\ {"host": "a.test", "secret": "x", "port": 70000},
+		\\ {"host": "a.test", "secret": "x", "port": "9200"}]
 	);
 	defer bad.deinit();
 	const items = bad.value.array.items;
@@ -308,4 +312,8 @@ test "validatePluginInjectSpec" {
 	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[8]));
 	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[9]));
 	try t.expectError(error.InlineSecretForbidden, mutate.validatePluginInjectSpec(items[10]));
+	// port must be an in-range integer -- a typo (0, overflow, or a string) fails loud
+	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[11]));
+	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[12]));
+	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[13]));
 }

@@ -171,14 +171,16 @@ pub const InjectSpecError = error{
 	MissingCookieName,
 	BadCookieName,
 	InlineSecretForbidden,
+	BadPort,
 	OutOfMemory,
 };
 
 /// Validate one plugin-declared injection spec (cogboxPlugin.<attr>.inject[]).
 /// A plugin may only NAME a credential plus the exact host it targets; it can
 /// never express a value or a host-side path. Shape:
-///   { host = "api.x"; style = "bearer"|"cookie"; secret = "name";
+///   { host = "api.x"; style = "bearer"|"cookie"|"basic"; secret = "name";
 ///     cookieName = "app.sid"  (required iff style == "cookie");
+///     port = 9200  (optional; non-standard service port to funnel);
 ///     stub = "..."  (optional) }
 /// SECURITY: any inline secret material / path-naming field
 /// ({path, cred_file, credFile, token, token_path, refresh, secretValue,
@@ -220,6 +222,15 @@ pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
 
 	if (v.object.get("stub")) |st| {
 		if (st != .string) return error.BadStub;
+	}
+
+	// Optional service port for a host reached on a non-standard port (e.g. an
+	// Elasticsearch cluster on :9200). renderRules funnels this port through the
+	// L7 proxy so the credential is stamped; without it the host's 80/443 alone
+	// is funnelled and a :9200 request egresses uninjected. A Nix manifest yields
+	// an integer; require a valid 1..65535 so a typo fails loud at `plugin add`.
+	if (v.object.get("port")) |pv| {
+		if (pv != .integer or pv.integer < 1 or pv.integer > 65535) return error.BadPort;
 	}
 }
 

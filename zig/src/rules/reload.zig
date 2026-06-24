@@ -53,6 +53,28 @@ fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 	return v.string;
 }
 
+/// An inject spec's optional non-standard service port (the port the guest
+/// actually connects to). Accepts a JSON integer (a Nix manifest yields one)
+/// or a numeric string (a hand-rolled conf may use one). Out-of-range / zero /
+/// unparseable -> null: the spec simply isn't funnelled on a custom port and
+/// falls back to the standard-port (80/443) assumption -- fail closed, never a
+/// bogus remap. The funnel reads the port from HERE (renderRules is secret-free
+/// and runs in the netfilter-rules path) rather than from the secret's audience.
+fn injectPort(obj: std.json.ObjectMap) ?u16 {
+	const v = obj.get("port") orelse return null;
+	switch (v) {
+		.integer => |n| {
+			if (n < 1 or n > 65535) return null;
+			return @intCast(n);
+		},
+		.string => |s| {
+			const n = std.fmt.parseInt(u16, s, 10) catch return null;
+			return if (n == 0) null else n;
+		},
+		else => return null,
+	}
+}
+
 fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	const r = rules orelse return false;
 	for (r.items) |item| {
@@ -140,6 +162,41 @@ pub fn renderRules(allocator: std.mem.Allocator, network: std.json.Value, l7_bas
 		try out.appendSlice(allocator, tls_line);
 		const http_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:{d}\n", .{ports.http});
 		try out.appendSlice(allocator, http_line);
+
+		// Plus a funnel remap for every DISTINCT non-standard port an inject host
+		// is served on. A host reached on e.g. :9200 (Elasticsearch) is otherwise
+		// invisible to the proxy -- the guest's connect clears only the L4 CIDR
+		// layer and egresses untouched, so its credential is never stamped (a 401
+		// at the upstream). 80/443 are already funnelled above. We route the extra
+		// port to the SAME http entry: peekClassify sniffs TLS vs plain HTTP by the
+		// first byte, so one entry serves both, and the proxy preserves the real
+		// dest port (carried over SOCKS5) when it dials upstream. NB this funnels
+		// ALL guest TCP on that port through the proxy (as :80/:443 already are), so
+		// the port must speak HTTP/TLS; a non-inject host on it is L7-evaluated and
+		// spliced, never injected (the needs_inject gate stays host-scoped).
+		if (injectSpecs(network)) |specs| {
+			var seen: [32]u16 = undefined;
+			var nseen: usize = 0;
+			for (specs.items) |spec| {
+				if (spec != .object) continue;
+				const p = injectPort(spec.object) orelse continue;
+				if (p == 80 or p == 443) continue; // already funnelled
+				var dup = false;
+				for (seen[0..nseen]) |q| {
+					if (q == p) {
+						dup = true;
+						break;
+					}
+				}
+				if (dup) continue;
+				if (nseen < seen.len) {
+					seen[nseen] = p;
+					nseen += 1;
+				}
+				const inj_line = try std.fmt.bufPrint(&buf, "remap tcp 0.0.0.0/0:{d} -> tcp 127.0.0.1:{d}\n", .{ p, ports.http });
+				try out.appendSlice(allocator, inj_line);
+			}
+		}
 	}
 }
 
@@ -479,4 +536,33 @@ test "renderRules funnel targets the per-instance base ports" {
 	try std.testing.expect(std.mem.indexOf(u8, s, "remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18447\n") != null);
 	// this instance's render never mentions the default base
 	try std.testing.expect(std.mem.indexOf(u8, s, "18443") == null);
+}
+
+test "renderRules funnels non-standard inject-host ports (deduped, 80/443 excluded)" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[],"inject":{"enabled":true,"specs":[
+		\\  {"host":"es.internal","style":"basic","secret":"es","port":9200},
+		\\  {"host":"es2.internal","style":"basic","secret":"es2","port":9200},
+		\\  {"host":"kibana.internal","style":"basic","secret":"kb","port":"5601"},
+		\\  {"host":"std-https.internal","style":"bearer","secret":"h","port":443},
+		\\  {"host":"std-http.internal","style":"bearer","secret":"p","port":80},
+		\\  {"host":"no-port.internal","style":"bearer","secret":"n"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderRules(gpa, parsed.value, 18443, &out);
+	const s = out.items;
+
+	// :9200 funnels to the http entry (base+1); declared twice but emitted once.
+	try std.testing.expect(std.mem.indexOf(u8, s, "remap tcp 0.0.0.0/0:9200 -> tcp 127.0.0.1:18444\n") != null);
+	try std.testing.expect(std.mem.count(u8, s, "0.0.0.0/0:9200 ->") == 1);
+	// a numeric-string port is honored too.
+	try std.testing.expect(std.mem.indexOf(u8, s, "remap tcp 0.0.0.0/0:5601 -> tcp 127.0.0.1:18444\n") != null);
+	// 80/443 are already the standard funnel -- no duplicate custom remap for them.
+	try std.testing.expect(std.mem.count(u8, s, "0.0.0.0/0:443 ->") == 1);
+	try std.testing.expect(std.mem.count(u8, s, "0.0.0.0/0:80 ->") == 1);
 }

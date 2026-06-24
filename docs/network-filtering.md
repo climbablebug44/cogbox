@@ -264,7 +264,7 @@ When an **inject-conf** is present (path in `COGBOX_L7_INJECT_CONF`, passed to t
 
 A new rules-mode instance is **seeded for injection at init** for the harnesses the user is already **logged into** (a host-side cred file is present): `cogbox init` writes, under `.network.l7`, a `terminate` allow rule for each such harness's provider host(s) (`api.anthropic.com`, `chatgpt.com`, `api.openai.com`, ...) plus `"inject": true`. Nothing is seeded for a harness with no token yet (the `--yes` init activates all harnesses, but only logged-in ones are seeded) -- log in on the host first, or add the rule later. At launch, when `.network.l7.inject` is true, cogbox generates the inject-conf from the active harnesses' host cred files (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.local/share/opencode/auth.json`) into the runtime dir and points the terminate backend at it -- so injection works out of the box with no manual conf. The mapping is keyed on the **host**; if two harnesses provide the same host (e.g. claude-code and opencode both for `api.anthropic.com`), the first active one whose token file exists wins. Only specs whose host-side cred file exists are emitted; the rest fall back to the legacy path.
 
-Opt a seeded host out by replacing its rule with passthrough -- `cogbox l7 add allow api.anthropic.com --passthrough` -- which drops both terminate and injection so the token goes end-to-end again (the legacy behavior); deleting the rule has the same effect. Setting `.network.l7.inject` to `false` stops the token rewriting but leaves the host on the terminate tier (still MITM'd, just not injected). Note that `cogbox l7 mode passthrough` does **not** opt a seeded host out: the seeded rule carries an explicit `terminate` that wins over the instance-default tier (`needsTerminate` precedence). An explicit `COGBOX_L7_INJECT_CONF=<path>` overrides the generated conf (used for testing or a hand-rolled mapping).
+Opt a seeded host out by replacing its rule with passthrough -- `cogbox l7 add allow api.anthropic.com --passthrough` -- which drops both terminate and injection so the token goes end-to-end again (the legacy behavior); deleting the rule has the same effect. Setting `.network.l7.inject` to `false` stops the token rewriting but leaves the host on the terminate tier (still MITM'd, just not injected). Note that `cogbox l7 mode passthrough` does **not** opt a seeded host out: the seeded rule carries an explicit `terminate` that wins over the instance-default tier (`needsTerminate` precedence). An explicit `COGBOX_L7_INJECT_CONF=<path>` overrides the generated conf (used for testing or a hand-rolled mapping): it replaces both what the addon injects and the plain-HTTP inject-routing list (`l7-inject-hosts`). It does **not**, however, drive the netfilter funnel -- the per-port `remap` rules are rendered from `.network.l7.inject.specs[]` in `config.json` only (the funnel runs before any inject-conf is read). So an override-conf host on `:80`/`:443` is HTTP-routed and injected as usual, but one on a [non-standard port](#non-standard-ports) also needs a matching config spec carrying that `port`, or its egress never reaches the proxy to be injected.
 
 ### Keeping the token out of the guest
 
@@ -292,12 +292,13 @@ This per-instance login model currently applies to **claude-code** (the only har
 
 The same terminate-tier mechanism is not limited to the built-in harnesses: a **plugin** can request injection for any host its agent talks to, and an **operator** binds the actual credential host-side. This generalizes the harness path to arbitrary bearer tokens and session cookies while preserving the credless boundary.
 
-A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer`, `cookie`, or `basic`; the `cookie` style also needs a `cookieName`), the secret `name`, and an optional `stub` sentinel. The named specs merge into `.network.l7.inject.specs[]`:
+A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer`, `cookie`, or `basic`; the `cookie` style also needs a `cookieName`), the secret `name`, an optional `stub` sentinel, and an optional `port` (see [non-standard ports](#non-standard-ports) -- declare it when the host is served somewhere other than 80/443, e.g. `9200` for Elasticsearch). The named specs merge into `.network.l7.inject.specs[]`:
 
 ```json
 "network": { "l7": {
     "inject": { "enabled": true, "specs": [
         { "host": "api.example.com", "style": "bearer", "secret": "api-bearer", "plugin": "myplugin" },
+        { "host": "es.internal", "style": "basic", "secret": "es-creds", "port": 9200, "plugin": "myplugin" },
         { "host": "app.example.com", "style": "cookie", "secret": "app-session",
           "cookieName": "app.sid", "stub": "cogbox-app-stub", "plugin": "myplugin" }
     ] },
@@ -327,19 +328,45 @@ The value is read from a file or stdin (never argv, which leaks to the process t
 | `basic` | `Authorization: Basic base64(<value>)` | `user:password` |
 | `cookie` | replaces named cookie only | cookie value |
 
-**Example -- HTTP Basic auth for an internal Elasticsearch cluster:**
+**Example -- HTTP Basic auth for an internal Elasticsearch cluster on `:9200`:**
+
+Injection needs two things: an inject **spec** (which host + style + secret name, and -- on a non-standard port -- the `port`) and the **bound secret**. A plugin's `cogboxPlugin.inject` writes the spec for you; there is no `cogbox inject add` verb, so an operator without a plugin hand-edits `.network.l7.inject.specs[]` in the instance `config.json`:
 
 ```sh
-# Store the credential (the raw user:password; base64 encoding is done at injection time)
+# 1. Declare the inject spec. (A plugin does this via cogboxPlugin.inject; by hand:)
+cfg=~/.config/cogbox/instances/<name>/config.json
+jq '.network.l7.inject = {enabled: true,
+      specs: ((.network.l7.inject.specs // []) +
+        [{host: "es.internal.example.com", style: "basic", secret: "es-creds", port: 9200}])}' \
+   "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+
+# 2. Bind the credential host-side (raw user:password; base64 is done at injection time).
+#    The --audience is the BARE host -- no :9200 -- and must equal the spec host.
 echo -n "elastic:mypassword" | cogbox secret add es-creds \
-    --from-stdin --audience elastic.internal.example.com --kind basic
+    --from-stdin --audience es.internal.example.com --kind basic
 
-# Allow the host through the L7 terminate tier (required for header rewriting)
-cogbox l7 add allow elastic.internal.example.com
+# 3. cogbox restart  (the inject spec auto-adds an `allow <host> terminate` rule and,
+#    via port:9200, a funnel remap so the guest's :9200 egress reaches the proxy).
+```
 
-# The guest sends requests unauthenticated or with a placeholder;
-# the host proxy rewrites the Authorization header before the request leaves the host.
-``` Sidecar-produced per-instance secrets use the same layout under `instances/<name>/secrets/` and shadow a global secret of the same name. Names are restricted to `[A-Za-z0-9_-]` so neither `<name>` nor `<name>.meta` can traverse out of the store.
+The guest then sends requests unauthenticated or with a placeholder, and the host proxy rewrites the `Authorization` header before the request leaves the host. The spec host, the `--audience`, and any explicit `cogbox l7 add allow` all use the **bare** host (the proxy matches the request `Host` with its port stripped); the `:9200` lives only in the spec's `port` -- see [non-standard ports](#non-standard-ports). Omit the `port` and the spec still injects on `:80`/`:443` but a `:9200` request never reaches the proxy and stays unauthenticated.
+
+Sidecar-produced per-instance secrets use the same layout under `instances/<name>/secrets/` and shadow a global secret of the same name. Names are restricted to `[A-Za-z0-9_-]` so neither `<name>` nor `<name>.meta` can traverse out of the store.
+
+#### Non-standard ports
+
+The guest's web egress is funnelled into the L7 proxy by a netfilter remap that captures only TCP **:80** and **:443** -- the ports the proxy splits into its plain-HTTP and TLS entries. A host served anywhere else (Elasticsearch on **:9200**, an internal API on **:8080**, ...) would bypass the proxy entirely: the connection clears only the L4 CIDR layer and egresses untouched, so its credential is never stamped and the upstream answers `401`.
+
+To inject on such a host, the inject spec declares a `port`:
+
+```json
+{ "host": "data-es.internal", "style": "basic", "secret": "es-creds", "port": 9200 }
+```
+
+The renderer then emits an extra funnel remap (`0.0.0.0/0:9200 -> the proxy`) so the host's `:9200` egress reaches the addon and gets injected exactly like an `:80`/`:443` host. Two consequences:
+
+1. The funnel is **per-port and instance-wide** -- declaring `:9200` routes *all* guest TCP to `:9200` (any host) through the L7 proxy, and the proxy classifies each connection by its first bytes: a valid TLS ClientHello or an HTTP/1.x request is evaluated against the L7 rules and forwarded (injected only for the exact inject host; a non-inject HTTP/TLS host on the port is just spliced). **Anything else is dropped, fail-closed** -- a non-HTTP/non-TLS (raw binary, server-speaks-first, malformed) connection on the port never reaches an upstream dial. So this is also a *behavior change* for the port: a non-HTTP service on `:9200` that the guest could previously reach over the native L4 path is now denied. Only declare a port that genuinely serves HTTP/TLS (Elasticsearch's REST is HTTP on `:9200`; its binary transport is the separate `:9300`, unaffected).
+2. The `port` is a property of the **spec**, not the secret -- the secret's `--audience` and the `cogbox l7 add allow` rule both stay the bare host.
 
 At boot (and on the hot-reload path), the renderer resolves each spec's named secret to the store's value path and emits it with `cred_format: "raw"` -- the addon reads that file's **first non-empty line** as the credential (no dotted `token_path`, unlike the JSON-cred harness specs). It writes the inject-conf with **two fail-closed gates**:
 

@@ -82,6 +82,8 @@ A plugin whose agent talks to an authenticated service can request **host-side c
 cogboxPlugin.inject = [
     # a static API bearer for an HTTPS host
     { host = "api.example.com"; style = "bearer"; secret = "api-bearer"; }
+    # HTTP Basic auth for a service on a non-standard port (e.g. Elasticsearch)
+    { host = "es.internal"; style = "basic"; secret = "es-creds"; port = 9200; }
     # a session cookie for an HTTP host (e.g. minted by a sidecar)
     { host = "app.example.com"; style = "cookie"; cookieName = "app.sid";
       secret = "app-session"; stub = "cogbox-app-stub"; }
@@ -91,9 +93,10 @@ cogboxPlugin.inject = [
 Each spec:
 
 - `host` -- the **exact** host the credential may be injected to (no wildcard).
-- `style` -- `bearer` (`Authorization: Bearer <value>`) or `cookie` (replaces only `cookieName` in the request `Cookie` header).
+- `style` -- `bearer` (`Authorization: Bearer <value>`), `basic` (`Authorization: Basic base64(<user:pass>)`), or `cookie` (replaces only `cookieName` in the request `Cookie` header).
 - `secret` -- the **symbolic name** of a secret you bind with `cogbox secret`. A plugin can never name a value or a file path; the manifest is rejected at `add` time if it tries to (`path`, `cred_file`, `token`, `refresh`, ...).
 - `cookieName` -- required for the cookie style.
+- `port` (optional) -- the service port, when the host is reached on something other than 80/443 (e.g. `9200` for Elasticsearch). cogbox then funnels that port through the L7 proxy so the credential is stamped; without it the request bypasses the proxy and stays unauthenticated. See [non-standard ports](network-filtering.md#non-standard-ports).
 - `stub` (optional) -- a sentinel the guest carries; injection then replaces the credential **only** over that stub (or an absent one), leaving any other credential the guest legitimately holds untouched.
 
 On `add`, injection requests are shown in their own confirmation section (granting a credential is different trust than a firewall rule), merged into `.network.l7.inject.specs[]` tagged with the plugin name, and a **bind-checklist** prints the exact commands to run:
