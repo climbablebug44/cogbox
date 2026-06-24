@@ -327,6 +327,24 @@ spb = csb.spec_for("api.example.com")
 check(spb is not None, "credstore admits a raw bearer spec with no token_path")
 check(csb.token_for(spb) == "tok-abc123", "credstore token_for reads a raw bearer line")
 
+# A `basic` spec is admitted + raw-read with NO cred_format AND NO token_path,
+# exactly like `cookie`: the raw line is the `user:pass` pair that apply_injection
+# base64-encodes. (Before this, a hand-rolled basic spec lacking cred_format was
+# silently dropped -> no injection.)
+_basic = os.path.join(_d, "userpass")
+_write_raw(_basic, "alice:s3cr3t\n", 1000)
+_write(_conf, [{"host": "basic.example.com", "style": "basic",
+                "cred_file": _basic}], 7000)
+csbasic = m.CredStore(_conf)
+spbasic = csbasic.spec_for("basic.example.com")
+check(spbasic is not None, "credstore admits a basic spec with no token_path/cred_format")
+check(csbasic.token_for(spbasic) == "alice:s3cr3t",
+      "credstore token_for raw-reads a basic user:pass line")
+_hb = CIDict({})
+m.apply_injection(_hb, "basic", csbasic.token_for(spbasic))
+check(_hb.get("authorization") == "Basic " + _b64.b64encode(b"alice:s3cr3t").decode(),
+      "basic style injects base64(user:pass) from a raw cred file")
+
 
 # --- json_path_raw / json_path_set (refresh write-back helpers) ----------
 check(m.json_path_raw({"a": {"b": 5}}, "a.b") == 5, "json_path_raw numeric leaf")

@@ -442,11 +442,13 @@ class CredStore:
                 # Admit a spec that has a host + cred_file and a way to read the
                 # value: a JSON token_path (harness creds), a raw single-line file
                 # (cred_format=="raw": a plain bearer / session cookie), or a
-                # cookie style (whose file is always a raw cookie value).
+                # cookie/basic style (whose cred file is naturally a raw single
+                # line -- a cookie value, or `user:pass` for basic -- so neither
+                # needs an explicit token_path/cred_format; see token_for).
                 if host and spec.get("cred_file") and (
                     spec.get("token_path")
                     or spec.get("cred_format") == "raw"
-                    or spec.get("style") == "cookie"
+                    or spec.get("style") in ("cookie", "basic")
                 ):
                     specs[host] = spec
         except (OSError, ValueError):
@@ -510,11 +512,13 @@ class CredStore:
 
     def token_for(self, spec):
         """The credential value for `spec`, independent of cred-file format: a
-        raw single-line file (cred_format=="raw", or a cookie style with no
+        raw single-line file (cred_format=="raw", or a cookie/basic style with no
         token_path) or a JSON cred file read at token_path. Returns None (fail
-        closed) when unreadable."""
+        closed) when unreadable. For `basic` the raw line is the `user:pass`
+        pair (apply_injection base64-encodes it), so -- like `cookie` -- a basic
+        spec needs no explicit token_path/cred_format to be read."""
         if spec.get("cred_format") == "raw" or (
-            spec.get("style") == "cookie" and not spec.get("token_path")
+            spec.get("style") in ("cookie", "basic") and not spec.get("token_path")
         ):
             return self._read_raw(spec.get("cred_file"))
         return self.value_for(spec, "token_path")
