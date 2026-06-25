@@ -113,14 +113,14 @@ test "classifyModuleCheck: present / missing / failed" {
 	// Clean evals: --apply 'm: m ? "attr"' prints true or false.
 	try t.expectEqual(.present, nix.classifyModuleCheck(true, "true\n", ""));
 	try t.expectEqual(.missing, nix.classifyModuleCheck(true, "false\n", ""));
-	// No nixosModules output at all: still a contract violation, not a failure.
+	// No cogboxPlugins output at all: still a contract violation, not a failure.
 	try t.expectEqual(.missing, nix.classifyModuleCheck(
 		false,
 		"",
-		"error: flake 'git+file:///x' does not provide attribute 'packages.x86_64-linux.nixosModules', 'legacyPackages.x86_64-linux.nixosModules' or 'nixosModules'",
+		"error: flake 'git+file:///x' does not provide attribute 'packages.x86_64-linux.cogboxPlugins', 'legacyPackages.x86_64-linux.cogboxPlugins' or 'cogboxPlugins'",
 	));
-	// A fetch error must NOT be misread as a missing module (the bug that
-	// reported every broken locked URL as "does not expose nixosModules").
+	// A fetch error must NOT be misread as a missing plugin (the bug that
+	// reported every broken locked URL as "does not expose cogboxPlugins").
 	try t.expectEqual(.failed, nix.classifyModuleCheck(
 		false,
 		"",
@@ -130,7 +130,7 @@ test "classifyModuleCheck: present / missing / failed" {
 	try t.expectEqual(.failed, nix.classifyModuleCheck(false, "", "error: boom: deliberately broken"));
 	// A plugin's own eval error containing a missing-attribute phrase must
 	// not smuggle the failure back into the contract message: only nix's
-	// flake-output error naming 'nixosModules' counts as missing.
+	// flake-output error naming 'cogboxPlugins' counts as missing.
 	try t.expectEqual(.failed, nix.classifyModuleCheck(
 		false,
 		"",
@@ -139,7 +139,7 @@ test "classifyModuleCheck: present / missing / failed" {
 }
 
 test "stderr helpers" {
-	try t.expect(nix.stderrSaysMissingAttribute("error: flake 'path:/x' does not provide attribute 'cogboxPlugin.networkRules'"));
+	try t.expect(nix.stderrSaysMissingAttribute("error: flake 'path:/x' does not provide attribute 'cogboxPlugins.networkRules'"));
 	try t.expect(nix.stderrSaysMissingAttribute("error: attribute 'networkRules' ... has no attribute"));
 	try t.expect(!nix.stderrSaysMissingAttribute("error: infinite recursion encountered"));
 	try t.expectEqualStrings("short", nix.stderrTail("  short \n"));

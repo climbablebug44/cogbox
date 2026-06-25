@@ -26,7 +26,7 @@ test "golden render: one plugin (hydrated -> path: input)" {
 		"\toutputs = { self, user, ... }@inputs: {\n" ++
 		"\t\tnixosModules.default = {\n" ++
 		"\t\t\timports = [\n" ++
-		"\t\t\t\tinputs.\"p-myplugin\".nixosModules.\"default\"\n" ++
+		"\t\t\t\t(inputs.\"p-myplugin\".cogboxPlugins.\"default\".module or {})\n" ++
 		"\t\t\t\tuser.nixosModules.default\n" ++
 		"\t\t\t];\n" ++
 		"\t\t};\n" ++
@@ -65,8 +65,8 @@ test "two plugins keep config order, user module last" {
 	const b_in = std.mem.indexOf(u8, out, "\"p-beta\".url").?;
 	try t.expect(a_in < b_in);
 
-	const a_imp = std.mem.indexOf(u8, out, "inputs.\"p-alpha\".nixosModules.\"default\"").?;
-	const b_imp = std.mem.indexOf(u8, out, "inputs.\"p-beta\".nixosModules.\"default\"").?;
+	const a_imp = std.mem.indexOf(u8, out, "(inputs.\"p-alpha\".cogboxPlugins.\"default\".module or {})").?;
+	const b_imp = std.mem.indexOf(u8, out, "(inputs.\"p-beta\".cogboxPlugins.\"default\".module or {})").?;
 	const user_imp = std.mem.indexOf(u8, out, "user.nixosModules.default\n\t\t\t];").?;
 	try t.expect(a_imp < b_imp);
 	try t.expect(b_imp < user_imp);
@@ -82,8 +82,8 @@ test "non-default module attrs are emitted quoted" {
 
 	// Same flake URL twice (two modules of one flake) is fine: two pinned
 	// inputs that resolve to the same store path.
-	try t.expect(std.mem.indexOf(u8, out, "inputs.\"p-hello\".nixosModules.\"default\"") != null);
-	try t.expect(std.mem.indexOf(u8, out, "inputs.\"p-extra\".nixosModules.\"extra\"") != null);
+	try t.expect(std.mem.indexOf(u8, out, "(inputs.\"p-hello\".cogboxPlugins.\"default\".module or {})") != null);
+	try t.expect(std.mem.indexOf(u8, out, "(inputs.\"p-extra\".cogboxPlugins.\"extra\".module or {})") != null);
 }
 
 test "nix string escaping in urls and paths" {

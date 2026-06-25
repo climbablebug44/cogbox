@@ -1,7 +1,7 @@
 // Shelling out to nix for the plugin verb. Everything network-touching or
 // store-touching goes through here: resolving a flake URL to a locked rev
 // (metadata), checking the module contract (eval), reading the optional
-// cogboxPlugin.networkRules output (eval), and pre-fetching the plugin's
+// cogboxPlugins.<attr> host-side policy output (eval), and pre-fetching the plugin's
 // transitive inputs for offline restarts (archive).
 //
 // Experimental features are passed explicitly (the launcher does the same at
@@ -148,21 +148,24 @@ pub fn buildRunner(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.pr
 	return runNix(allocator, io, env, argv.items);
 }
 
-/// Outcome of the nixosModules.<attr> contract check. `missing` is the
+/// Outcome of the cogboxPlugins.<attr> contract check. `missing` is the
 /// contract violation ("this flake is not a cogbox plugin"); `failed` is
 /// everything else that can go wrong with the eval (fetch error, eval error
 /// inside the flake) and carries nix's stderr (caller owns it). Conflating
-/// the two would misreport any broken URL as a missing module.
+/// the two would misreport any broken URL as a missing plugin.
 pub const ModuleCheck = union(enum) {
 	present,
 	missing,
 	failed: []u8,
 };
 
-/// `nix eval URL#nixosModules --apply 'm: m ? "<attr>"' --json`. `attr` must
-/// satisfy name.isValidAttr (it is interpolated into a nix expression).
-pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, attr: []const u8) !ModuleCheck {
-	const installable = try std.fmt.allocPrint(allocator, "{s}#nixosModules", .{url});
+/// `nix eval URL#cogboxPlugins --apply 'm: m ? "<attr>"' --json`. The plugin
+/// contract is the cogboxPlugins.<attr> REGISTRATION (which carries the
+/// optional `module` reference plus host-side networkRules/l7Rules/inject); a
+/// flake without it is not a cogbox plugin. `attr` must satisfy
+/// name.isValidAttr (it is interpolated into a nix expression).
+pub fn evalHasCogboxPlugin(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, attr: []const u8) !ModuleCheck {
+	const installable = try std.fmt.allocPrint(allocator, "{s}#cogboxPlugins", .{url});
 	defer allocator.free(installable);
 	const apply = try std.fmt.allocPrint(allocator, "m: m ? \"{s}\"", .{attr});
 	defer allocator.free(apply);
@@ -176,10 +179,10 @@ pub fn evalHasNixosModule(allocator: std.mem.Allocator, io: std.Io, env: ?*const
 }
 
 /// Pure classification of the eval result: a clean "true" is present, a clean
-/// "false" or a "flake does not provide attribute ... 'nixosModules'" error is
+/// "false" or a "flake does not provide attribute ... 'cogboxPlugins'" error is
 /// missing, any other failure is real and must be surfaced. The missing-attr
 /// match is deliberately narrower than stderrSaysMissingAttribute: it requires
-/// nix's flake-output phrase naming 'nixosModules', so a plugin flake whose
+/// nix's flake-output phrase naming 'cogboxPlugins', so a plugin flake whose
 /// own eval error happens to contain "has no attribute" cannot smuggle a real
 /// failure back into the misleading contract message.
 pub fn classifyModuleCheck(ok: bool, stdout: []const u8, stderr: []const u8) std.meta.Tag(ModuleCheck) {
@@ -188,20 +191,22 @@ pub fn classifyModuleCheck(ok: bool, stdout: []const u8, stderr: []const u8) std
 		return if (is_true) .present else .missing;
 	}
 	const no_output = std.mem.indexOf(u8, stderr, "does not provide attribute") != null and
-		std.mem.indexOf(u8, stderr, "'nixosModules'") != null;
+		std.mem.indexOf(u8, stderr, "'cogboxPlugins'") != null;
 	return if (no_output) .missing else .failed;
 }
 
-/// `nix eval URL#cogboxPlugin."<attr>".<leaf> --json` (or the flat path
-/// `cogboxPlugin.<leaf>` when `attr` is null). `leaf` is `networkRules`
-/// (L4 CIDR rules) or `l7Rules` (vhost rules). IFD is blocked: reading the
-/// rules must never trigger a build of untrusted code at add time. `attr`
-/// must satisfy name.isValidAttr; `leaf` is always caller-controlled.
+/// `nix eval URL#cogboxPlugins."<attr>".<leaf> --json` (or the flat path
+/// `cogboxPlugins.<leaf>` when `attr` is null). `leaf` is `networkRules`
+/// (L4 CIDR rules), `l7Rules` (vhost rules), or `inject` (cred specs). IFD is
+/// blocked: reading the host-side policy must never trigger a build of
+/// untrusted code at add time. `attr` must satisfy name.isValidAttr; `leaf` is
+/// always caller-controlled. (The kit -- cogbox.* in the module -- is NOT read
+/// here; it rides the module import at build, not the cheap add-time eval.)
 pub fn evalPluginRules(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, attr: ?[]const u8, leaf: []const u8) !RunOut {
 	const installable = if (attr) |a|
-		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.\"{s}\".{s}", .{ url, a, leaf })
+		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugins.\"{s}\".{s}", .{ url, a, leaf })
 	else
-		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugin.{s}", .{ url, leaf });
+		try std.fmt.allocPrint(allocator, "{s}#cogboxPlugins.{s}", .{ url, leaf });
 	defer allocator.free(installable);
 	return runNix(allocator, io, env, &.{ "eval", installable, "--json", "--no-allow-import-from-derivation" });
 }

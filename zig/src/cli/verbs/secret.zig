@@ -1,6 +1,6 @@
 // `cogbox secret` - bind/list/remove operator-held credentials in the global
 // host-side secret store (<config>/secrets/). Plugins REQUEST a secret by name
-// + audience (cogboxPlugin.<attr>.inject); the operator binds the value here so
+// + audience (cogboxPlugins.<attr>.inject); the operator binds the value here so
 // it stays host-side and out of the guest. Mirrors verbs/l7.zig's shape but
 // resolves the GLOBAL store (no --name), since operator secrets are shared
 // across an account's instances.

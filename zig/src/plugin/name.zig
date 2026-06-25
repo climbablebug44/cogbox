@@ -23,7 +23,7 @@ pub const FragmentError = error{
 };
 
 /// Split `URL#attr` into the flake ref and the module attr. The attr selects
-/// `nixosModules.<attr>` in the plugin flake; absent means `default`.
+/// `cogboxPlugins.<attr>` in the plugin flake; absent means `default`.
 pub fn splitFragment(url: []const u8) FragmentError!SplitUrl {
 	const hash = std.mem.indexOfScalar(u8, url, '#') orelse {
 		return .{ .ref = url, .attr = null };

@@ -426,7 +426,7 @@ pub const L7 =
 	\\--passthrough (token end-to-end, cert pinning preserved). A harness with
 	\\no host-side token, or any such host with no explicit rule, stays
 	\\auto-passthrough. Beyond the harnesses, a plugin can REQUEST injection for
-	\\a host (cogboxPlugin.<attr>.inject) and you bind the credential host-side
+	\\a host (cogboxPlugins.<attr>.inject) and you bind the credential host-side
 	\\with `cogbox secret add` (see `cogbox secret --help`); those specs live
 	\\under .network.l7.inject.specs[] -- the `inject` field is an object
 	\\{enabled, specs}, though the legacy bool is still accepted. See
@@ -463,11 +463,12 @@ pub const PLUGIN =
 	\\  -y, --yes             Skip confirmation prompts
 	\\  -h, --help            Show this help and exit
 	\\
-	\\A plugin is a NixOS module exposed by a flake: `URL#attr` selects
-	\\`nixosModules.<attr>`, bare URL means `default`. One flake can carry many
-	\\plugins; enable any subset with repeated adds. FLAKE_URL is any nix flake
-	\\reference: github:owner/repo, git+https://..., path:/abs/dir, with ?dir=
-	\\supported. The module is folded into the guest at the next instance start.
+	\\A plugin is a flake output `cogboxPlugins.<attr>` (its `module` reference
+	\\plus host-side networkRules/l7Rules/inject): `URL#attr` selects it, bare URL
+	\\means `default`. One flake can carry many plugins; enable any subset with
+	\\repeated adds. FLAKE_URL is any nix flake reference: github:owner/repo,
+	\\git+https://..., path:/abs/dir, with ?dir= supported. The module (which
+	\\carries the kit via cogbox.*) is folded into the guest at the next start.
 	\\
 	\\Versioning is per FLAKE, not per plugin: the source is resolved and
 	\\pinned at add time (rev + narHash recorded in config.json, inputs
@@ -478,12 +479,12 @@ pub const PLUGIN =
 	\\
 	\\A plugin may also declare firewall rules, tagged with the plugin's name
 	\\so del/update remove or replace exactly those rules:
-	\\  cogboxPlugin.<attr>.networkRules  L4 CIDR rules (.network.rules schema)
-	\\  cogboxPlugin.<attr>.l7Rules       L7 vhost rules (.network.l7.rules
+	\\  cogboxPlugins.<attr>.networkRules  L4 CIDR rules (.network.rules schema)
+	\\  cogboxPlugins.<attr>.l7Rules       L7 vhost rules (.network.l7.rules
 	\\                                    schema, incl. terminate/passthrough/
 	\\                                    path/insecure_upstream)
-	\\(flat cogboxPlugin.networkRules / .l7Rules for the default module), e.g.
-	\\  cogboxPlugin.l7Rules = [ { allow = "api.internal"; terminate = true; } ];
+	\\(flat cogboxPlugins.networkRules / .l7Rules for the default module), e.g.
+	\\  cogboxPlugins.l7Rules = [ { allow = "api.internal"; terminate = true; } ];
 	\\On add/update these are shown for confirmation and inserted AT THE TOP of
 	\\their rule lists (first match wins, so plugin allows must precede the
 	\\seeded RFC1918 denies). Rule changes hot-reload; module changes need
@@ -526,7 +527,7 @@ pub const SECRET =
 	\\                    (the binding then applies at the instance's next start).
 	\\  -h, --help        Show this help and exit
 	\\
-	\\A plugin REQUESTS a credential by symbolic name (cogboxPlugin.<attr>.inject =
+	\\A plugin REQUESTS a credential by symbolic name (cogboxPlugins.<attr>.inject =
 	\\[{ host, style, secret }]); it can never name a file path or a value. You
 	\\bind the real value here, host-side, and it stays out of the guest -- the
 	\\guest carries only a stub (or no real credential) and the addon overwrites

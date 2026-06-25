@@ -449,6 +449,14 @@
 					capped = if builtins.stringLength neutralized > 200 then (builtins.substring 0 197 neutralized) + "..." else neutralized;
 				in capped;
 
+				# MCP secret-rejection: a neutral mcp server may name only
+				# command/args/env/url/headers. A plugin can never inline a
+				# token/cred_file/refresh/secret -- MCP auth goes through host-side
+				# inject/sidecar (the same stance as the inject spec validator).
+				mcpAllowedKeys = [ "command" "args" "env" "url" "headers" ];
+				mcpViolations = lib.concatLists (lib.mapAttrsToList (srv: m:
+					map (k: "${srv}.${k}") (lib.filter (k: !(lib.elem k mcpAllowedKeys)) (lib.attrNames m))) cfg.mcp);
+
 				# --- per-harness config files (pkgs.formats; no hand-rolled JSON/TOML) ---
 				jsonFmt = pkgs.formats.json {};
 				tomlFmt = pkgs.formats.toml {};
@@ -609,10 +617,14 @@
 				# the build, plugin-agnostically attributed. (Explicit-name
 				# collisions across plugins are caught for free by the module
 				# system's attrsOf merge; the add-time lint pre-empts both.)
-				assertions = map (c: {
+				assertions = (map (c: {
 					assertion = false;
 					message = "cogbox: duplicate discovered ${c} across cogbox.contents roots; rename one (units share a flat namespace) or use an explicit cogbox.* override.";
-				}) discoveredCollisions;
+				}) discoveredCollisions)
+				++ lib.optional (mcpViolations != []) {
+					assertion = false;
+					message = "cogbox.mcp servers may only set command/args/env/url/headers; rejected: ${lib.concatStringsSep ", " mcpViolations}. MCP auth goes through host-side inject, never inline.";
+				};
 
 				# Point login-shell TLS tools at the L7 CA bundle too (the
 				# harness launchers also bake these in for non-login `cogbox

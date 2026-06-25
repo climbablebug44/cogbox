@@ -1,8 +1,8 @@
 // `cogbox plugin` verb dispatcher. Manages the `.plugins` array in
 // config.json: each entry is a flake (resolved + pinned by nix at add time)
-// whose nixosModules.default gets folded into the guest via the generated
+// whose cogboxPlugins.<attr>.module gets folded into the guest via the generated
 // composition flake. A plugin may also suggest firewall rules through the
-// optional `cogboxPlugin.networkRules` flake output; those merge into
+// optional `cogboxPlugins.<attr>.networkRules` flake output; those merge into
 // .network.rules tagged with the plugin's name (shown for confirmation, and
 // removed/replaced exactly by del/update).
 //
@@ -191,7 +191,7 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		ctx.fetch_env = fetch_env.?.map();
 	}
 
-	// `URL#attr` selects nixosModules.<attr>; bare URL means `default`.
+	// `URL#attr` selects cogboxPlugins.<attr>; bare URL means `default`.
 	const split = name_mod.splitFragment(a.url) catch |err| switch (err) {
 		error.EmptyFragment => die(allocator, io, "empty #fragment in '{s}'", .{a.url}, 65),
 		error.InvalidAttr => die(allocator, io, "invalid module attr in '{s}' (allowed: [a-zA-Z0-9_-])", .{a.url}, 65),
@@ -263,9 +263,9 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	}
 
 	const module_attr = attr orelse "default";
-	switch (try nix.evalHasNixosModule(allocator, io, ctx.fetch_env, meta.locked_url, module_attr)) {
+	switch (try nix.evalHasCogboxPlugin(allocator, io, ctx.fetch_env, meta.locked_url, module_attr)) {
 		.present => {},
-		.missing => die(allocator, io, "plugin flake does not expose nixosModules.{s} (see docs/plugins.md)", .{module_attr}, 65),
+		.missing => die(allocator, io, "plugin flake does not expose cogboxPlugins.{s} (see docs/plugins.md)", .{module_attr}, 65),
 		.failed => |stderr| die(allocator, io, "could not evaluate flake '{s}':\n{s}", .{ meta.locked_url, nix.stderrTail(stderr) }, 65),
 	}
 
@@ -1080,35 +1080,35 @@ fn cloneEnvMap(allocator: std.mem.Allocator, src: *const std.process.Environ.Map
 }
 
 /// Evaluate one of the plugin's suggested-rule lists:
-/// cogboxPlugin."<attr>".<leaf>, with the flat path cogboxPlugin.<leaf> as
+/// cogboxPlugins."<attr>".<leaf>, with the flat path cogboxPlugins.<leaf> as
 /// fallback for the default module. Returns the parsed tree when the output
 /// exists and is a JSON list; null when the flake doesn't declare it.
 fn evalRuleList(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8, leaf: []const u8) ?std.json.Parsed(std.json.Value) {
 	const allocator = ctx.allocator;
 	var out = nix.evalPluginRules(allocator, ctx.io, ctx.fetch_env, locked_url, attr orelse "default", leaf) catch return null;
 	if (!out.ok and attr == null and nix.stderrSaysMissingAttribute(out.stderr)) {
-		// No cogboxPlugin.default -- fall back to the flat form.
+		// No cogboxPlugins.default -- fall back to the flat form.
 		out.deinit(allocator);
 		out = nix.evalPluginRules(allocator, ctx.io, ctx.fetch_env, locked_url, null, leaf) catch return null;
 	}
 	defer out.deinit(allocator);
 	if (!out.ok) {
 		if (!nix.stderrSaysMissingAttribute(out.stderr)) {
-			warn(ctx, "could not read cogboxPlugin.{s}: {s}", .{ leaf, nix.stderrTail(out.stderr) }) catch {};
+			warn(ctx, "could not read cogboxPlugins.{s}: {s}", .{ leaf, nix.stderrTail(out.stderr) }) catch {};
 		}
 		return null;
 	}
 
 	const parsed = std.json.parseFromSlice(std.json.Value, allocator, out.stdout, .{}) catch {
-		die(allocator, ctx.io, "cogboxPlugin.{s} did not evaluate to JSON", .{leaf}, 65);
+		die(allocator, ctx.io, "cogboxPlugins.{s} did not evaluate to JSON", .{leaf}, 65);
 	};
 	if (parsed.value != .array) {
-		die(allocator, ctx.io, "cogboxPlugin.{s} must be a list of rule objects", .{leaf}, 65);
+		die(allocator, ctx.io, "cogboxPlugins.{s} must be a list of rule objects", .{leaf}, 65);
 	}
 	return parsed;
 }
 
-/// L4 CIDR rules (cogboxPlugin.<attr>.networkRules), validated.
+/// L4 CIDR rules (cogboxPlugins.<attr>.networkRules), validated.
 fn evalRules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "networkRules") orelse return null;
 	for (parsed.value.array.items, 0..) |r, i| {
@@ -1119,13 +1119,13 @@ fn evalRules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.js
 				error.InvalidCidr => "invalid CIDR",
 				error.OutOfMemory => "out of memory",
 			};
-			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.networkRules[{d}]: {s}", .{ i, what }, 65);
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugins.networkRules[{d}]: {s}", .{ i, what }, 65);
 		};
 	}
 	return parsed;
 }
 
-/// L7 vhost rules (cogboxPlugin.<attr>.l7Rules), validated with the same
+/// L7 vhost rules (cogboxPlugins.<attr>.l7Rules), validated with the same
 /// constraints `l7 add` enforces.
 fn evalL7Rules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "l7Rules") orelse return null;
@@ -1140,13 +1140,13 @@ fn evalL7Rules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.
 				error.ConflictingTier => "passthrough excludes terminate/path/insecure_upstream",
 				error.OutOfMemory => "out of memory",
 			};
-			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.l7Rules[{d}]: {s}", .{ i, what }, 65);
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugins.l7Rules[{d}]: {s}", .{ i, what }, 65);
 		};
 	}
 	return parsed;
 }
 
-/// Credential injection specs (cogboxPlugin.<attr>.inject), validated:
+/// Credential injection specs (cogboxPlugins.<attr>.inject), validated:
 /// name-only, exact audience host, no inline secret material.
 fn evalInjectSpecs(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.json.Parsed(std.json.Value) {
 	const parsed = evalRuleList(ctx, locked_url, attr, "inject") orelse return null;
@@ -1167,7 +1167,7 @@ fn evalInjectSpecs(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?
 				error.BadPort => "port must be an integer in 1..65535",
 				error.OutOfMemory => "out of memory",
 			};
-			die(ctx.allocator, ctx.io, "invalid cogboxPlugin.inject[{d}]: {s}", .{ i, what }, 65);
+			die(ctx.allocator, ctx.io, "invalid cogboxPlugins.inject[{d}]: {s}", .{ i, what }, 65);
 		};
 	}
 	return parsed;

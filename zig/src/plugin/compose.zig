@@ -1,5 +1,5 @@
 // Render and write the generated composition flake that folds every plugin's
-// nixosModules.default (plus the per-instance user flake) into one module.
+// cogboxPlugins.<attr>.module (plus the per-instance user flake) into one module.
 //
 // The file is a pure function of config.json's .plugins array plus the
 // on-disk plugin sources, and is regenerated on every plugin mutation;
@@ -92,11 +92,14 @@ pub fn render(
 		"\t\tnixosModules.default = {\n" ++
 		"\t\t\timports = [\n");
 	for (plugins) |p| {
-		try out.appendSlice(allocator, "\t\t\t\tinputs.\"p-");
+		// Import the plugin's module via its cogboxPlugins.<attr>.module
+		// reference; `or {}` makes the module optional (a pure-policy plugin
+		// that only contributes networkRules/l7Rules/inject omits it).
+		try out.appendSlice(allocator, "\t\t\t\t(inputs.\"p-");
 		try out.appendSlice(allocator, p.name);
-		try out.appendSlice(allocator, "\".nixosModules.\"");
+		try out.appendSlice(allocator, "\".cogboxPlugins.\"");
 		try out.appendSlice(allocator, p.attr);
-		try out.appendSlice(allocator, "\"\n");
+		try out.appendSlice(allocator, "\".module or {})\n");
 	}
 	try out.appendSlice(allocator, "\t\t\t\tuser.nixosModules.default\n" ++
 		"\t\t\t];\n" ++

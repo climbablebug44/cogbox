@@ -175,7 +175,7 @@ pub const InjectSpecError = error{
 	OutOfMemory,
 };
 
-/// Validate one plugin-declared injection spec (cogboxPlugin.<attr>.inject[]).
+/// Validate one plugin-declared injection spec (cogboxPlugins.<attr>.inject[]).
 /// A plugin may only NAME a credential plus the exact host it targets; it can
 /// never express a value or a host-side path. Shape:
 ///   { host = "api.x"; style = "bearer"|"cookie"|"basic"; secret = "name";
