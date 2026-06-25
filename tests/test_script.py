@@ -267,6 +267,27 @@ NIX_EOF"""))
     machine.succeed(
         as_user(f"cogbox ssh 'nix-store --check-validity {hello_path}'")
     )
+
+    # --- Brain materialization: the base oneshots run for EVERY instance, even
+    # one with no plugins. ~/work (the standardized workdir) is a symlink into
+    # the persisted share, .cogbox/brain is the RO store tree, and the
+    # cogbox-authored capability index is always present as a skill.
+    work_link = machine.succeed(
+        as_user("cogbox ssh 'readlink /root/work'")
+    ).strip()
+    assert work_link == "/var/lib/cogbox/work", work_link
+    machine.succeed(as_user("cogbox ssh 'test -L /var/lib/cogbox/work/.cogbox/brain'"))
+    machine.succeed(as_user(
+        "cogbox ssh 'test -f /var/lib/cogbox/work/.claude/skills/cogbox-plugins/SKILL.md'"
+    ))
+    # Frontmatter must start at column 0 or the harness ignores the skill.
+    machine.succeed(as_user(
+        "cogbox ssh 'sed -n 1p /var/lib/cogbox/work/.claude/skills/cogbox-plugins/SKILL.md | grep -qx -- ---'"
+    ))
+    # Claude workspace trust is pre-accepted for the new workdir.
+    machine.succeed(as_user(
+        "cogbox ssh 'grep -q /var/lib/cogbox/work /root/.claude.json'"
+    ))
     stop_instance("cc-default")
 
     # Revert to the byte-exact scaffold so the next boot skips re-exec
