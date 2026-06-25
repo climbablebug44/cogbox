@@ -84,6 +84,15 @@ Two sources of guest extension share one mechanism, `--override-input userExtens
 
 `COGBOX_REEXECED` breaks the loop after one hop. Non-launch verbs never re-exec.
 
+## Plugin brain materialization
+
+The base module declares the `cogbox.*` option tree and folds the merged `config.cogbox` of every plugin into one `cogbox-brain` derivation at build (per-harness native trees + merged `opencode.json`/`.mcp.json`/codex `config.toml` + a generated capability index skill). Two base-owned `Type=oneshot` services (modeled on `load-ssh-keys`, ordered `before=sshd.service`) materialize it at boot:
+
+1. `cogbox-brain-materialize` creates the `~/work` (`/root/work` → `/var/lib/cogbox/work`) symlink, the `~/work/.cogbox/brain` link to the RO store derivation, and per-leaf child symlinks into each harness's real writable dirs (`.claude/skills/<s>`, `.opencode/agents/<a>.md`, `.agents/skills/<s>`, …). It only ever drops *child* symlinks, never whole-dir links, so the harness can scaffold session state alongside and peers coexist. It reads only closure-resident store paths, so it works offline.
+2. `cogbox-brain-trust` pre-accepts Claude Code workspace trust for `~/work` (both `/root/work` and the `/var/lib/cogbox/work` it resolves to) and reconciles stale pre-migration project keys.
+
+The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the `c`/`oc`/`cx` launchers `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
+
 ## Network enforcement
 
 In `rules` network mode, the wrapper loads a Zig shared library (`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and checks destination addresses against the configured CIDR rules; denied connections receive `ENETUNREACH`. It initializes via `.init_array` (before `main()`) so all file I/O for rule loading completes before passt activates its seccomp-bpf sandbox. Rules hot-reload via `SIGUSR1`; the L7 proxy reloads via `SIGHUP`. Details, including the remap/SOCKS5 layer and the L7 proxy architecture, are in [network filtering](network-filtering.md).

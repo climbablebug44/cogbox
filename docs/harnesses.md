@@ -26,6 +26,10 @@ To add a harness after init, either create its host config dir manually and re-l
 
 A note about `node_modules/`: if a host harness config dir contains a `node_modules/` tree, it is exposed read-only into the VM via the 9p lowerdir share. To avoid streaming hundreds of megabytes through 9p on every boot, keep heavy package installs out of harness config dirs.
 
+## Plugin kits per harness
+
+Independently of the shared host config above, [plugins](plugins.md) contribute an agent-facing **kit** (skills/agents/commands/rules + merged MCP/settings) via the `cogbox.*` module options. The base materializes one neutral kit into each enabled harness's native layout under the project workdir `~/work` — `.claude/`, `.opencode/`, and codex's `.agents/`/`.codex/` — so the same plugin serves every harness. This is project-scoped (per instance, in `~/work`), not part of the shared `~/.claude`/`~/.config/opencode`/`~/.codex` host config. See [plugins.md](plugins.md#harness-agnostic--native-mapping) for the mapping table.
+
 ## How "full auto" is wired per harness
 
 - `c` (claude-code) sets `IS_SANDBOX=1` and passes `--dangerously-skip-permissions`.

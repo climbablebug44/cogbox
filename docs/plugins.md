@@ -1,55 +1,142 @@
 # Plugins
 
-Plugins package the [per-instance extension pattern](extensions.md) into something installable: a git repo (or any flake source) that carries one or more NixOS modules plus, optionally, the firewall rules they need. `cogbox plugin add` is the CLI workflow for what previously required hand-editing the instance flake and hand-merging rules.
+Plugins package the [per-instance extension pattern](extensions.md) into something installable: a git repo (or any flake source) that carries a NixOS module **and** the agent-facing kit it contributes (skills, agents, commands, rules), plus the host-side firewall/credential policy it needs. `cogbox plugin add` is the CLI workflow for what previously required hand-editing the instance flake and hand-merging rules.
 
 ```sh
 cogbox plugin add github:myorg/myplugin?dir=flake            # install into the default instance
-cogbox plugin add 'github:org/observability#loki' -n work   # one module of a multi-plugin flake
-cogbox plugin update                                        # re-resolve and re-pin everything
-cogbox plugin del myplugin                                  # remove module + its firewall rules
+cogbox plugin add 'github:org/observability#loki' -n work    # one module of a multi-plugin flake
+cogbox plugin resolve github:org/observability#loki          # preview (JSON) -- installs nothing
+cogbox plugin update                                          # re-resolve and re-pin everything
+cogbox plugin del myplugin                                    # remove module + its firewall rules
 ```
 
 ## The contract
 
-A plugin is a NixOS module exposed by a flake. One flake can carry any number of plugins, and any subset of them can be enabled per instance:
+A plugin is a flake that exposes two outputs:
 
-- `nixosModules.<attr>` -- the plugin module, selected by the URL fragment (`URL#attr`); a bare URL means `nixosModules.default`. Folded into the guest like the per-instance flake's module. `pkgs` resolves to cogbox's nixpkgs (the same caveat as the [extension scaffold](extensions.md#which-nixpkgs-pkgs-is): declare a differently-named input to use your own).
-- `cogboxPlugin.<attr>.networkRules` (optional) -- a list of rule objects in `config.json`'s `.network.rules` schema for that module (L4 CIDR allows/denies). For the default module the flat form `cogboxPlugin.networkRules` also works.
-- `cogboxPlugin.<attr>.l7Rules` (optional) -- a list of [L7 vhost rules](network-filtering.md#l7-host-filtering) in the `.network.l7.rules` schema: `allow`/`deny` keyed to a host pattern, plus the optional tier fields `terminate`, `passthrough`, `path`, `insecure_upstream` (same constraints as `cogbox l7 add`). Flat form `cogboxPlugin.l7Rules` for the default module. Prefer these over IP allows when the plugin's backend sits behind a shared LB or reverse proxy: an L7 allow reaches exactly that vhost, not its siblings on the same IP.
-- `cogboxPlugin.<attr>.inject` (optional) -- a list of credential-injection requests for hosts the plugin's agent talks to. Each entry **names** a secret and the exact host it targets; it can never carry a value or a host-side path. You bind the real secret host-side with `cogbox secret add`, so it stays out of the guest. Flat form `cogboxPlugin.inject` for the default module. See [Credential injection](#credential-injection) below and the [host-side injection design](network-filtering.md#plugin-declared-and-operator-bound-injection).
+- **`nixosModules.<attr>`** — a standard, reusable NixOS module. It carries ordinary guest config (packages, services, mounts) **and** the plugin's agent-facing contributions under the `cogbox.*` option tree the base declares (see [The kit](#the-kit-cogbox)). Selected by the URL fragment (`URL#attr`); a bare URL means the `default` module. `pkgs` resolves to cogbox's nixpkgs (same caveat as the [extension scaffold](extensions.md#which-nixpkgs-pkgs-is)).
+- **`cogboxPlugins.<attr>`** — a thin registration: `{ module = self.nixosModules.<attr>; networkRules; l7Rules; inject; }`. This is the host-side, **hot-reloadable** network/auth policy, read at `cogbox plugin add` with a cheap isolated `nix eval` (no cogbox-system context, IFD-blocked) and merged into `config.json` — applied to the running firewall/proxy **without a rebuild**.
 
-A minimal multi-plugin flake:
+`cogbox plugin add URL` installs `cogboxPlugins.default`; `add URL#loki` installs `cogboxPlugins.loki` (and imports its `.module`). `module` is optional — a **pure-policy** plugin (only firewall/inject, no guest content) omits it and cogbox treats it as the empty module.
+
+### The organizing principle — hot-reload decides where a thing lives
+
+- **Host-side, hot-reloadable policy** (`networkRules`/`l7Rules`/`inject`) lives in the `cogboxPlugins.<attr>` flake output. It is read at `add` by a cheap `nix eval`, stored in `config.json`, and applied to the running firewall/proxy **without a rebuild**. It is never rendered inside the guest.
+- **Build-time guest content** (the kit, and any packages/services) lives in the **NixOS module** as `cogbox.*`. A change there already requires a rebuild/restart, so it belongs in the build, where it is evaluated with cogbox's `pkgs` and folded into the guest by the base.
+
+A complete mid-complexity plugin:
 
 ```nix
 {
-    outputs = { self }: {
-        nixosModules.default = { pkgs, ... }: {
-            environment.systemPackages = with pkgs; [ mimir-helpers ];
-        };
-        nixosModules.loki = { pkgs, ... }: {
-            environment.systemPackages = with pkgs; [ loki-helpers ];
-        };
-        cogboxPlugin.networkRules = [
-            { allow = "10.0.0.1/32"; comment = "mimir backend"; }
-        ];
-        cogboxPlugin.loki.l7Rules = [
-            { allow = "loki.internal.example"; terminate = true; comment = "loki vhost on the shared LB"; }
-        ];
+  description = "cogbox druid-es: Druid performance-analysis agent over an Elasticsearch cluster";
+
+  outputs = { self }: {
+
+    # Everything built into the guest -- the kit AND ordinary NixOS config.
+    nixosModules.default = { pkgs, ... }: {
+      cogbox = {
+        contents = ./contents;                  # scan contents/{skills,agents,commands,rules}
+        env.ES_URL = "http://es-1.example.internal:9200";
+        settings.claude-code.model = "claude-opus-4-8";
+      };
+      environment.systemPackages = [ /* es-*, druid-* helper bins */ ];
     };
+
+    # Thin registration: which module is the plugin, plus host-side policy.
+    cogboxPlugins.default = {
+      module  = self.nixosModules.default;
+      l7Rules = [ { allow = "es-1.example.internal"; terminate = true; comment = "ES data node 1"; } ];
+      inject  = [ { host = "es-1.example.internal"; style = "basic"; secret = "es-creds"; port = 9200; } ];
+    };
+  };
 }
 ```
 
-`FLAKE_URL` can be anything nix accepts: `github:owner/repo`, `git+https://...`, `path:/abs/dir`, with `?dir=` for flakes in a subdirectory. The `#attr` fragment is restricted to `[a-zA-Z0-9_-]` (it is interpolated into nix attr paths). Plugin names follow the instance-name grammar; `user` is reserved.
+The directory **is** the manifest:
+
+```
+data-druid-es/
+├── flake.nix
+├── bin/                       es-cat, es-search, druid-metric, ...
+└── contents/
+    ├── skills/{overview,es-query,druid-metrics}/SKILL.md
+    ├── agents/druid-investigator.md      # standard agent file (name/description/model frontmatter + body)
+    ├── commands/druid-rca.md
+    └── rules/read-only.md                # optional; empty `paths` frontmatter => always-on
+```
+
+`FLAKE_URL` can be anything nix accepts: `github:owner/repo`, `git+https://...`, `path:/abs/dir`, with `?dir=` for flakes in a subdirectory. The `#attr` fragment is restricted to `[a-zA-Z0-9_-]`. Plugin names follow the instance-name grammar; `user` is reserved.
+
+## The kit: `cogbox.*`
+
+The base declares one option tree; each plugin module fills in its slice, and the module system merges across all imported plugins:
+
+| Option | Type | Meaning |
+|---|---|---|
+| `cogbox.contents` | path \| list of paths | Convention root(s) scanned (`readDir`, pure eval) for `skills/`, `agents/`, `commands/`, `rules/`. Roots concatenate across plugins. |
+| `cogbox.skills` / `.agents` / `.commands` / `.rules` | attrset name→path | Explicit units that compose on top of (and override) discovery — e.g. a *generated* skill dir. |
+| `cogbox.mcp` | attrset name→`{command/args/env}` \| `{url/headers}` | Neutral MCP servers, materialized per harness. |
+| `cogbox.hooks` | attrset event→command | Lifecycle hooks. |
+| `cogbox.env` | attrset string→string | Plugin endpoints, merged into the harness launcher env (never a hard global `environment.variables`). |
+| `cogbox.settings.<harness>` | `{ model; reasoningEffort }` | Per-harness settings. **Allowlist: `model`, `reasoningEffort` only** (enforced by the option type) — never permissions/auth/providers. Keyed `claude-code` / `opencode` / `codex`. |
+
+**Discovery.** A skill is a directory containing `SKILL.md`; an agent/command/rule is a `<name>.md` file. The skill's `name:` frontmatter must equal its directory name (opencode requirement). Non-conforming entries (`README.md`, a dir without `SKILL.md`) are skipped.
+
+**Names are natural — no namespacing.** A skill is `/druid-rca`, not `/druid-es-druid-rca`. Uniqueness, not prefixing, is the invariant: a discovered-name collision across `contents` roots, or two plugins defining the same explicit name, **fails the build** with a plugin-attributed message. Name generically-named units distinctly.
+
+**Two deliberate non-features**, enforced by the contract shape:
+
+- **Plugins set no cwd and no `loginShellInit`.** The workdir (`~/work`) and cwd are 100% base-owned, so the cwd fight between plugins is structurally impossible.
+- **Plugins ship no always-on `CLAUDE.md`/`AGENTS.md`.** Orientation is relevance-loaded skills (listed in the cogbox-authored index) plus an optional path-scoped `rules/` channel (a rule with empty `paths` ⇒ always-on). There is no channel for a third party to inject always-on, user-outranking prose.
+
+## The workdir: `~/work`
+
+`~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`cx` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
+
+At build, the base folds every plugin's merged `config.cogbox` into **one derivation** (`cogbox-brain`) laying out each enabled harness's native tree + merged config + a cogbox-authored capability **index** skill. At boot, one base-owned oneshot (modeled on `load-ssh-keys`) materializes it:
+
+```
+~/work/.cogbox/brain      -> the cogbox-brain store derivation (RO leaves)
+~/work/.claude/skills/<s>  -> child symlinks into the RO leaves (parents stay real writable dirs)
+~/work/.claude/agents/<a>.md, .claude/commands/<c>.md, .claude/rules/<r>.md
+~/work/.opencode/{skills,agents,commands}/...   (opencode.json read via OPENCODE_CONFIG)
+~/work/.agents/skills/...                        (codex skills)
+```
+
+The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
+
+## Harness-agnostic → native mapping
+
+One neutral unit → each enabled harness's native layout (gated on which harnesses the instance uses):
+
+| Neutral | claude-code | opencode | codex |
+|---|---|---|---|
+| **skill** `<s>` | `.claude/skills/<s>/SKILL.md` | `.opencode/skills/<s>/SKILL.md` | `.agents/skills/<s>/SKILL.md` |
+| **rule** `<r>` | `.claude/rules/<r>.md` (`paths:`; empty ⇒ always-on) | `instructions` glob in `opencode.json` | (empty-paths only, best-effort) |
+| **agent** `<a>` | `.claude/agents/<a>.md` | `.opencode/agents/<a>.md` | (best-effort) |
+| **command** `<c>` | `.claude/commands/<c>.md` | `.opencode/commands/<c>.md` | skill `.agents/skills/<c>` |
+| **mcp** `<srv>` | `.mcp.json` `mcpServers` | `opencode.json` `mcp` | `config.toml` `[mcp_servers]` |
+| **settings** | `.claude/settings.json` | `opencode.json` | `config.toml` |
+| **env** | launcher env | launcher env | launcher env |
+| **index** | `.claude/skills/cogbox-plugins/` | `.opencode/skills/cogbox-plugins/` | `.agents/skills/cogbox-plugins/` |
+
+The same store copy is symlinked into each layout (no duplication). codex agent/command fidelity is best-effort (claude-only frontmatter is dropped; read-only relies on prompt + egress lockdown).
+
+## Network rules and credential injection
+
+`cogboxPlugins.<attr>.networkRules` (L4 CIDR), `.l7Rules` ([L7 vhost rules](network-filtering.md#l7-host-filtering)), and `.inject` ([credential injection](network-filtering.md#host-side-credential-injection)) are the host-side, hot-reloadable policy. If the plugin declares any and the instance is in `rules` mode, `add` shows them all and asks once before merging (auto-confirmed with `-y` or when stdin is not a tty). Injection gets its own louder confirmation section (granting a host-side credential is a different trust than a firewall rule) and prints a `cogbox secret add` bind checklist — the secret is named symbolically and **never** enters the guest.
+
+Each merged rule/spec carries a `"plugin": "<name>"` field, so `del`/`update` remove or replace exactly what that plugin brought in. **Rule/inject changes hot-reload** into a running instance; **kit/module changes need a `cogbox restart`** — that asymmetry is the §"organizing principle" above. An `mcp` server may name only `command`/`args`/`env`/`url`/`headers` — a token/cred_file/secret path is rejected (MCP auth goes through host-side inject, never inline).
+
+See [Credential injection](network-filtering.md#host-side-credential-injection) for the full security model and the [`cogbox secret`](network-filtering.md#the-secret-store) reference.
 
 ## Pinning and updates
 
-Versioning is per flake, not per plugin. `add` resolves the URL with `nix flake metadata`, records the locked URL, rev, and narHash in `config.json` (`.plugins`), and runs `nix flake archive` so the plugin and its transitive inputs land in the local store -- subsequent starts resolve the pins offline.
+Versioning is per flake, not per plugin. `add` resolves the URL with `nix flake metadata`, records the locked URL, rev, and narHash in `config.json` (`.plugins`), and runs `nix flake archive` so the plugin and its transitive inputs land in the local store — subsequent starts resolve the pins offline.
 
-Enabling another module of an already-installed flake **reuses the existing pin**, so all plugins from one flake stay at one rev; `update` resolves each distinct URL once and moves all of its plugins together. To hold a flake at a specific rev, pin it in the URL itself (`...?rev=<sha>` or `github:owner/repo/<sha>`) -- a distinct URL pins independently.
+Enabling another module of an already-installed flake **reuses the existing pin**, so all plugins from one flake stay at one rev; `update` resolves each distinct URL once and moves all of its plugins together. To hold a flake at a specific rev, pin it in the URL (`...?rev=<sha>` or `github:owner/repo/<sha>`). A **dirty git worktree** is the worst-pinned shape (no rev, no narHash in the URL); `add` warns — commit, then `cogbox plugin update` to pin properly.
 
-The clone-less model means there is no working copy to manage: `update` re-resolves the *original* URL (network) and re-pins only when the content changed.
-
-A `.plugins` entry in `config.json` looks like:
+A `.plugins` entry:
 
 ```json
 {
@@ -62,99 +149,48 @@ A `.plugins` entry in `config.json` looks like:
 }
 ```
 
-`url` is exactly what you typed (minus the fragment) and is what `update` re-resolves; `lockedUrl` is what the composition flake's inputs consume. For forge, `path:`, and tarball schemes it carries the rev and narHash, making the input deterministic and offline-substitutable. For `git+`/`hg+` URLs it carries ref+rev only: nix's git and hg fetchers pass unrecognized query params (narHash included) through to the remote, which would corrupt the repository path the forge sees, so the rev alone is the pin and offline resolution relies on the fetcher cache populated at add time. The top-level `narHash` field is recorded for every scheme and is the canonical change detector (dirty `path:` flakes have no `rev`). `attr` is omitted for the default module.
-
-A **dirty git worktree** is the worst-pinned shape: its lock has neither rev nor narHash in the URL, so the recorded plugin floats with the worktree across restarts. `add` warns when this happens; commit the tree and run `cogbox plugin update` to pin properly.
-
-## Network rules
-
-If the plugin declares network rules (L4 and/or L7) and the instance is in `rules` mode, `add` shows them all and asks once before merging (auto-confirmed with `-y` or when stdin is not a tty). Merged rules are inserted **at the top of their respective rule list** -- both lists are first-match-wins, and the seeded L4 ruleset is "RFC1918/bogon denies, then `allow 0.0.0.0/0`", so a plugin's allows for private backend IPs only work ahead of the denies. Review the prompt: a malicious plugin could suggest `allow 0.0.0.0/0`, or an L7 `allow *`.
-
-Each merged rule carries a `"plugin": "<name>"` field, which is how `del` and `update` remove or replace exactly the rules that plugin brought in (your own edits to the same CIDRs or hosts are untouched). Rule changes hot-reload into a running instance through the same path as `cogbox rules`/`l7` edits; module changes need a `cogbox restart`. Note that merging a plugin's first `l7Rules` into an instance activates [L7 filtering](network-filtering.md#l7-host-filtering) for it, with everything that implies (80/443 funneled through the host-side proxy, QUIC/IPv6 denied).
-
-Instances not in `rules` mode still get the module; the suggested rules are skipped with a warning.
-
-## Credential injection
-
-A plugin whose agent talks to an authenticated service can request **host-side credential injection** so the agent reaches that service already-authenticated without the credential ever entering the guest. The plugin declares `cogboxPlugin.<attr>.inject`; you bind the actual secret host-side.
-
-```nix
-cogboxPlugin.inject = [
-    # a static API bearer for an HTTPS host
-    { host = "api.example.com"; style = "bearer"; secret = "api-bearer"; }
-    # HTTP Basic auth for a service on a non-standard port (e.g. Elasticsearch)
-    { host = "es.internal"; style = "basic"; secret = "es-creds"; port = 9200; }
-    # a session cookie for an HTTP host (e.g. minted by a sidecar)
-    { host = "app.example.com"; style = "cookie"; cookieName = "app.sid";
-      secret = "app-session"; stub = "cogbox-app-stub"; }
-];
-```
-
-Each spec:
-
-- `host` -- the **exact** host the credential may be injected to (no wildcard).
-- `style` -- `bearer` (`Authorization: Bearer <value>`), `basic` (`Authorization: Basic base64(<user:pass>)`), or `cookie` (replaces only `cookieName` in the request `Cookie` header).
-- `secret` -- the **symbolic name** of a secret you bind with `cogbox secret`. A plugin can never name a value or a file path; the manifest is rejected at `add` time if it tries to (`path`, `cred_file`, `token`, `refresh`, ...).
-- `cookieName` -- required for the cookie style.
-- `port` (optional) -- the service port, when the host is reached on something other than 80/443 (e.g. `9200` for Elasticsearch). cogbox then funnels that port through the L7 proxy so the credential is stamped; without it the request bypasses the proxy and stays unauthenticated. See [non-standard ports](network-filtering.md#non-standard-ports).
-- `stub` (optional) -- a sentinel the guest carries; injection then replaces the credential **only** over that stub (or an absent one), leaving any other credential the guest legitimately holds untouched.
-
-On `add`, injection requests are shown in their own confirmation section (granting a credential is different trust than a firewall rule), merged into `.network.l7.inject.specs[]` tagged with the plugin name, and a **bind-checklist** prints the exact commands to run:
-
-```
-$ cogbox plugin add path:/path/to/plugin
-Credential injection requests from 'myplugin' (host-side; the secret stays OUT of the guest):
-  + inject api.example.com bearer secret=api-bearer
-Bind these secrets host-side so injection takes effect (they stay OUT of the guest):
-  cogbox secret add api-bearer --from-file FILE --audience api.example.com --kind bearer
-```
-
-You then bind the secret:
-
-```sh
-cogbox secret add api-bearer --from-file ~/.secrets/api.token --audience api.example.com
-```
-
-The `--audience` you bind **must** match the spec host, or nothing is injected -- this is the gate that stops a hostile plugin from later requesting your bound secret be injected to an attacker host. An unbound secret renders nothing (fail closed); injection simply stays inert until you bind it. The host is automatically MITM-terminated for injection to work; see the [injection design](network-filtering.md#plugin-declared-and-operator-bound-injection) for the full security model and the [`cogbox secret`](network-filtering.md#the-secret-store) reference.
+`url` is what you typed (minus the fragment) and is what `update` re-resolves; `lockedUrl` is what the composition flake's inputs consume. `attr` is omitted for the default module.
 
 ## The composition flake
 
-Plugin state is materialized as a generated flake at `~/.config/cogbox/instances/<name>/plugins-flake/flake.nix` (marked DO NOT EDIT; regenerated from `config.json` by every `plugin` command, `update` included -- run `cogbox plugin update` if it ever goes missing). It declares one pinned input per plugin plus the instance's own `flake/` as input `user`, and exposes a single `nixosModules.default` importing all of them, user module last:
+Plugin state is materialized as a generated flake at `~/.config/cogbox/instances/<name>/plugins-flake/flake.nix` (marked DO NOT EDIT; regenerated from `config.json` by every `plugin` command). It declares one pinned input per plugin plus the instance's own `flake/` as input `user`, and exposes a single `nixosModules.default` importing each plugin's module via its registration, user module last:
 
 ```nix
 # GENERATED by 'cogbox plugin' -- DO NOT EDIT.
 {
-	inputs = {
-		user.url = "path:/home/me/.config/cogbox/instances/default/flake";
-		"p-mimir".url = "github:org/observability/<rev>?narHash=sha256-...";
-		"p-loki".url = "github:org/observability/<rev>?narHash=sha256-...";
-	};
-
-	outputs = { self, user, ... }@inputs: {
-		nixosModules.default = {
-			imports = [
-				inputs."p-mimir".nixosModules."default"
-				inputs."p-loki".nixosModules."loki"
-				user.nixosModules.default
-			];
-		};
-	};
+    inputs = {
+        user.url = "path:/home/me/.config/cogbox/instances/default/flake";
+        "p-mimir".url = "github:org/observability/<rev>?narHash=sha256-...";
+        "p-loki".url  = "github:org/observability/<rev>?narHash=sha256-...";
+    };
+    outputs = { self, user, ... }@inputs: {
+        nixosModules.default = {
+            imports = [
+                (inputs."p-mimir".cogboxPlugins."default".module or {})
+                (inputs."p-loki".cogboxPlugins."loki".module or {})
+                user.nixosModules.default
+            ];
+        };
+    };
 }
 ```
 
-At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake instead of the plain instance flake (the [same re-exec mechanism](extensions.md#how-it-works) the manual extension path uses), so plugins and manual flake.nix edits compose. Two plugins from the same flake become two pinned inputs that resolve to the same store path. No `flake.lock` is generated: the composition is only ever consumed as an input, and pinned inputs leave nothing for a lock file to decide.
+`(... .module or {})` makes the module optional (a pure-policy plugin omits it). At launch, when `.plugins` is non-empty, the wrapper points `--override-input userExtensions` at this flake, so plugins and manual flake.nix edits compose. Because the inputs are pinned and pre-fetched by `nix flake archive`, restarts of a plugin-bearing instance work offline once the runner is built.
 
-Because the inputs are pinned (by narHash, or by rev for git/hg schemes) and pre-fetched by `nix flake archive` at add time, restarts of a plugin-bearing instance work offline once the runner has been built.
+## Preview before install: `cogbox plugin resolve`
+
+`cogbox plugin resolve URL[#attr] [--git-credential-stdin]` is a read-only preview: it runs flake metadata + the `cogboxPlugins.<attr>` contract check + the host-side `networkRules`/`l7Rules`/`inject` readout and prints **one JSON line** on stdout (`{name, attr, url, lockedUrl, rev, narHash, dirty, present, networkRules, l7Rules, inject}`). It mutates nothing — no config, no source materialization, no composition. It is the foundation for the cogworx plugin store's truthful pre-install posture preview.
 
 ## Trust
 
-Adding a plugin evaluates third-party nix code at add time (pure eval, IFD disabled) and *builds* it into the guest at the next start. Treat `cogbox plugin add` like installing software: only add flakes you trust. The suggested-rules prompt exists so a plugin cannot silently widen the instance's egress policy.
+Adding a plugin evaluates third-party nix code at add time (pure eval, IFD disabled) and *builds* it into the guest at the next start. Treat `cogbox plugin add` like installing software: only add flakes you trust. The contract removes the always-on prompt-injection channel and the cwd fight by construction, sanitizes plugin-authored descriptions before they reach the cogbox-authored index, and surfaces the egress/credential ask for confirmation — but a skill body is still arbitrary plugin prose loaded on relevance. The boundary remains "only add plugins you trust."
 
 ## Plugin verb reference
 
 | Form | Description |
 |---|---|
 | `cogbox plugin list [-n NAME]` | List installed plugins with their pinned revision and rule count |
-| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install a plugin. `#ATTR` selects `nixosModules.<attr>` (default: `default`). `--as` overrides the derived name (the attr, the `?dir=` basename, or the repo name); `-y` skips the rule-merge confirmation. |
+| `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install. `#ATTR` selects `cogboxPlugins.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the confirmation. |
+| `cogbox plugin resolve FLAKE_URL[#ATTR] [--git-credential-stdin]` | Preview (JSON) the contract + host-side rules/inject without installing |
 | `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
-| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules. Without a name, updates every plugin. |
+| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules |

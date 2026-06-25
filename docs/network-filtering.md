@@ -301,7 +301,7 @@ This per-instance login model currently applies to **claude-code** (the only har
 
 The same terminate-tier mechanism is not limited to the built-in harnesses: a **plugin** can request injection for any host its agent talks to, and an **operator** binds the actual credential host-side. This generalizes the harness path to arbitrary bearer tokens and session cookies while preserving the credless boundary.
 
-A plugin declares `cogboxPlugin.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer`, `cookie`, or `basic`; the `cookie` style also needs a `cookieName`), the secret `name`, an optional `stub` sentinel, and an optional `port` (see [non-standard ports](#non-standard-ports) -- declare it when the host is served somewhere other than 80/443, e.g. `9200` for Elasticsearch). The named specs merge into `.network.l7.inject.specs[]`:
+A plugin declares `cogboxPlugins.<attr>.inject` (see [plugins](plugins.md#credential-injection)). Crucially, a plugin can only **name** a secret and the exact host it targets -- it can never carry a value or a host-side path (the manifest is rejected at `add` time if it tries: `path`, `cred_file`, `token`, `refresh`, ... are all forbidden). Each spec names an exact `host` (no wildcard), a `style` (`bearer`, `cookie`, or `basic`; the `cookie` style also needs a `cookieName`), the secret `name`, an optional `stub` sentinel, and an optional `port` (see [non-standard ports](#non-standard-ports) -- declare it when the host is served somewhere other than 80/443, e.g. `9200` for Elasticsearch). The named specs merge into `.network.l7.inject.specs[]`:
 
 ```json
 "network": { "l7": {
@@ -342,10 +342,10 @@ The value is read from a file or stdin (never argv, which leaks to the process t
 
 **Example -- HTTP Basic auth for an internal Elasticsearch cluster on `:9200`:**
 
-Injection needs two things: an inject **spec** (which host + style + secret name, and -- on a non-standard port -- the `port`) and the **bound secret**. A plugin's `cogboxPlugin.inject` writes the spec for you; there is no `cogbox inject add` verb, so an operator without a plugin hand-edits `.network.l7.inject.specs[]` in the instance `config.json`:
+Injection needs two things: an inject **spec** (which host + style + secret name, and -- on a non-standard port -- the `port`) and the **bound secret**. A plugin's `cogboxPlugins.inject` writes the spec for you; there is no `cogbox inject add` verb, so an operator without a plugin hand-edits `.network.l7.inject.specs[]` in the instance `config.json`:
 
 ```sh
-# 1. Declare the inject spec. (A plugin does this via cogboxPlugin.inject; by hand:)
+# 1. Declare the inject spec. (A plugin does this via cogboxPlugins.inject; by hand:)
 cfg=~/.config/cogbox/instances/<name>/config.json
 jq '.network.l7.inject = {enabled: true,
       specs: ((.network.l7.inject.specs // []) +

@@ -103,8 +103,8 @@ each instance overlays its own changes on top, so per-instance harness
 settings persist independently (see [Harnesses](docs/harnesses.md)).
 
 The guest's hostname is `cogbox-<instance>` (e.g. `cogbox-work`), and
-interactive shells start in `/var/lib/cogbox`, the persisted host-shared
-data dir.
+interactive shells start in `~/work` (a symlink into the persisted host-shared
+data dir), the standardized project workdir where plugin kits are materialized.
 
 ## CLI
 
