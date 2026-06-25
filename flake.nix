@@ -203,8 +203,13 @@
 					# Land interactive login shells in the persisted data
 					# dir so the autologin session starts where the user's
 					# state lives, rather than in root's home.
-					programs.bash.loginShellInit = ''
-						cd /var/lib/${name}
+					# Land interactive login shells in the standardized workdir
+					# ~/work (= /root/work, a base-created symlink into the persisted
+					# share). mkForce so no plugin can append a competing `cd` -- the
+					# cogbox.* contract has no loginShellInit surface. Falls back to
+					# the share root if the brain oneshot has not run yet.
+					programs.bash.loginShellInit = lib.mkForce ''
+						cd /root/work 2>/dev/null || cd /var/lib/${name}
 					'';
 					microvm = {
 						hypervisor = "qemu";
@@ -248,9 +253,56 @@
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			inputs.nixfs.nixosModules.nixfs
+			# Declare the cogbox.* plugin-contribution option tree (the "brain"
+			# contract). Every plugin module fills in its slice; the base module
+			# below reads the merged config.cogbox and materializes it into each
+			# enabled harness's native tree under ~/work. Host-side hot-reloadable
+			# policy (networkRules/l7Rules/inject) is NOT here -- it lives in the
+			# cogboxPlugins.<name> flake output, read cheaply at `plugin add`.
+			({ lib, ... }: {
+				options.cogbox = {
+					# Convention root(s): each scanned (readDir, pure eval) for
+					# skills/, agents/, commands/, rules/. A bare path coerces to a
+					# one-element list so multiple plugins' roots concatenate.
+					contents = lib.mkOption {
+						type = lib.types.coercedTo lib.types.path (p: [ p ]) (lib.types.listOf lib.types.path);
+						default = [];
+						description = "Convention root(s) scanned for skills/, agents/, commands/, rules/.";
+					};
+					# Explicit units compose on top of discovery and override a
+					# discovered name. Each value is a path: a skill is a dir
+					# (containing SKILL.md), an agent/command/rule is a .md file.
+					skills   = lib.mkOption { type = lib.types.attrsOf lib.types.path; default = {}; description = "Explicit skill dirs (each containing SKILL.md), keyed by name."; };
+					agents   = lib.mkOption { type = lib.types.attrsOf lib.types.path; default = {}; description = "Explicit agent .md files, keyed by name."; };
+					commands = lib.mkOption { type = lib.types.attrsOf lib.types.path; default = {}; description = "Explicit command .md files, keyed by name."; };
+					rules    = lib.mkOption { type = lib.types.attrsOf lib.types.path; default = {}; description = "Explicit rule .md files (paths: frontmatter; empty => always-on), keyed by name."; };
+					# Neutral MCP spec, materialized per-harness. serverName ->
+					# { command/args/env } (stdio) or { url/headers } (remote).
+					mcp      = lib.mkOption { type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything); default = {}; description = "Neutral MCP servers: name -> { command/args/env } | { url/headers }."; };
+					# Lifecycle hooks: event -> command.
+					hooks    = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = {}; description = "Lifecycle hooks: event -> command."; };
+					# Plugin-scoped env, re-emitted into the harness launchers only
+					# (never a hard global environment.variables set).
+					env      = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = {}; description = "Plugin-scoped env, merged into the harness launcher env."; };
+					# Per-harness settings -- NOT harness-agnostic (model strings
+					# differ). ALLOWLIST per harness: model, reasoningEffort. Never
+					# permissions/auth/providers. Keyed by harness name.
+					settings = lib.mkOption {
+						type = lib.types.attrsOf (lib.types.submodule {
+							options = {
+								model           = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+								reasoningEffort = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+							};
+						});
+						default = {};
+						description = "Per-harness settings (allowlist: model, reasoningEffort). Keyed by claude-code/opencode/codex.";
+					};
+				};
+			})
 			userExt
-			({ pkgs, lib, utils, ... }: let
+			({ config, pkgs, lib, utils, ... }: let
 				harnesses = mkHarnesses system pkgs;
+				cfg = config.cogbox;
 
 				# Flatten harnesses into a list of paths annotated with
 				# their owning harness name and path key.
@@ -288,11 +340,25 @@
 
 				mkLauncher = h: pkgs.writeScriptBin h.launcher.name (
 					let
-						# CA env first so a harness can still override it.
-						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") (l7CaEnv // h.launcher.env);
+						# opencode reads its merged plugin config from OPENCODE_CONFIG
+						# (deep-merged UNDER any user ./opencode.json), not the project
+						# root, so a plugin's mcp/instructions/settings never clobber
+						# the user's file. cogbox-set, so plugin env can't shadow it.
+						ocConfig = lib.optionalAttrs (h.launcher.name == "oc") {
+							OPENCODE_CONFIG = "/root/work/.cogbox/brain/opencode.json";
+						};
+						# Layer order: CA env first (a harness may override it), then
+						# plugin-scoped cogbox.env, then the cogbox OPENCODE_CONFIG, then
+						# the harness's own launcher env (wins). Plugin env is launcher-
+						# scoped on purpose -- never a hard global environment.variables.
+						envParts = lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}")
+							(l7CaEnv // cfg.env // ocConfig // h.launcher.env);
 						envStr = lib.concatStringsSep " " envParts;
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
+					# Land non-login `cogbox ssh -- c/oc/cx` in the standardized
+					# workdir too (loginShellInit covers the interactive login path).
 					in "#!${pkgs.runtimeShell}\n"
+						+ "cd /root/work 2>/dev/null || true\n"
 						+ ''exec env ${envStr} ${lib.getExe h.package} ${flagsStr} "$@"''
 						+ "\n"
 				);
@@ -302,8 +368,251 @@
 				# path mount.
 				harnessMountUnits = map (p: "${utils.escapeSystemdPath p.guest}.mount")
 					(overlayPaths ++ ephemeralPaths);
+
+				# ===== Plugin brain: materialize config.cogbox into per-harness =====
+				# native trees under ~/work. Pure eval (readDir/readFile over the
+				# in-closure plugin sources); built once into the cogbox-brain
+				# derivation and symlinked in by the cogbox-brain oneshot. See
+				# docs/plugins.md (the cogbox.* contract).
+
+				# --- readDir discovery (skill = dir with SKILL.md; agent/command/
+				#     rule = <name>.md file) over each cogbox.contents root ---
+				readDirSafe = dir: if builtins.pathExists dir then builtins.readDir dir else {};
+				discoverSkills = root: let
+					dir = root + "/skills";
+				in lib.mapAttrs (n: _: dir + "/${n}")
+					(lib.filterAttrs (n: t: t == "directory" && builtins.pathExists (dir + "/${n}/SKILL.md"))
+						(readDirSafe dir));
+				discoverMd = sub: root: let
+					dir = root + "/${sub}";
+				in lib.mapAttrs' (n: _: lib.nameValuePair (lib.removeSuffix ".md" n) (dir + "/${n}"))
+					(lib.filterAttrs (n: t: t == "regular" && lib.hasSuffix ".md" n && n != "README.md")
+						(readDirSafe dir));
+
+				mergeRoots = perRoot: lib.foldl' (a: b: a // b) {} perRoot;
+				dupNames = perRoot: let
+					names = lib.concatMap lib.attrNames perRoot;
+					counts = lib.foldl' (acc: n: acc // { ${n} = (acc.${n} or 0) + 1; }) {} names;
+				in lib.attrNames (lib.filterAttrs (_: c: c > 1) counts);
+
+				roots = cfg.contents;
+				perRootSkills   = map discoverSkills roots;
+				perRootAgents   = map (discoverMd "agents") roots;
+				perRootCommands = map (discoverMd "commands") roots;
+				perRootRules    = map (discoverMd "rules") roots;
+
+				# Explicit cogbox.{skills,...} compose on top of (and override) a
+				# discovered unit of the same name -- explicit is the more
+				# intentional declaration.
+				skills   = mergeRoots perRootSkills   // cfg.skills;
+				agents   = mergeRoots perRootAgents   // cfg.agents;
+				commands = mergeRoots perRootCommands // cfg.commands;
+				rules    = mergeRoots perRootRules    // cfg.rules;
+
+				# Discovered-name collisions ACROSS contents roots (the base owns the
+				# readDir merge, so it must catch these; explicit-name collisions are
+				# caught for free by the module system's attrsOf merge).
+				discoveredCollisions =
+					(map (n: "skill '${n}'")   (dupNames perRootSkills))
+					++ (map (n: "agent '${n}'")   (dupNames perRootAgents))
+					++ (map (n: "command '${n}'") (dupNames perRootCommands))
+					++ (map (n: "rule '${n}'")    (dupNames perRootRules));
+
+				# --- minimal YAML-frontmatter reader (for the index + codex). Pure
+				#     readFile over store paths; only flat `key: value` lines. ---
+				trimWs = s: let m = builtins.match "[[:space:]]*(.*[^[:space:]]|)[[:space:]]*" s; in if m == null then s else builtins.head m;
+				stripQuotes = s: let
+					unq = q: x: if lib.hasPrefix q x && lib.hasSuffix q x && builtins.stringLength x >= 2
+						then builtins.substring 1 (builtins.stringLength x - 2) x else x;
+				in unq "'" (unq "\"" s);
+				fmLinesOf = file: let
+					content = if builtins.pathExists file then builtins.readFile file else "";
+					lines = lib.splitString "\n" content;
+					hasFm = lines != [] && lib.head lines == "---";
+					afterFirst = if hasFm then lib.tail lines else [];
+					closes = lib.filter (x: x.v == "---") (lib.imap0 (i: l: { i = i; v = l; }) afterFirst);
+				in if !hasFm || closes == [] then [] else lib.take (lib.head closes).i afterFirst;
+				fmOf = file: lib.listToAttrs (lib.filter (x: x != null) (map (l: let
+					parts = lib.splitString ":" l;
+				in if lib.length parts < 2 || lib.hasPrefix "#" (trimWs l) then null
+					else lib.nameValuePair (trimWs (lib.head parts))
+						(stripQuotes (trimWs (lib.concatStringsSep ":" (lib.tail parts))))) (fmLinesOf file)));
+				# Collapse to a single line, neutralize the most obvious override
+				# patterns, and length-cap a plugin-authored description before it
+				# reaches the always-on index (defense-in-depth; see plan section 8).
+				sanitize = s: let
+					oneLine = lib.concatStringsSep " " (lib.splitString "\n" (lib.concatStringsSep " " (lib.splitString "\t" s)));
+					neutralized = builtins.replaceStrings
+						[ "ignore previous" "ignore all previous" "disregard previous" "system prompt" ]
+						[ "(redacted)" "(redacted)" "(redacted)" "(redacted)" ]
+						oneLine;
+					capped = if builtins.stringLength neutralized > 200 then (builtins.substring 0 197 neutralized) + "..." else neutralized;
+				in capped;
+
+				# --- per-harness config files (pkgs.formats; no hand-rolled JSON/TOML) ---
+				jsonFmt = pkgs.formats.json {};
+				tomlFmt = pkgs.formats.toml {};
+				opencodeMcp = lib.mapAttrs (n: m:
+					(if m ? command
+						then { type = "local"; command = [ m.command ] ++ (m.args or []); enabled = true; }
+							// lib.optionalAttrs (m ? env) { environment = m.env; }
+						else { type = "remote"; url = m.url; enabled = true; }
+							// lib.optionalAttrs (m ? headers) { headers = m.headers; })) cfg.mcp;
+				claudeMcp = lib.mapAttrs (n: m:
+					(if m ? command
+						then { command = m.command; args = m.args or []; } // lib.optionalAttrs (m ? env) { env = m.env; }
+						else { type = "http"; url = m.url; } // lib.optionalAttrs (m ? headers) { headers = m.headers; })) cfg.mcp;
+				codexMcp = lib.mapAttrs (n: m:
+					(if m ? command
+						then { command = m.command; args = m.args or []; } // lib.optionalAttrs (m ? env) { env = m.env; }
+						else { url = m.url; } // lib.optionalAttrs (m ? headers) { headers = m.headers; })) cfg.mcp;
+				settingsModel = h: let s = cfg.settings.${h} or null; in
+					lib.optionalAttrs (s != null && s.model != null) { model = s.model; };
+				claudeHooks = lib.mapAttrs (_: cmd: [ { hooks = [ { type = "command"; command = cmd; } ]; } ]) cfg.hooks;
+
+				opencodeConfigAttrs = {
+					"$schema" = "https://opencode.ai/config.json";
+					instructions = [ ".cogbox/brain/rules/*.md" ];
+				} // lib.optionalAttrs (cfg.mcp != {}) { mcp = opencodeMcp; }
+					// settingsModel "opencode";
+				opencodeConfig = jsonFmt.generate "opencode.json" opencodeConfigAttrs;
+
+				claudeSettingsAttrs = settingsModel "claude-code"
+					// lib.optionalAttrs (cfg.hooks != {}) { hooks = claudeHooks; };
+				claudeSettings = jsonFmt.generate "settings.json" claudeSettingsAttrs;
+				claudeMcpJson = jsonFmt.generate "mcp.json" { mcpServers = claudeMcp; };
+
+				codexConfigAttrs = lib.optionalAttrs (cfg.mcp != {}) { mcp_servers = codexMcp; }
+					// settingsModel "codex";
+				codexConfig = tomlFmt.generate "config.toml" codexConfigAttrs;
+
+				# --- the cogbox-authored capability index (the only always-on text) ---
+				indexRows = lib.mapAttrsToList (n: p:
+					"| `${n}` | ${sanitize ((fmOf (p + "/SKILL.md")).description or "")} |") skills;
+				# Built as an explicit line list (NOT a '' here-string): a SKILL.md
+				# whose `---` frontmatter is not at column 0 is not recognized by the
+				# harness, and '' dedent leaves stray leading tabs.
+				indexSkill = pkgs.writeTextDir "SKILL.md" (lib.concatStringsSep "\n" ([
+					"---"
+					"name: cogbox-plugins"
+					"description: Index of capabilities installed in this sandbox; consult before answering domain questions."
+					"---"
+					""
+					"# Installed capabilities"
+					""
+					"Plugin-provided skills available in this sandbox. Load a skill by relevance before answering domain questions in its area."
+					""
+					"| skill | description |"
+					"|---|---|"
+				] ++ indexRows) + "\n");
+
+				# --- the materialized brain derivation (RO store leaves) ---
+				linkInto = dir: ext: attrs: lib.concatStringsSep "\n"
+					(lib.mapAttrsToList (n: p: ''ln -s ${p} "${dir}/${n}${ext}"'') attrs);
+				cogbox-brain = pkgs.runCommandLocal "cogbox-brain" {} (''
+					set -e
+					mkdir -p $out/rules
+					${linkInto "$out/rules" ".md" rules}
+				'' + lib.optionalString (harnesses ? "claude-code") ''
+					mkdir -p $out/claude/skills $out/claude/agents $out/claude/commands
+					${linkInto "$out/claude/skills" "" skills}
+					ln -s ${indexSkill} $out/claude/skills/cogbox-plugins
+					${linkInto "$out/claude/agents" ".md" agents}
+					${linkInto "$out/claude/commands" ".md" commands}
+					${lib.optionalString (claudeSettingsAttrs != {}) "cp ${claudeSettings} $out/claude/settings.json"}
+					${lib.optionalString (cfg.mcp != {}) "cp ${claudeMcpJson} $out/claude/.mcp.json"}
+				'' + lib.optionalString (harnesses ? "opencode") ''
+					mkdir -p $out/opencode/skills $out/opencode/agents $out/opencode/commands
+					${linkInto "$out/opencode/skills" "" skills}
+					ln -s ${indexSkill} $out/opencode/skills/cogbox-plugins
+					${linkInto "$out/opencode/agents" ".md" agents}
+					${linkInto "$out/opencode/commands" ".md" commands}
+					cp ${opencodeConfig} $out/opencode.json
+				'' + lib.optionalString (harnesses ? "codex") ''
+					mkdir -p $out/agents/skills
+					${linkInto "$out/agents/skills" "" skills}
+					ln -s ${indexSkill} $out/agents/skills/cogbox-plugins
+					${lib.optionalString (codexConfigAttrs != {}) "mkdir -p $out/codex && cp ${codexConfig} $out/codex/config.toml"}
+				'');
+
+				# Materialize the brain into ~/work: create the ~/work symlink into
+				# the persisted share, the .cogbox/brain RO store link, and per-leaf
+				# child symlinks into each harness's native dirs (parents stay real
+				# writable dirs so the harness can scaffold session state alongside).
+				# Harness-agnostic: each layout is attempted, skipped if the brain
+				# didn't build it. Offline-safe -- reads only closure-resident paths.
+				brainMaterializeScript = pkgs.writeShellScript "cogbox-brain-materialize" ''
+					set -e
+					brain=${cogbox-brain}
+					WORK=/var/lib/cogbox/work
+					mkdir -p "$WORK/.cogbox"
+					ln -sfn "$WORK" /root/work
+					ln -sfn "$brain" "$WORK/.cogbox/brain"
+
+					linkleaves() {  # $1 = brain subdir, $2 = dest dir
+						[ -d "$1" ] || return 0
+						mkdir -p "$2"
+						for leaf in "$1"/*; do
+							[ -e "$leaf" ] || continue
+							ln -sfn "$leaf" "$2/$(basename "$leaf")"
+						done
+					}
+
+					# claude-code: native skills/agents/commands/rules
+					linkleaves "$brain/claude/skills"   "$WORK/.claude/skills"
+					linkleaves "$brain/claude/agents"   "$WORK/.claude/agents"
+					linkleaves "$brain/claude/commands" "$WORK/.claude/commands"
+					linkleaves "$brain/rules"           "$WORK/.claude/rules"
+					if [ -e "$brain/claude/settings.json" ]; then
+						mkdir -p "$WORK/.claude"
+						ln -sfn "$brain/claude/settings.json" "$WORK/.claude/settings.json"
+					fi
+					# project .mcp.json only when the user has none (never clobber)
+					if [ -e "$brain/claude/.mcp.json" ] && [ ! -e "$WORK/.mcp.json" ]; then
+						ln -sfn "$brain/claude/.mcp.json" "$WORK/.mcp.json"
+					fi
+
+					# opencode: config via OPENCODE_CONFIG; native skills/agents/commands
+					linkleaves "$brain/opencode/skills"   "$WORK/.opencode/skills"
+					linkleaves "$brain/opencode/agents"   "$WORK/.opencode/agents"
+					linkleaves "$brain/opencode/commands" "$WORK/.opencode/commands"
+
+					# codex: skills under ~/.agents/skills; global config.toml only if absent
+					linkleaves "$brain/agents/skills" "$WORK/.agents/skills"
+					if [ -e "$brain/codex/config.toml" ] && [ ! -e /root/.codex/config.toml ]; then
+						mkdir -p /root/.codex
+						install -m600 "$brain/codex/config.toml" /root/.codex/config.toml || true
+					fi
+				'';
+
+				# Pre-accept Claude Code workspace trust for ~/work (both /root/work
+				# and the /var/lib/cogbox/work it resolves to, since Node's cwd
+				# resolves the symlink) and reconcile stale pre-migration project
+				# keys. Replaces the per-plugin cogbox-claude-trust units.
+				brainTrustScript = pkgs.writeShellScript "cogbox-brain-trust" ''
+					set -eu
+					f=/root/.claude.json
+					[ -s "$f" ] || echo '{}' > "$f"
+					${pkgs.jq}/bin/jq '
+						.projects["/var/lib/cogbox/work"].hasTrustDialogAccepted = true
+						| .projects["/root/work"].hasTrustDialogAccepted = true
+						| del(.projects["/var/lib/cogbox"])
+						| del(.projects["/var/lib/cogbox/analytics"])
+						| del(.projects["/var/lib/cogbox/home"])
+					' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+					chmod 600 "$f"
+				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
+
+				# Discovered-unit name collisions across cogbox.contents roots fail
+				# the build, plugin-agnostically attributed. (Explicit-name
+				# collisions across plugins are caught for free by the module
+				# system's attrsOf merge; the add-time lint pre-empts both.)
+				assertions = map (c: {
+					assertion = false;
+					message = "cogbox: duplicate discovered ${c} across cogbox.contents roots; rename one (units share a flat namespace) or use an explicit cogbox.* override.";
+				}) discoveredCollisions;
 
 				# Point login-shell TLS tools at the L7 CA bundle too (the
 				# harness launchers also bake these in for non-login `cogbox
@@ -411,6 +720,31 @@
 						};
 					}
 				) fwCfgPaths) // {
+					cogbox-brain-materialize = {
+						description = "Materialize the cogbox plugin brain into ~/work";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "sshd.service" ];
+						after = [ "var-lib-cogbox.mount" ]
+							++ lib.optional (harnesses ? "codex") "${utils.escapeSystemdPath "/root/.codex"}.mount";
+						requires = [ "var-lib-cogbox.mount" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = brainMaterializeScript;
+						};
+					};
+					cogbox-brain-trust = {
+						description = "Pre-accept Claude Code workspace trust for ~/work";
+						wantedBy = [ "multi-user.target" ];
+						before = [ "multi-user.target" "sshd.service" ];
+						after = [ "var-lib-cogbox.mount" "cogbox-brain-materialize.service" ]
+							++ lib.optional (harnesses ? "claude-code") "claude-code-auth.service";
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = brainTrustScript;
+						};
+					};
 					# Assemble the L7 CA trust bundle: system store + the injected
 					# per-instance MITM CA (when terminate is active). Always
 					# produces ${l7CaBundle} so the CA env vars resolve even when
@@ -863,6 +1197,24 @@
 							})
 							({ pkgs, lib, ... }: { })
 						];
+					};
+				};
+			};
+			# Fixture: a populated cogbox.* config, for the brain-materialization
+			# VM test (Phase brain) and local brain builds.
+			cogbox-x86_64-brain-fixture = mkMicrovm "x86_64-linux" "cogbox" {
+				vcpu = 4;
+				mem = 4096;
+				extraModules = cogboxModules "x86_64-linux" {
+					userExt = { pkgs, lib, ... }: {
+						cogbox = {
+							contents = ./tests/fixtures/brain-plugin/contents;
+							mcp.demo-mcp = { command = "demo-mcp-server"; args = [ "--stdio" ]; env = { DEMO_MODE = "ro"; }; };
+							env = { DEMO_URL = "http://demo.example.com"; };
+							settings.claude-code = { model = "claude-opus-4-8"; };
+							settings.opencode = { model = "anthropic/claude-opus-4-8"; };
+							hooks.SessionStart = "true";
+						};
 					};
 				};
 			};
