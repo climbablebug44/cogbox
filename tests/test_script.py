@@ -371,7 +371,11 @@ NIX_EOF"""))
     comp = "/home/testuser/.config/cogbox/instances/plug/plugins-flake/flake.nix"
     comp_text = machine.succeed(f"cat {comp}")
     assert "DO NOT EDIT" in comp_text, comp_text
-    assert '"p-cogbox-test-plugin".url' in comp_text and "narHash=" in comp_text, comp_text
+    # The materialized source is referenced as a path: input (offline at launch);
+    # narHash lives in config.json (.plugins[].narHash, asserted above), not here.
+    assert '"p-cogbox-test-plugin".url' in comp_text, comp_text
+    assert "plugin-sources/cogbox-test-plugin" in comp_text, comp_text
+    assert 'cogboxPlugins."default".module' in comp_text, comp_text
 
     # Q2b: enable a SECOND module of the same flake via #fragment. The pin
     # must be reused (flake-level versioning), the name derives from the
@@ -389,8 +393,8 @@ NIX_EOF"""))
     tag = machine.succeed(f"jq -r '.network.rules[0].plugin' {plug_cfg}").strip()
     assert tag == "extra", f"extra's rule not tagged at head: {tag!r}"
     comp_text = machine.succeed(f"cat {comp}")
-    assert 'nixosModules."default"' in comp_text, comp_text
-    assert 'inputs."p-extra".nixosModules."extra"' in comp_text, comp_text
+    assert 'cogboxPlugins."default".module' in comp_text, comp_text
+    assert 'inputs."p-extra".cogboxPlugins."extra".module' in comp_text, comp_text
 
     # Q3: list shows both; duplicate add, unknown del, and a fragment that
     # names no module all fail with exit 65.
@@ -534,7 +538,7 @@ NIX_EOF"""))
     # contract check and the composition flake's input resolution perform.
     out = machine.succeed(as_user(
         "nix --extra-experimental-features 'nix-command flakes' "
-        f"eval '{locked}#nixosModules' --apply 'm: m ? \"default\"' --json"
+        f"eval '{locked}#cogboxPlugins' --apply 'm: m ? \"default\"' --json"
     )).strip()
     assert out == "true", out
     machine.succeed(as_user("cogbox plugin del cogbox-git-plugin -y --name plug"))
@@ -562,7 +566,7 @@ NIX_EOF"""))
     machine.succeed(as_user("""cat > """ + bad_plug + """/flake.nix <<'NIX_EOF'
 {
     outputs = { self }: {
-        nixosModules = throw "cogbox-test-deliberate-eval-error";
+        cogboxPlugins = throw "cogbox-test-deliberate-eval-error";
     };
 }
 NIX_EOF"""))
