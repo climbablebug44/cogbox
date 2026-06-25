@@ -16,6 +16,7 @@ pub const Cmd = union(enum) {
 	add: AddArgs,
 	del: DelArgs,
 	update: UpdateArgs,
+	resolve: ResolveArgs,
 };
 
 pub const AddArgs = struct {
@@ -44,6 +45,16 @@ pub const UpdateArgs = struct {
 	git_credential_stdin: bool = false,
 };
 
+pub const ResolveArgs = struct {
+	// resolve previews a flake URL WITHOUT installing it: flake metadata +
+	// the cogboxPlugins.<attr> contract check + the host-side
+	// networkRules/l7Rules/inject readout, emitted as one JSON line on stdout
+	// (the control plane's truthful pre-install preview). No mutation.
+	url: []const u8,
+	// Same single-fetch credential as add/update, for a private-repo preview.
+	git_credential_stdin: bool = false,
+};
+
 pub const ParseError = error{
 	MissingSubcommand,
 	UnknownSubcommand,
@@ -64,6 +75,7 @@ pub fn parse(argv: []const []const u8) ParseError!Cmd {
 	if (std.mem.eql(u8, sub, "add")) return parseAdd(rest);
 	if (std.mem.eql(u8, sub, "del")) return parseDel(rest);
 	if (std.mem.eql(u8, sub, "update")) return parseUpdate(rest);
+	if (std.mem.eql(u8, sub, "resolve")) return parseResolve(rest);
 	return error.UnknownSubcommand;
 }
 
@@ -134,6 +146,23 @@ fn parseUpdate(args: []const []const u8) ParseError!Cmd {
 		}
 	}
 	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred } };
+}
+
+fn parseResolve(args: []const []const u8) ParseError!Cmd {
+	var url: ?[]const u8 = null;
+	var git_cred = false;
+	for (args) |a| {
+		if (std.mem.eql(u8, a, "--git-credential-stdin")) {
+			git_cred = true;
+		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
+			return error.InvalidArgs;
+		} else {
+			if (url != null) return error.InvalidArgs;
+			url = a;
+		}
+	}
+	const u = url orelse return error.MissingUrl;
+	return .{ .resolve = .{ .url = u, .git_credential_stdin = git_cred } };
 }
 
 // --- Tests ---
@@ -220,6 +249,17 @@ test "update --git-credential-stdin (with and without name)" {
 	const c2 = try parse(&.{ "update", "myplugin", "--git-credential-stdin" });
 	try t.expect(c2.update.git_credential_stdin);
 	try t.expectEqualStrings("myplugin", c2.update.plugin.?);
+}
+
+test "resolve parses (url required, optional --git-credential-stdin)" {
+	const c = try parse(&.{ "resolve", "github:owner/repo#mod" });
+	try t.expectEqualStrings("github:owner/repo#mod", c.resolve.url);
+	try t.expect(!c.resolve.git_credential_stdin);
+	const c2 = try parse(&.{ "resolve", "git+https://g/r", "--git-credential-stdin" });
+	try t.expect(c2.resolve.git_credential_stdin);
+	try t.expectEqualStrings("git+https://g/r", c2.resolve.url);
+	try t.expectError(error.MissingUrl, parse(&.{"resolve"}));
+	try t.expectError(error.InvalidArgs, parse(&.{ "resolve", "a", "b" }));
 }
 
 test "unknown / missing subcommand" {

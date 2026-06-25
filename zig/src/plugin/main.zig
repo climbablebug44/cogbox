@@ -37,8 +37,8 @@ pub fn dispatch(
 ) !void {
 	const cmd = cli.parse(rest) catch |err| {
 		const msg = switch (err) {
-			error.MissingSubcommand => "missing subcommand (list, add, del, update)",
-			error.UnknownSubcommand => "unknown subcommand (expected list, add, del, update)",
+			error.MissingSubcommand => "missing subcommand (list, add, del, update, resolve)",
+			error.UnknownSubcommand => "unknown subcommand (expected list, add, del, update, resolve)",
 			error.MissingUrl => "add requires a FLAKE_URL",
 			error.MissingPlugin => "del requires a plugin name",
 			error.InvalidArgs => "invalid arguments",
@@ -83,7 +83,136 @@ pub fn dispatch(
 		.add => |a| try cmdAdd(&ctx, &loaded, a),
 		.del => |d| try cmdDel(&ctx, &loaded, d),
 		.update => |u| try cmdUpdate(&ctx, &loaded, u),
+		.resolve => |r| try cmdResolve(&ctx, &loaded, r),
 	}
+}
+
+// --- resolve (truthful pre-install preview; no mutation) -----------------
+
+// cmdResolve previews a flake URL the way cmdAdd's read-only prefix does --
+// flake metadata + the cogboxPlugins.<attr> contract check + the host-side
+// networkRules/l7Rules/inject readout -- and emits ONE JSON line on stdout for
+// the control plane (cogworx's Backend.ResolvePin). It installs nothing: no
+// config mutation, no source materialization, no composition regen. Human
+// chatter routes to stderr (the defer_rules flag) so stdout carries only JSON.
+fn cmdResolve(ctx: *Ctx, loaded: *config.Loaded, r: cli.ResolveArgs) !void {
+	_ = loaded;
+	const allocator = ctx.allocator;
+	const io = ctx.io;
+	ctx.defer_rules = true;
+
+	var fetch_env: ?gitcred.FetchEnv = null;
+	defer if (fetch_env) |*fe| fe.deinit();
+	if (r.git_credential_stdin) {
+		const raw = gitcred.readStdin(allocator, io) catch {
+			die(allocator, io, "could not read git credential from stdin", .{}, 65);
+		};
+		defer allocator.free(raw);
+		const cred = gitcred.parseLine(raw) catch {
+			die(allocator, io, "malformed git credential on stdin (want host<TAB>user<TAB>token)", .{}, 65);
+		};
+		fetch_env = gitcred.FetchEnv.setup(allocator, io, ctx.parent_env, cred) catch {
+			die(allocator, io, "could not set up authenticated fetch", .{}, 70);
+		};
+		ctx.fetch_env = fetch_env.?.map();
+	}
+
+	const split = name_mod.splitFragment(r.url) catch |err| switch (err) {
+		error.EmptyFragment => die(allocator, io, "empty #fragment in '{s}'", .{r.url}, 65),
+		error.InvalidAttr => die(allocator, io, "invalid module attr in '{s}' (allowed: [a-zA-Z0-9_-])", .{r.url}, 65),
+	};
+	const ref = split.ref;
+	const attr: ?[]const u8 = if (split.attr) |sa|
+		(if (std.mem.eql(u8, sa, "default")) null else sa)
+	else
+		null;
+
+	// Best-effort name (preview only): from the attr, else the URL, else "plugin".
+	const name: []const u8 = blk: {
+		if (attr) |at| break :blk name_mod.deriveNameFromAttr(allocator, at) catch try allocator.dupe(u8, "plugin");
+		break :blk name_mod.deriveName(allocator, ref) catch try allocator.dupe(u8, "plugin");
+	};
+	defer allocator.free(name);
+
+	try announce(ctx, "Resolving '{s}'...", .{ref});
+	var meta = resolveFlake(ctx, ref);
+	defer meta.deinit(allocator);
+	const dirty = meta.rev == null and nix.isGitOrHgUrl(meta.locked_url);
+
+	const module_attr = attr orelse "default";
+	const present = switch (try nix.evalHasCogboxPlugin(allocator, io, ctx.fetch_env, meta.locked_url, module_attr)) {
+		.present => true,
+		.missing => false,
+		.failed => |stderr| die(allocator, io, "could not evaluate flake '{s}':\n{s}", .{ meta.locked_url, nix.stderrTail(stderr) }, 65),
+	};
+
+	// Host-side policy readout (only meaningful when the contract is present).
+	var l4_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (l4_parsed) |*p| p.deinit();
+	var l7_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (l7_parsed) |*p| p.deinit();
+	var inject_parsed: ?std.json.Parsed(std.json.Value) = null;
+	defer if (inject_parsed) |*p| p.deinit();
+	var l4: []const std.json.Value = &.{};
+	var l7: []const std.json.Value = &.{};
+	var inject: []const std.json.Value = &.{};
+	if (present) {
+		l4_parsed = evalRules(ctx, meta.locked_url, attr);
+		if (l4_parsed) |p| l4 = p.value.array.items;
+		l7_parsed = evalL7Rules(ctx, meta.locked_url, attr);
+		if (l7_parsed) |p| l7 = p.value.array.items;
+		inject_parsed = evalInjectSpecs(ctx, meta.locked_url, attr);
+		if (inject_parsed) |p| inject = p.value.array.items;
+	}
+
+	const line = try renderResolveJson(allocator, name, attr, ref, &meta, dirty, present, l4, l7, inject);
+	defer allocator.free(line);
+	try writeStdout(io, line);
+}
+
+/// Build the one-line resolve JSON the control plane consumes:
+///   {"name","attr","url","lockedUrl","rev","narHash","dirty","present",
+///    "networkRules":[...],"l7Rules":[...],"inject":[...]}
+/// The rule/inject objects are the SAME validated shapes evalRules/evalL7Rules/
+/// evalInjectSpecs produced. Caller frees.
+fn renderResolveJson(
+	allocator: std.mem.Allocator,
+	name: []const u8,
+	attr: ?[]const u8,
+	url: []const u8,
+	meta: *const nix.Meta,
+	dirty: bool,
+	present: bool,
+	l4: []const std.json.Value,
+	l7: []const std.json.Value,
+	inject: []const std.json.Value,
+) ![]u8 {
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(allocator);
+	try out.appendSlice(allocator, "{\"name\":");
+	try writeCompactString(allocator, &out, name);
+	try out.appendSlice(allocator, ",\"attr\":");
+	try writeCompactString(allocator, &out, attr orelse "default");
+	try out.appendSlice(allocator, ",\"url\":");
+	try writeCompactString(allocator, &out, url);
+	try out.appendSlice(allocator, ",\"lockedUrl\":");
+	try writeCompactString(allocator, &out, meta.locked_url);
+	try out.appendSlice(allocator, ",\"rev\":");
+	if (meta.rev) |rev| try writeCompactString(allocator, &out, rev) else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\"narHash\":");
+	try writeCompactString(allocator, &out, meta.nar_hash);
+	try out.appendSlice(allocator, ",\"dirty\":");
+	try out.appendSlice(allocator, if (dirty) "true" else "false");
+	try out.appendSlice(allocator, ",\"present\":");
+	try out.appendSlice(allocator, if (present) "true" else "false");
+	try out.appendSlice(allocator, ",\"networkRules\":");
+	try writeCompactArray(allocator, &out, l4);
+	try out.appendSlice(allocator, ",\"l7Rules\":");
+	try writeCompactArray(allocator, &out, l7);
+	try out.appendSlice(allocator, ",\"inject\":");
+	try writeCompactArray(allocator, &out, inject);
+	try out.appendSlice(allocator, "}\n");
+	return out.toOwnedSlice(allocator);
 }
 
 const Ctx = struct {

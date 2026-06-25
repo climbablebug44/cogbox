@@ -304,12 +304,12 @@ NIX_EOF"""))
     stop_instance("cc-default")
 
 with subtest("Phase Q: plugin verb folds a flake into the guest + tagged rules"):
-    # Fixture: ONE flake exposing TWO plugins. The composed runner drv must
-    # equal the pre-built cogbox-x86_64-test-plugin fixture (offline cache
-    # hit), whose userExt mirrors exactly this shape: hello module + etc
-    # marker module + scaffold no-op, in add order. Rules use both contract
-    # forms: flat cogboxPlugin.networkRules for default, nested
-    # cogboxPlugin.extra.networkRules for the named module.
+    # Fixture: ONE flake exposing TWO plugins under the cogboxPlugins.<attr>
+    # contract (registration = module ref + host-side rules). The composed
+    # runner drv must equal the pre-built cogbox-x86_64-test-plugin fixture
+    # (offline cache hit), whose userExt mirrors exactly the imported modules:
+    # hello module + etc marker module + scaffold no-op, in add order (the
+    # `.module or {}` composition wrapper imports the same module values).
     plug_flake = "/home/testuser/cogbox-test-plugin/flake.nix"
     machine.succeed(as_user("mkdir -p /home/testuser/cogbox-test-plugin"))
     machine.succeed(as_user("""cat > """ + plug_flake + """ <<'NIX_EOF'
@@ -323,15 +323,21 @@ with subtest("Phase Q: plugin verb folds a flake into the guest + tagged rules")
         nixosModules.extra = { ... }: {
             environment.etc."cogbox-test-extra".text = "extra\n";
         };
-        cogboxPlugin.networkRules = [
-            { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
-        ];
-        cogboxPlugin.l7Rules = [
-            { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
-        ];
-        cogboxPlugin.extra.networkRules = [
-            { allow = "10.99.0.2/32"; comment = "extra allow"; }
-        ];
+        cogboxPlugins.default = {
+            module = self.nixosModules.default;
+            networkRules = [
+                { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
+            ];
+            l7Rules = [
+                { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
+            ];
+        };
+        cogboxPlugins.extra = {
+            module = self.nixosModules.extra;
+            networkRules = [
+                { allow = "10.99.0.2/32"; comment = "extra allow"; }
+            ];
+        };
     };
 }
 NIX_EOF"""))
@@ -441,16 +447,22 @@ NIX_EOF"""))
         nixosModules.extra = { ... }: {
             environment.etc."cogbox-test-extra".text = "extra\n";
         };
-        cogboxPlugin.networkRules = [
-            { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
-            { allow = "10.99.0.2/32"; comment = "second allow"; }
-        ];
-        cogboxPlugin.l7Rules = [
-            { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
-        ];
-        cogboxPlugin.extra.networkRules = [
-            { allow = "10.99.0.2/32"; comment = "extra allow"; }
-        ];
+        cogboxPlugins.default = {
+            module = self.nixosModules.default;
+            networkRules = [
+                { allow = "10.99.0.1/32"; comment = "test plugin allow"; }
+                { allow = "10.99.0.2/32"; comment = "second allow"; }
+            ];
+            l7Rules = [
+                { allow = "plugin-l7.test"; terminate = true; comment = "l7 vhost allow"; }
+            ];
+        };
+        cogboxPlugins.extra = {
+            module = self.nixosModules.extra;
+            networkRules = [
+                { allow = "10.99.0.2/32"; comment = "extra allow"; }
+            ];
+        };
     };
 }
 NIX_EOF"""))
@@ -488,7 +500,7 @@ NIX_EOF"""))
     # query params through to the remote, so every later fetch of the pin
     # (the contract check, the composition flake's inputs) asked the forge
     # for a repo literally named "...?narHash=..." and failed -- misreported
-    # as "does not expose nixosModules.default". git+file:// exercises the
+    # as "does not expose cogboxPlugins.default". git+file:// exercises the
     # same fetcher without network.
     git_plug = "/home/testuser/cogbox-git-plugin"
     machine.succeed(as_user(f"mkdir -p {git_plug}"))
@@ -499,6 +511,7 @@ NIX_EOF"""))
         nixosModules.default = { ... }: {
             environment.etc."cogbox-git-plugin".text = "git\\n";
         };
+        cogboxPlugins.default = { module = self.nixosModules.default; };
     };
 }
 NIX_EOF"""))
@@ -566,7 +579,7 @@ NIX_EOF"""))
         "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#nonexistent' -y --name plug 2>&1"
     ))
     assert rc != 0, out
-    assert "does not expose nixosModules.nonexistent" in out, out
+    assert "does not expose cogboxPlugins.nonexistent" in out, out
 
 with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     boot_and_wait("cc-default", "", ssh_port=2222)

@@ -499,6 +499,7 @@ pub const PLUGIN =
 	\\  cogbox plugin add path:/home/me/myplugin --as dev -n work
 	\\  cogbox plugin update
 	\\  cogbox plugin del myplugin
+	\\  cogbox plugin resolve github:org/observability#loki   # preview (JSON), installs nothing
 	\\
 ;
 
