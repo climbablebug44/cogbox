@@ -145,11 +145,14 @@ if [ ! -d "$REAL_HOME" ] || [ ! -w "$REAL_HOME" ]; then
 fi
 
 # -- Harness shape -------------------------------------------------
-# Mirror of the harness attrset in flake.nix. Both sides must agree on
-# names (used as 9p tags, fw_cfg keys, and runtime symlinks). When
-# adding or changing a harness, edit BOTH this section and the
-# `mkHarnesses` attrset in flake.nix.
-HARNESSES=(claude-code opencode codex)
+# The HARNESSES list is GENERATED from flake.nix's `mkHarnesses` set at
+# build time: the cogbox package substitutes the harness-name sentinel below
+# with the enabled-harness names, so this list always matches which harnesses
+# the VM was built with -- including the opt-in `enableCodex`. The per-harness
+# shape below (H_KIND, H_HOST, pathkeys, summaries, inject specs) is still
+# hand-maintained and must mirror the matching harness attrs in flake.nix;
+# names are used as 9p tags, fw_cfg keys, and runtime symlinks.
+HARNESSES=(@harnesses@)
 declare -A H_KIND
 declare -A H_HOST
 declare -A H_FW_DEFAULT

@@ -7,7 +7,7 @@ const std = @import("std");
 const util = @import("util.zig");
 
 pub const TOP_LEVEL =
-	\\cogbox - run coding-agent harnesses (claude-code, opencode, codex) in an isolated QEMU microvm
+	\\cogbox - run coding-agent harnesses (claude-code, opencode; codex opt-in) in an isolated QEMU microvm
 	\\
 	\\Usage:
 	\\  cogbox [VERB] [OPTIONS]            (cbx is a short alias for cogbox)

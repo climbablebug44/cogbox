@@ -14,9 +14,11 @@ prompting -- without that blast radius reaching the host.
 Currently supported harnesses: `claude-code`
 ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)),
 `opencode` ([opencode](https://github.com/sst/opencode)), and
-`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)). The
-architecture is harness-agnostic; see [Harnesses](docs/harnesses.md)
-for the model and how to add more.
+`codex` ([OpenAI Codex CLI](https://github.com/openai/codex)). Codex is
+opt-in and **disabled by default** (its Rust build is slow); enable it by
+setting `enableCodex = true` in `flake.nix`. The architecture is
+harness-agnostic; see [Harnesses](docs/harnesses.md) for the model and
+how to add more.
 
 ## Quick start
 
@@ -26,15 +28,15 @@ nix run github:illustris/cogbox
 
 On first run, the wrapper asks which harnesses to set up (only the ones
 you pick get host-side config dirs created) and then prompts before
-touching anything:
+touching anything (the list reflects which harnesses were built in, so
+`codex` appears only when `enableCodex` is on):
 
 ```
 No harness state detected. Set up which?
   [1] claude-code     (creates ~/.claude/, ~/.claude.json)
   [2] opencode        (creates ~/.config/opencode/, ~/.local/share/opencode/)
-  [3] codex           (creates ~/.codex/)
-  [4] all
-Choice [1-4, comma-separated for multiple]:
+  [3] all
+Choice [1-3, comma-separated for multiple]:
 
 The following paths will be created:
   ~/.config/cogbox/instances/default/config.json  (default settings)
@@ -303,9 +305,10 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | Docker | enabled |
 
 Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism).
-Harness binaries (with launchers): `claude-code` (`c`), `opencode`
-(`oc`), and `codex` (`cx`), on `x86_64-linux` and `aarch64-linux`
-(sourced from `numtide/llm-agents.nix`).
+Harness binaries (with launchers): `claude-code` (`c`) and `opencode`
+(`oc`), on `x86_64-linux` and `aarch64-linux` (sourced from
+`numtide/llm-agents.nix`). `codex` (`cx`) is opt-in (see above) and built
+in only when `enableCodex` is set.
 Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
 (where the `nix-mcp` flake publishes a build).
 

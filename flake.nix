@@ -76,6 +76,14 @@
 		#               via QEMU's fw_cfg device
 		#   ephemeral - sandbox-only; bind-mounted from the harness
 		#               overlay image (no host source)
+		#
+		# Codex is OPT-IN. Its Rust toolchain build is slow and frequently a
+		# cache miss against our nixpkgs, so it is disabled by default to keep
+		# cogbox builds fast. Flip this to `true` to build it in. Everything
+		# downstream is derived from the resulting harness set -- the VM's
+		# packages/mounts/services AND the launcher's HARNESSES list (baked in
+		# via the @harnesses@ sentinel) -- so this single switch covers both.
+		enableCodex = false;
 		mkHarnesses = system: pkgs: lib.filterAttrs (_: h: h.enable) {
 			claude-code = {
 				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
@@ -152,7 +160,8 @@
 			};
 
 			codex = {
-				enable = builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
+				# Opt-in (slow Rust build): gated on `enableCodex` above.
+				enable = enableCodex && builtins.elem system [ "x86_64-linux" "aarch64-linux" ];
 				package = inputs.llm-agents.packages.${system}.codex;
 				launcher = {
 					name = "cx";
@@ -947,6 +956,11 @@
 		packages = forAllSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
+			# Space-separated enabled-harness names, baked into cogbox-launch.sh's
+			# `HARNESSES=(@harnesses@)` so the launcher's set can never drift from
+			# what the VM was built with (single source of truth: mkHarnesses +
+			# enableCodex).
+			harnessNames = lib.concatStringsSep " " (lib.attrNames (mkHarnesses system pkgs));
 			# Build a cogbox package: the Zig CLI binary at $out/bin/cogbox,
 			# the LD_PRELOAD filter at $out/lib/libnetfilter.so, and the
 			# substituted bash launch script at $out/libexec/cogbox-launch.sh.
@@ -970,6 +984,7 @@
 					--replace-fail "@runner@" "${runner'}" \
 					--replace-fail "@netfilter@" "$out/lib/libnetfilter.so" \
 					--replace-fail "@cogbox@" "$out/bin/cogbox" \
+					--replace-fail "@harnesses@" "${harnessNames}" \
 					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
 					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
 					--replace-fail "@flock@" "${pkgs.util-linux}/bin/flock" \

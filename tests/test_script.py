@@ -88,8 +88,10 @@ machine.succeed("cat > /tmp/ech-hello.py << 'PY_EOF'\n" + ech_hello_script + "\n
 
 with subtest("Phase A: CLI / state without booting"):
     # A1: first-run init for the default instance, network=none.
-    # A non-interactive stdin auto-selects all harnesses, so claude-code,
-    # opencode, and codex host paths are all seeded.
+    # A non-interactive stdin auto-selects all built-in harnesses, so
+    # claude-code and opencode host paths are seeded. Codex is opt-in
+    # (disabled by default via enableCodex in flake.nix), so it is not
+    # built into the VM and its host path is not seeded.
     machine.succeed(as_user("cogbox init -y --network none"))
     machine.succeed("test -f /home/testuser/.config/cogbox/instances/default/config.json")
     machine.succeed("test -f /home/testuser/.config/cogbox/authorized_keys")
@@ -113,14 +115,16 @@ with subtest("Phase A: CLI / state without booting"):
     machine.succeed("test -d /home/testuser/.claude")
     machine.succeed("test -d /home/testuser/.config/opencode")
     machine.succeed("test -d /home/testuser/.local/share/opencode")
-    machine.succeed("test -d /home/testuser/.codex")
+    # codex is opt-in and not built by default, so its host dir is NOT seeded.
+    machine.fail("test -d /home/testuser/.codex")
     machine.succeed(
         "test -f /home/testuser/.local/share/cogbox/instances/default/.config/active-harnesses"
     )
     active = machine.succeed(
         "cat /home/testuser/.local/share/cogbox/instances/default/.config/active-harnesses"
     ).strip().splitlines()
-    assert "claude-code" in active and "opencode" in active and "codex" in active, active
+    assert "claude-code" in active and "opencode" in active, active
+    assert "codex" not in active, active
     # Old top-level default config must NOT be created any more.
     machine.fail("test -e /home/testuser/.config/cogbox/config.json")
     net = machine.succeed(
@@ -585,15 +589,16 @@ NIX_EOF"""))
     assert rc != 0, out
     assert "does not expose cogboxPlugins.nonexistent" in out, out
 
-with subtest("Phase F: opencode + codex harnesses wired into the VM"):
+with subtest("Phase F: opencode harness wired into the VM (codex opt-in, excluded)"):
     boot_and_wait("cc-default", "", ssh_port=2222)
-    # All harness launchers are on $PATH inside the VM unconditionally
+    # Built-in harness launchers are on $PATH inside the VM unconditionally
     # (D4: binaries always installed regardless of which harness has
     # active host state).
     c_path = machine.succeed(as_user("cogbox ssh 'command -v c'")).strip()
     oc_path = machine.succeed(as_user("cogbox ssh 'command -v oc'")).strip()
-    cx_path = machine.succeed(as_user("cogbox ssh 'command -v cx'")).strip()
-    assert c_path and oc_path and cx_path, (c_path, oc_path, cx_path)
+    assert c_path and oc_path, (c_path, oc_path)
+    # codex is opt-in (disabled by default), so its `cx` launcher is absent.
+    machine.succeed(as_user("cogbox ssh '! command -v cx'"))
 
     # Per-harness config dirs are mounted at the expected guest paths.
     machine.succeed(as_user(
@@ -601,9 +606,6 @@ with subtest("Phase F: opencode + codex harnesses wired into the VM"):
     ))
     machine.succeed(as_user(
         "cogbox ssh 'mountpoint -q /root/.local/share/opencode'"
-    ))
-    machine.succeed(as_user(
-        "cogbox ssh 'mountpoint -q /root/.codex'"
     ))
     # Ephemeral paths (cache + state) bind from the harness overlay.
     machine.succeed(as_user(
@@ -613,16 +615,14 @@ with subtest("Phase F: opencode + codex harnesses wired into the VM"):
         "cogbox ssh 'mountpoint -q /root/.local/state/opencode'"
     ))
 
-    # Single-image overlay layout: claude-code/config, opencode/{config,data},
-    # and codex/home all live under the shared harness-rw mount.
+    # Single-image overlay layout: claude-code/config and opencode/{config,data}
+    # live under the shared harness-rw mount. (codex/home would join them here
+    # when codex is enabled.)
     machine.succeed(as_user(
         "cogbox ssh 'test -d /var/lib/harness-rw/claude-code/config/upper'"
     ))
     machine.succeed(as_user(
         "cogbox ssh 'test -d /var/lib/harness-rw/opencode/config/upper'"
-    ))
-    machine.succeed(as_user(
-        "cogbox ssh 'test -d /var/lib/harness-rw/codex/home/upper'"
     ))
 
     # Persistence: write a file under opencode's config overlay, reboot,

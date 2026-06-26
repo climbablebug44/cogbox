@@ -1,6 +1,6 @@
 # Harnesses
 
-A *harness* is a coding-agent CLI that cogbox installs in the guest and mounts host state for. The currently-supported harnesses are `claude-code` (launcher: `c`), `opencode` (launcher: `oc`), and `codex` (launcher: `cx`).
+A *harness* is a coding-agent CLI that cogbox installs in the guest and mounts host state for. The currently-supported harnesses are `claude-code` (launcher: `c`), `opencode` (launcher: `oc`), and `codex` (launcher: `cx`). Codex is opt-in and disabled by default (its Rust build is slow) -- set `enableCodex = true` in `flake.nix` to build it in. When a harness is not built in, its launcher, mounts, and host-state seeding are all omitted (the launcher's `HARNESSES` list is generated from the same `mkHarnesses` set).
 
 ## The harness model
 
