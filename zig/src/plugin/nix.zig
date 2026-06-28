@@ -37,7 +37,12 @@ pub fn runNix(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process
 	return .{ .stdout = res.stdout, .stderr = res.stderr, .ok = ok };
 }
 
-pub fn flakeMetadata(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) !RunOut {
+/// `refresh` adds `--refresh`, which bypasses nix's flake/tarball eval cache so
+/// a mutable ref (e.g. `github:owner/repo` with no rev) re-resolves to the
+/// current tip instead of a stale cached rev. `update` sets it; `add`/`resolve`
+/// don't (a first resolve has nothing cached to go stale).
+pub fn flakeMetadata(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, refresh: bool) !RunOut {
+	if (refresh) return runNix(allocator, io, env, &.{ "flake", "metadata", "--refresh", "--json", url });
 	return runNix(allocator, io, env, &.{ "flake", "metadata", "--json", url });
 }
 
@@ -346,7 +351,7 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) MetaEr
 /// fails or the field is absent (best-effort; the composition then falls back
 /// to the git URL). Authenticated via `env` like every other fetch.
 pub fn flakeSourcePath(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) ![]u8 {
-	var out = try flakeMetadata(allocator, io, env, url);
+	var out = try flakeMetadata(allocator, io, env, url, false);
 	defer out.deinit(allocator);
 	if (!out.ok) return try allocator.dupe(u8, "");
 

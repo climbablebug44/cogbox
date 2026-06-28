@@ -134,7 +134,7 @@ See [Credential injection](network-filtering.md#host-side-credential-injection) 
 
 Versioning is per flake, not per plugin. `add` resolves the URL with `nix flake metadata`, records the locked URL, rev, and narHash in `config.json` (`.plugins`), and runs `nix flake archive` so the plugin and its transitive inputs land in the local store — subsequent starts resolve the pins offline.
 
-Enabling another module of an already-installed flake **reuses the existing pin**, so all plugins from one flake stay at one rev; `update` resolves each distinct URL once and moves all of its plugins together. To hold a flake at a specific rev, pin it in the URL (`...?rev=<sha>` or `github:owner/repo/<sha>`). A **dirty git worktree** is the worst-pinned shape (no rev, no narHash in the URL); `add` warns — commit, then `cogbox plugin update` to pin properly.
+Enabling another module of an already-installed flake **reuses the existing pin**, so all plugins from one flake stay at one rev; `update` resolves each distinct URL once (with `nix flake metadata --refresh`, bypassing nix's eval cache so a mutable ref like `github:owner/repo` actually re-resolves to the current tip) and moves all of its plugins together. To hold a flake at a specific rev, pin it in the URL (`...?rev=<sha>` or `github:owner/repo/<sha>`). A **dirty git worktree** is the worst-pinned shape (no rev, no narHash in the URL); `add` warns — commit, then `cogbox plugin update` to pin properly.
 
 A `.plugins` entry:
 

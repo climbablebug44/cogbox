@@ -729,7 +729,10 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 			for (resolved.items) |*r| {
 				if (std.mem.eql(u8, r.url, url)) break :blk &r.meta;
 			}
-			var meta_out = nix.flakeMetadata(allocator, io, ctx.fetch_env, url) catch {
+			// --refresh: bypass nix's flake eval cache so a mutable ref re-resolves
+			// to the current tip. Without it, update can keep returning the cached
+			// rev and never actually move the pin.
+			var meta_out = nix.flakeMetadata(allocator, io, ctx.fetch_env, url, true) catch {
 				die(allocator, io, "failed to run nix (is it on PATH?)", .{}, 70);
 			};
 			defer meta_out.deinit(allocator);
@@ -859,7 +862,7 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 
 /// nix flake metadata + parse, with fatal errors on failure.
 fn resolveFlake(ctx: *const Ctx, url: []const u8) nix.Meta {
-	var out = nix.flakeMetadata(ctx.allocator, ctx.io, ctx.fetch_env, url) catch {
+	var out = nix.flakeMetadata(ctx.allocator, ctx.io, ctx.fetch_env, url, false) catch {
 		die(ctx.allocator, ctx.io, "failed to run nix (is it on PATH?)", .{}, 70);
 	};
 	defer out.deinit(ctx.allocator);
